@@ -966,7 +966,7 @@ int SIO_WriteStatusBlock(int unit, const UBYTE *buffer)
 {
 	int size;
 #ifdef DEBUG
-	Log_print("Write Status-Block: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+	Log_print("Write Status-Block: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
 		buffer[0], buffer[1], buffer[2], buffer[3],
 		buffer[4], buffer[5], buffer[6], buffer[7],
 		buffer[8], buffer[9], buffer[10], buffer[11]);
@@ -1172,7 +1172,7 @@ void SIO_Handler(void)
 		case 0x57:
 		case 0xD0:				/* xf551 hispeed */
 		case 0xD7:
-			SIO_SizeOfSector(unit, sector, &realsize, NULL);
+			SIO_SizeOfSector((UBYTE) unit, sector, &realsize, NULL);
 			if (realsize == length) {
 				MEMORY_CopyFromMem(data, DataBuffer, realsize);
 				result = SIO_WriteSector(unit, sector, DataBuffer);
@@ -1198,7 +1198,7 @@ void SIO_Handler(void)
 				delay_counter = 0;
 			}
 #endif
-			SIO_SizeOfSector(unit, sector, &realsize, NULL);
+			SIO_SizeOfSector((UBYTE) unit, sector, &realsize, NULL);
 			if (realsize == length) {
 				result = SIO_ReadSector(unit, sector, DataBuffer);
 				if (result == 'C')
@@ -1220,7 +1220,7 @@ void SIO_Handler(void)
 			break;
 		/*case 0x66:*/			/* US Doubler Format - I think! */
 		case 0x21:				/* Format Disk */
-		case 0xA1:				/* xf551 hispeed */
+		case 0xa1:				/* xf551 hispeed */
 			realsize = SIO_format_sectorsize[unit];
 			if (realsize == length) {
 				result = SIO_FormatDisk(unit, DataBuffer, realsize, SIO_format_sectorcount[unit]);
@@ -1234,7 +1234,7 @@ void SIO_Handler(void)
 			}
 			break;
 		case 0x22:				/* Enhanced Density Format */
-		case 0xA2:				/* xf551 hispeed */
+		case 0xa2:				/* xf551 hispeed */
 			realsize = 128;
 			if (realsize == length) {
 				result = SIO_FormatDisk(unit, DataBuffer, 128, 1040);
@@ -1415,11 +1415,11 @@ static UBYTE Command_Frame(void)
 
 			netsio_recv_byte(&b);
 			if (b != 0x41)
-				return;       /* no ACK, bail out */
+				return 'E';       /* no ACK, bail out */
 
 			netsio_recv_byte(&b);
 			if (b != 0x43)
-				return;       /* no complete, bail out */
+				return 'E';       /* no complete, bail out */
 
             /* read in the 128‐byte sector payload */
             for (i = 0; i < 128; i++) {
@@ -1431,10 +1431,13 @@ static UBYTE Command_Frame(void)
             netsio_recv_byte(&b);
             DataBuffer[1 + 128] = b;
 
-            DataBuffer[0]     = 'C';           /* Complete */
-            DataIndex         = 0;
-            ExpectedBytes     = 1 + 128 + 1;   /* code + 128 data + checksum */
-            TransferStatus    = SIO_ReadFrame;
+            DataBuffer[0] = 'C';                    /* per SIO_DriveStatus() */
+			netsio_recv_byte(&b);
+            DataBuffer[5] = b;     /* final checksum */
+
+            DataIndex      = 0;
+            ExpectedBytes  = 1 + 128 + 1;   /* code + 128 data + checksum */
+            TransferStatus = SIO_ReadFrame;
 
             POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL << 2;
 
@@ -1489,11 +1492,11 @@ static UBYTE Command_Frame(void)
 
             netsio_recv_byte(&b);
             if (b != 0x41)
-                return;       /* no ACK, bail out */
+                return 'E';       /* no ACK, bail out */
 
             netsio_recv_byte(&b);
             if (b != 0x43)
-                return;       /* no complete, bail out */
+                return 'E';       /* no complete, bail out */
 
             for (i = 0; i < 4; i++) {
 				netsio_recv_byte(&b);
@@ -1602,7 +1605,7 @@ static UBYTE WriteSectorBack(void)
 	sector = CommandFrame[2] + (CommandFrame[3] << 8);
 	unit = CommandFrame[0] - '1';
 	if (unit >= SIO_MAX_DRIVES)		/* UBYTE range ! */
-		return 0;
+		return 'E';
 	switch (CommandFrame[1]) {
 	case 0x4f:				/* Write Status Block */
 		return SIO_WriteStatusBlock(unit, DataBuffer);
