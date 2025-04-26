@@ -18,6 +18,8 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>  /* For inet_ntoa() */
+#include <fcntl.h>      /* For fcntl() */
 #include "netsio.h"
 #include "log.h"
 #include "pia.h" /* For toggling PROC & INT */
@@ -43,10 +45,14 @@ int fds0[2], fds1[2];
 static int sockfd = -1;
 static struct sockaddr_storage fujinet_addr;
 static socklen_t fujinet_addr_len = sizeof(fujinet_addr);
+#ifdef FUJINET_DEBUG
+static char fujinet_ip[INET_ADDRSTRLEN]; /* To hold IP string for debugging */
+#endif
 
 /* Thread declarations */
 static void *fujinet_rx_thread(void *arg);
 static void *emu_tx_thread(void *arg);
+static void reset_socket(void);
 
 char *buf_to_hex(const uint8_t *buf, size_t offset, size_t len) {
     /* each byte takes "XX " == 3 chars, +1 for trailing NUL */
@@ -85,6 +91,8 @@ static void enqueue_to_emulator(const uint8_t *pkt, size_t len) {
 /* send a packet to FujiNet socket */
 static void send_to_fujinet(const uint8_t *pkt, size_t len) {
     ssize_t n;
+    static int socket_connected = 0;
+    static int error_count = 0;
 
     /* if we never received a ping from FujiNet or we have no address to reply to */
     if (!fujinet_known || fujinet_addr.ss_family != AF_INET) {
@@ -92,29 +100,70 @@ static void send_to_fujinet(const uint8_t *pkt, size_t len) {
         return;
     }
 
-    n = sendto(
-        sockfd,
-        pkt, len, 0,
-        (struct sockaddr *)&fujinet_addr,
-        fujinet_addr_len
-    );
+    /* Debug the address details */
+    struct sockaddr_in *addr_in = (struct sockaddr_in *)&fujinet_addr;
+
+    /* Make sure the port is non-zero */
+    if (ntohs(addr_in->sin_port) == 0) {
+        Log_print("netsio: fixing zero port to 65408 (FujiNet default)");
+        addr_in->sin_port = htons(65408); /* Default FujiNet port */
+    }
+
+    /* If we've had multiple failures, reset the socket */
+    if (error_count >= 3) {
+        Log_print("netsio: too many errors (%d), resetting socket", error_count);
+        reset_socket();
+        socket_connected = 0;
+        error_count = 0;
+        /* After reset, attempt to send using sendto() */
+        n = sendto(sockfd, pkt, len, 0, 
+                  (struct sockaddr *)&fujinet_addr, 
+                  fujinet_addr_len);
+    } else {
+        /* Try to connect the socket if not already connected */
+        if (!socket_connected) {
+            if (connect(sockfd, (struct sockaddr *)&fujinet_addr, fujinet_addr_len) < 0) {
+                perror("netsio: connect to FujiNet");
+                error_count++;
+                /* Fall back to using sendto directly */
+                n = sendto(sockfd, pkt, len, 0, 
+                          (struct sockaddr *)&fujinet_addr, 
+                          fujinet_addr_len);
+            } else {
+                socket_connected = 1;
+                Log_print("netsio: socket connected to FujiNet address");
+                /* Use send() since we're connected */
+                n = send(sockfd, pkt, len, 0);
+            }
+        } else {
+            /* Use send() since we're already connected */
+            n = send(sockfd, pkt, len, 0);
+        }
+    }
+    
     if (n < 0) {
         if (errno == EINTR) {
             /* transient, try once more */
-            n = sendto(
-                sockfd,
-                pkt, len, 0,
-                (struct sockaddr *)&fujinet_addr,
-                fujinet_addr_len
-            );
+            if (socket_connected) {
+                n = send(sockfd, pkt, len, 0);
+            } else {
+                n = sendto(sockfd, pkt, len, 0, 
+                          (struct sockaddr *)&fujinet_addr, 
+                          fujinet_addr_len);
+            }
         }
         if (n < 0) {
-            perror("netsio: sendto FujiNet");
+            perror("netsio: send to FujiNet");
+            error_count++;
             return;
         }
     } else if ((size_t)n != len) {
         Log_print("netsio: partial send (%zd of %zu bytes)", n, len);
+        error_count++;
         return;
+    } else {
+        /* Reset error count on successful send */
+        error_count = 0;
     }
 
     /* build a hex string: each byte "XX " */
@@ -134,6 +183,39 @@ static void send_to_fujinet(const uint8_t *pkt, size_t len) {
     /* Log_print("netsio: send: %zu bytes → %s", len, hexdump); */
 }
 
+/* Reset and reconnect the UDP socket */
+static void reset_socket(void) {
+    Log_print("netsio: resetting socket connection");
+    
+    /* Close the existing socket */
+    if (sockfd >= 0) {
+        close(sockfd);
+    }
+    
+    /* Create a new socket */
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("netsio: socket recreation");
+        return;
+    }
+    
+    /* Set socket to non-blocking mode */
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    
+    /* Don't bind to a specific port, let the kernel assign one */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;  /* Let OS choose */
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    
+    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("netsio: binding to random port");
+    }
+    
+    Log_print("netsio: socket reset complete, new socket: %d", sockfd);
+}
 
 /* Send a single byte as a DATA_BYTE packet */
 void send_byte_to_fujinet(uint8_t data_byte) {
@@ -192,7 +274,7 @@ int netsio_init(uint16_t port) {
     }*/
 
     /* Bind to the socket on requested port */
-    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
     perror("netsio bind");
     close(sockfd);
     }
