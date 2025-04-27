@@ -92,21 +92,22 @@ static void send_to_fujinet(const uint8_t *pkt, size_t len) {
         return;
     }
 
-    n = sendto(
-        sockfd,
-        pkt, len, 0,
-        (struct sockaddr *)&fujinet_addr,
-        fujinet_addr_len
-    );
+    /* macOS sendto() expects exact struct length for the address family */
+    socklen_t addrlen = (fujinet_addr.ss_family == AF_INET)
+                        ? (socklen_t)sizeof(struct sockaddr_in)
+                        : (socklen_t)sizeof(struct sockaddr_in6);
+
+    n = sendto(sockfd,
+               pkt, len, 0,
+               (struct sockaddr *)&fujinet_addr,
+               addrlen);
     if (n < 0) {
         if (errno == EINTR) {
             /* transient, try once more */
-            n = sendto(
-                sockfd,
-                pkt, len, 0,
-                (struct sockaddr *)&fujinet_addr,
-                fujinet_addr_len
-            );
+            n = sendto(sockfd,
+                       pkt, len, 0,
+                       (struct sockaddr *)&fujinet_addr,
+                       addrlen);
         }
         if (n < 0) {
             perror("netsio: sendto FujiNet");
@@ -270,14 +271,18 @@ void netsio_toggle_cmd(int v)
 int netsio_send_byte(uint8_t b) {
     uint8_t pkt[2] = { NETSIO_DATA_BYTE, b };
     Log_print("netsio: send byte: %02X", b);
-    send_to_fujinet(&pkt, 2);
+    send_to_fujinet(pkt, 2);
     return 0;
 }
 
 /* The emulator calls this to send a data block out to FujiNet */
 int netsio_send_block(const uint8_t *block, ssize_t len) {
-    /* ssize_t len = sizeof(block);*/ 
-    send_block_to_fujinet(block, len);
+    if (len < 0 || len > 512) return -1;
+    uint8_t pkt[512 + 2];
+    pkt[0] = NETSIO_DATA_BLOCK;
+    memcpy(&pkt[1], block, len);
+    pkt[1 + len] = 0xFF;
+    send_to_fujinet(pkt, len + 2);
     Log_print("netsio: send block, %i bytes:\n  %s", len, buf_to_hex(block, 0, len));
 }
 
