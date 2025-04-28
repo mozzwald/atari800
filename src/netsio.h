@@ -3,6 +3,7 @@
 #define NETSIO_H
 
 #include <stdint.h>
+#include <sys/types.h>
 #include <pthread.h>
 
 /* NetSIO Commands */
@@ -33,6 +34,12 @@
 #define NETSIO_WARM_RESET         0xFE
 #define NETSIO_COLD_RESET         0xFF
 
+/* Some defines about the serial I/O timing. Currently fixed! */
+#define SIO_XMTDONE_INTERVAL  15
+#define SIO_SERIN_INTERVAL     8
+#define SIO_SEROUT_INTERVAL    8
+#define SIO_ACK_INTERVAL      36
+
 /* FIFO buffer depth */
 #define NETSIO_FIFO_SIZE 4096
 
@@ -48,6 +55,7 @@ extern volatile int netsio_enabled;
 extern uint8_t netsio_sync_num;
 extern int netsio_sync_wait;
 extern int netsio_cmd_state;
+extern uint16_t netsio_next_write_size;
 
 /* FIFO pipes:
 * fds0: FujiNet->emulator
@@ -81,5 +89,8 @@ void netsio_toggle_cmd(int v);
 int netsio_available(void);
 
 void netsio_test_cmd(void);
+
+void SIO_Net_PutByte(UBYTE out_byte);
+UBYTE SIO_Net_GetByte(void);
 
 #endif /* NETSIO_H */

@@ -36,7 +36,7 @@
 #include "pia.h"
 #include "pokey.h"
 #include "gtia.h"
-#include "sio.h"
+/* #include "sio.h" Disabled so we can use netsio */
 #ifndef BASIC
 #include "input.h"
 #include "statesav.h"
@@ -49,7 +49,6 @@
 #include "log.h"
 #include "input.h"
 #include "pbi.h"
-#include "netsio.h"
 
 #ifdef POKEYREC
 #include "pokeyrec.h"
@@ -63,6 +62,10 @@
 #ifdef POKEY_UPDATE
 void pokey_update(void);
 #endif
+
+/* NETSIO */
+#include "netsio.h"
+/* NETSIO */
 
 UBYTE POKEY_KBCODE;
 UBYTE POKEY_SERIN;
@@ -259,7 +262,7 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 		VOICEBOX_SEROUTPutByte(byte);
 #endif
 		if ((POKEY_SKCTL & 0x70) == 0x20 && POKEY_siocheck())
-			SIO_PutByte(byte);
+			SIO_Net_PutByte(byte);
 		/* check if cassette 2-tone mode has been enabled */
 		if ((POKEY_SKCTL & 0x08) == 0x00) {
 			/* intelligent device */
@@ -482,7 +485,7 @@ void POKEY_Scanline(void)
 	if (POKEY_DELAYED_SERIN_IRQ > 0) {
 		if (--POKEY_DELAYED_SERIN_IRQ == 0) {
 			/* Load a byte to SERIN - even when the IRQ is disabled. */
-			POKEY_SERIN = SIO_GetByte();
+			POKEY_SERIN = SIO_Net_GetByte();
 			if (POKEY_IRQEN & 0x20) {
 				if (POKEY_IRQST & 0x20) {
 					POKEY_IRQST &= 0xdf;

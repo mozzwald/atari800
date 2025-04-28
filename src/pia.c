@@ -29,7 +29,7 @@
 #include "cpu.h"
 #include "memory.h"
 #include "pia.h"
-#include "sio.h"
+/* #include "sio.h" Disabled to use netsio state machine */
 #include "pokey.h"
 #ifdef XEP80_EMULATION
 #include "xep80.h"
@@ -38,6 +38,10 @@
 #include "input.h"
 #include "statesav.h"
 #endif
+/* NETSIO */
+#include "netsio.h"
+#include "SDL/SDL.h" /* for SDL_Delay() */
+/* NETSIO */
 
 UBYTE PIA_PACTL;
 UBYTE PIA_PBCTL;
@@ -106,7 +110,23 @@ static void set_CB2(int value)
 	/* This code is part of the serial I/O emulation */
 	if (PIA_CB2 != value) {
 		/* The command line status has changed */
-		SIO_SwitchCommandFrame(!value);
+		/* SIO_SwitchCommandFrame(!value); */
+		if (!value)
+			netsio_cmd_on();
+		else
+		{
+			netsio_cmd_off_sync();
+			/* Wait for sync response */
+			int ticker = 0;
+			Log_print("pia: wait for ACK start");
+			while (netsio_sync_wait) { 
+				SDL_Delay(5);
+				if (ticker > 7)
+					break;
+				ticker++;		 	
+			}
+			Log_print("pia: wait for ACK end, %i ticks", ticker);
+		}
 	}
 	PIA_CB2 = value;
 }

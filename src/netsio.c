@@ -18,9 +18,30 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include "atari.h"
 #include "netsio.h"
 #include "log.h"
 #include "pia.h" /* For toggling PROC & INT */
+#include "pokey.h"
+
+#define SIO_ACK           0x41  /* “A” */
+#define SIO_COMPLETE      0x43  /* “C” */
+typedef enum {
+    ST_IDLE,           /* waiting for first command byte */
+    ST_CMD,            /* collecting 5-byte command frame */
+    ST_WAIT_ACK,       /* sent cmd, waiting for 0x41 */
+    ST_ACK,            /* got ACK */
+    ST_FRAME,          /* frame response to atari */
+    ST_FRAME_FINAL,    /* chksum byte */
+    ST_DATA,           /* now streaming payload */
+} sio_state_t;
+
+static sio_state_t state;
+static UBYTE     cmd_frame[5];
+static UBYTE     DataBuffer[260];    /* big enough for 128+1 or 4+1 */
+static int       cmd_index;
+static int       DataIndex;
+static int       ExpectedBytes;
 
 /* Flag to know when netsio is enabled */
 volatile int netsio_enabled = 0;
@@ -32,6 +53,8 @@ int fujinet_known = 0;
 int netsio_sync_wait = 0;
 /* true if cmd line pulled */
 int netsio_cmd_state = 0;
+/* holds how big the next emu -> netsio write size will be*/
+uint16_t netsio_next_write_size = 0;
 
 /* FIFO pipes:
 * fds0: FujiNet->emulator
@@ -184,12 +207,6 @@ int netsio_init(uint16_t port) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    /*
-    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("netsio: connect");
-        close(sockfd);
-        return -1;
-    }*/
 
     /* Bind to the socket on requested port */
     if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -204,14 +221,6 @@ int netsio_init(uint16_t port) {
     }
     pthread_detach(rx_thread);
 
-    /* spawn transmitter thread */
-/* Disabled this thread
-    if (pthread_create(&tx_thread, NULL, emu_tx_thread, NULL) != 0) {
-        perror("netsio: pthread_create tx");
-        return -1;
-    }
-    pthread_detach(tx_thread);
-*/
     return 0;
 }
 
@@ -230,6 +239,7 @@ int netsio_available(void) {
 /* COMMAND ON */
 int netsio_cmd_on(void)
 {
+    state = ST_CMD; /* set state machine */
     Log_print("netsio: CMD ON");
     netsio_cmd_state = 1;
     uint8_t p = NETSIO_COMMAND_ON;
@@ -249,11 +259,15 @@ int netsio_cmd_off(void)
 /* COMMAND OFF with SYNC */
 int netsio_cmd_off_sync(void)
 {
+    /* Send the whole command frame */
+    netsio_send_block((const uint8_t*)cmd_frame, sizeof(cmd_frame));
+    /* Send command off sync */
     Log_print("netsio: CMD OFF SYNC");
     uint8_t p[2] = { NETSIO_COMMAND_OFF_SYNC, netsio_sync_num };
     send_to_fujinet(&p, sizeof(p));
     netsio_sync_num++;
-    netsio_sync_wait = 1; /* pause emulation til we hear back */
+    /* freeze emulation til we hear back or timeout occurs */
+    netsio_sync_wait = 1;
     return 0;
 }
 
@@ -303,11 +317,6 @@ void netsio_test_cmd(void)
     uint8_t p[6] = { 0x70, 0xE8, 0x00, 0x00, 0x59 }; /* Send fujidev get adapter config request */
     netsio_cmd_on(); /* Turn on CMD */
     send_block_to_fujinet(p, sizeof(p));
-    /* send_byte_to_fujinet(0x70);
-    send_byte_to_fujinet(0xE8);
-    send_byte_to_fujinet(0x00);
-    send_byte_to_fujinet(0x00);
-    send_byte_to_fujinet(0x59); */
     netsio_cmd_off_sync(); /* Turn off CMD */
 }
 
@@ -389,7 +398,7 @@ static void *fujinet_rx_thread(void *arg) {
                               | (uint32_t)buf[3] << 16
                               | (uint32_t)buf[4] << 24;
                 Log_print("netsio: recv: requested baud rate %u", baud);
-                /* TODO: apply baud */
+                /* TODO: apply baud somehow */
                 break;
             }
 
@@ -402,7 +411,7 @@ static void *fujinet_rx_thread(void *arg) {
                 uint8_t  resp_sync  = buf[1];
                 uint8_t  ack_type   = buf[2];
                 uint8_t  ack_byte   = buf[3];
-                uint16_t write_size = buf[4] | (uint16_t)buf[5] << 8;
+                netsio_next_write_size = buf[4] | (uint16_t)buf[5] << 8;
 
                 if (resp_sync != netsio_sync_num - 1) {
                     Log_print("netsio: recv: sync-response: got %u, want %u",
@@ -410,17 +419,19 @@ static void *fujinet_rx_thread(void *arg) {
                 } else {
                     if (ack_type == 0) {
                         Log_print("netsio: recv: sync %u NAK, dropping", resp_sync);
+                        state = ST_IDLE;
                     } else if (ack_type == 1) {
                         Log_print("netsio: recv: sync %u ACK byte=0x%02X",
                                   resp_sync, ack_byte);
                         enqueue_to_emulator(&ack_byte, 1);
+                        state = ST_ACK;
                     } else {
                         Log_print("netsio: recv: sync %u unknown ack_type %u",
                                   resp_sync, ack_type);
+                        state = ST_IDLE;
                     }
-                    /* netsio_next_write_size = write_size; */
                 }
-                netsio_sync_wait = 0; /* continue emulation */
+                netsio_sync_wait = 0; /* unfreeze emulation */
                 break;
             }
 
@@ -477,76 +488,189 @@ static void *fujinet_rx_thread(void *arg) {
     return NULL;
 }
 
-/* Thread: receive from emulator FIFO and send to FujiNet socket, disabled/not used now */
-static void *emu_tx_thread(void *arg) {
-    uint8_t buf[4096];
-    size_t head = 0, tail = 0;
-    uint8_t packet[65536];
-    int i;
+/* NetSIO State Machine */
+void SIO_Net_PutByte(UBYTE out_byte)
+{
+/* failed raw send/recv disabled
+    if (netsio_cmd_state)
+    {
+        /* capturing the command frame from atari 
+        cmd_frame[cmd_index++] = out_byte;
 
-    for (;;) {
-        ssize_t n = read(fds1[0], buf + tail, sizeof(buf) - tail);
-        if (n <= 0) {
-            perror("netsio: read from TX FIFO");
-            /*exit(1);**/
-        }
-        tail += n;
-
-        head = 0;
-        while (head < tail) {
-            uint8_t cmd = buf[head];
-            size_t rem = tail - head;
-
-            /* Handle COMMAND ON */
-            if (cmd == NETSIO_COMMAND_ON) {
-                uint8_t r = NETSIO_COMMAND_ON;
-                Log_print("netsio: CMD ON");
-                send_to_fujinet(&r, 1);
-                head++;
-                continue;
-            }
-
-            /* Handle COMMAND OFF */
-            if (cmd == NETSIO_COMMAND_OFF) {
-                uint8_t r = NETSIO_COMMAND_OFF;
-                Log_print("netsio: CMD OFF");
-                send_to_fujinet(&r, 1);
-                head++;
-                continue;
-            }
-
-            /* Handle COMMAND OFF SYNC */
-            if (cmd == NETSIO_COMMAND_OFF_SYNC) {
-                uint8_t r = NETSIO_COMMAND_OFF_SYNC;
-                uint8_t b = 0x01;
-                Log_print("netsio: CMD OFF SYNC");
-                send_to_fujinet(&r, 1);
-                send_to_fujinet(&b, 1); /* FIXME: send real incremented sync counter */
-                head++;
-                continue;
-            }
-
-            /* Handle other NETSIO frames */
-            size_t pkt_len = 1;
-            if ((cmd == NETSIO_DATA_BYTE) || (cmd == NETSIO_DATA_BYTE_SYNC)) {
-                if (rem < 2) break;
-                pkt_len = 2;
-            } else if (cmd == NETSIO_DATA_BLOCK) {
-                if (rem < 3) break;
-                uint16_t L = buf[head+1] | (buf[head+2] << 8);
-                if (rem < 3 + L) break;
-                pkt_len = 3 + L;
-            }
-
-            memcpy(packet, buf + head, pkt_len);
-            send_to_fujinet(packet, pkt_len);
-            head += pkt_len;
-        }
-
-        if (head) {
-            memmove(buf, buf + head, tail - head);
-            tail -= head;
+        if (cmd_index == 5)
+        {
+            state = ST_ACK;
+            POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL + SIO_ACK_INTERVAL;
         }
     }
-    return NULL;
+    else
+    {
+        /* Send out the byte to netsio 
+        netsio_send_byte(out_byte);
+    }
+
+    /* POKEY_DELAYED_SEROUT_IRQ = SIO_SEROUT_INTERVAL; /* according to sio.c this is already set in pokey.c
+    return; */
+
+    /* state machine */
+    switch (state) {
+    case ST_IDLE:
+        /* beginning of a new frame */
+        cmd_index = 0;
+        /* fall through */
+
+    case ST_CMD:
+        /* buffer it */
+        cmd_frame[cmd_index++] = out_byte;
+        /* command frame send moved to netsio_cmd_off_sync() so we can
+           send a block instead of individual bytes */        
+
+        /* once we have all 5 bytes, wait for ACK */
+        if (cmd_index == 5) {
+            state = ST_ACK;
+            POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL + SIO_ACK_INTERVAL;
+        }
+        break;
+    case ST_FRAME_FINAL:
+
+        break;
+    default:
+        break;
+    }
+}
+
+UBYTE SIO_Net_GetByte(void)
+{
+    UBYTE b, ack;
+    int i = 0;
+
+    /* failed raw send/recv disabled
+    if (netsio_available())
+    {
+        netsio_recv_byte(&b);
+        return b;
+    }
+
+    return 0; */
+
+    /* state machine */
+    switch (state) {
+    case ST_ACK:
+        /* Got ACK (0x41) */
+        if (netsio_recv_byte(&b) < 0) return 0;
+        if (b == 0x41) {
+            ack = b;
+            /* queue the data  */
+            switch(cmd_frame[1])
+            {
+                case 0x4e: /* Read Status */
+                    POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL;
+                    break;
+                case 0x52: /* read */
+                    POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL << 2;
+                    break;
+                case 0x53: /* status */
+                case 0xD3: /* xf551 hispeed */
+                    Log_print("netsio: ACK! 0x53 STATUS");
+        
+                    netsio_recv_byte(&b);
+                    if (b != 0x43)
+                    {
+                        state = ST_IDLE;
+                        Log_print("netsio: state: ACK, no complete");
+                        return 0;       /* no Complete, bail out */
+                    }
+
+                    /* queue data into the buffer, 4 bytes */
+                    for (i = 0; i < 4; i++) {
+                        netsio_recv_byte(&b);
+                        DataBuffer[1 + i] = b;
+                    }
+        
+                    DataBuffer[0] = 'C';   /* Complete */
+                    netsio_recv_byte(&b);  /* get chksum */
+                    DataBuffer[5] = b;     /* put chksum */
+                
+                    DataIndex      = 0;
+                    ExpectedBytes  = 6;    /* 'C' + 4 data + chksum */
+                    POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL;
+                    state = ST_FRAME;
+                    return 'A';
+            }
+        } else {
+            /* unexpected—abort */
+            state = ST_IDLE;
+        }
+        Log_print("netsio: state ACK: return 0 failure");
+        return 0;
+    case ST_FRAME:
+        if (DataIndex < ExpectedBytes)
+        {
+            b = DataBuffer[DataIndex++];
+            
+            if (DataIndex >= ExpectedBytes)
+            {
+                state = ST_IDLE;
+                Log_print("netsio: state change FRAME->IDLE");
+            }
+            else
+            {
+                /* set delay using the expected transfer speed */
+                POKEY_DELAYED_SERIN_IRQ = (DataIndex == 1) ? SIO_SERIN_INTERVAL
+                    : ((SIO_SERIN_INTERVAL * POKEY_AUDF[POKEY_CHAN3] - 1) / 0x28 + 1);
+            }
+        }
+        else
+        {
+            Log_print("Invalid read frame!");
+            state = ST_IDLE;
+        }
+        Log_print("netsio: state FRAME: to emu: %02X", b);
+        return b;
+        /* and older try at ST_FRAME state, we never get here */
+        if (DataIndex < ExpectedBytes) {
+            /* grab the next byte out of our buffer */
+            b = DataBuffer[DataIndex++];
+            /* if this was the very last byte (the checksum), idle afterwards */
+            if (DataIndex == ExpectedBytes)
+            {
+                state = ST_IDLE;
+                /* last byte needs the extra ACK‐interval delay */
+                /* Log_print("netsio: state FRAME: pokey ACK interval"); */
+                POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL + SIO_ACK_INTERVAL;
+            }
+            else
+            {
+                /* every other byte is paced at the normal serial‐in rate */
+                POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL;
+            }
+            /* set delay using the expected transfer speed */
+            POKEY_DELAYED_SERIN_IRQ = (DataIndex == 1) ? SIO_SERIN_INTERVAL
+            : ((SIO_SERIN_INTERVAL * POKEY_AUDF[POKEY_CHAN3] - 1) / 0x28 + 1);
+
+            Log_print("netsio: state FRAME: pass byte %02X", b);
+            return b;
+        }
+        /* shouldn’t ever hit this, but if we do, bail out */
+        Log_print("netsio: state FRAME: Unexpected extra byte");
+        state = ST_IDLE;
+        return 0;
+    case ST_FRAME_FINAL:
+        /* This state seems useless and is never entered */
+        state = ST_IDLE;
+        POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL;
+        return 0;
+    case ST_DATA:
+        /* stream payload bytes */
+        if (netsio_recv_byte(&b) < 0) return 0;
+        
+        /*data_buffer[data_index++] = b;
+        if (data_index >= expected_bytes) {
+            state = ST_IDLE;
+        }*/
+        return b;
+
+    default:
+        return 0;
+    }
 }
