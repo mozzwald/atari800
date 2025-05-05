@@ -842,7 +842,7 @@ int Atari800_Initialise(int *argc, char *argv[])
 		|| !PIA_Initialise(argc, argv)
 		|| !POKEY_Initialise(argc, argv)
 	) {
-		Atari800_ErrExit();
+		Atari800_ErrExit("Big IF after setmachinetype");
 		return FALSE;
 	}
 
@@ -856,7 +856,7 @@ int Atari800_Initialise(int *argc, char *argv[])
 #if SUPPORTS_CHANGE_VIDEOMODE
 #ifndef DONT_DISPLAY
 	if (!VIDEOMODE_InitialiseDisplay()) {
-		Atari800_ErrExit();
+		Atari800_ErrExit("VIDEOMODE_Init_Display");
 		return FALSE;
 	}
 #endif
@@ -1076,8 +1076,9 @@ int Atari800_Exit(int run_monitor)
 	return restart;
 }
 
-void Atari800_ErrExit(void)
+void Atari800_ErrExit_real(const char *msg)
 {
+	Log_print("ErrExit: %s", msg);
 	CFG_save_on_exit = FALSE; /* avoid saving the config */
 	Atari800_Exit(FALSE);
 }

@@ -144,8 +144,15 @@ int Atari800_Exit(int run_monitor);
 
 /* Shuts down Atari800 emulation core. Use it for emergency-exiting
    such as on failure. */
-void Atari800_ErrExit(void);
-
+void Atari800_ErrExit_real(const char *msg);
+#define Atari800_ErrExit(...)                           \
+    do {                                                \
+        /* stringize the arguments: #__VA_ARGS__ == ""  \
+           if no args were passed */                    \
+        const char *_s = #__VA_ARGS__;                  \
+        /* if _s[0]=='\0' it was called with no args */ \
+        Atari800_ErrExit_real(_s[0] ? __VA_ARGS__ : NULL); \
+    } while (0)
 
 /* Private interface ----------------------------------------------------- */
 /* Don't use outside the emulation core! */
