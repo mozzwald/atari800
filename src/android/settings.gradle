@@ -1,0 +1,4 @@
+// settings.gradle
+rootProject.name = "Colleen"
+include ":app"
+project(":app").projectDir = file("app")

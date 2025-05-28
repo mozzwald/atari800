@@ -322,8 +322,8 @@ $(TARGET_BASE_NAME).jar: $(TARGET_BASE_NAME).class $(TARGET_BASE_NAME)$(RUNTIME)
 
 # Allow parallel execution in sub-make with '+'
 android:
-	+ $(NDK_BUILD) -C android
-	ant -f android/build.xml debug
+	$(NDK_BUILD) -C android/app
+#	ant -f android/build.xml debug
 .PHONY: android
 
 CLEANFILES = *.o *.a *.class .manifest $(TARGET) $(TARGET_BASE_NAME).jar $(TARGET_BASE_NAME)_runtime.java core *.bak *~

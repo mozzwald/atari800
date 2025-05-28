@@ -36,7 +36,7 @@
 #include "screen.h"
 #include "cpu.h"
 #include "antic.h"
-#include "../../memory.h"	/* override system header */
+#include "../../../memory.h"	/* override system header */
 #include "sio.h"
 #include "sysrom.h"
 #include "akey.h"

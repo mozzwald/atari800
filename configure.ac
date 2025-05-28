@@ -170,10 +170,10 @@ if [[ "$a8_target" = "rpi" ]]; then
     LDFLAGS="$LDFLAGS -Wl,--unresolved-symbols=ignore-in-shared-libs -L${RPI_SDK}/lib"
 fi
 if [[ "$a8_target" = "android" ]]; then
-	CC="arm-linux-androideabi-gcc"
-	CPP="arm-linux-androideabi-cpp"
+#	CC="arm-linux-androideabi-gcc"
+#	CPP="arm-linux-androideabi-cpp"
 	AC_NO_EXECUTABLES
-	CPPFLAGS="$CPPFLAGS -I$ANDROID_NDK_ROOT/platforms/android-9/arch-arm/usr/include/"
+#	CPPFLAGS="$CPPFLAGS -I$ANDROID_NDK_ROOT/platforms/android-9/arch-arm/usr/include/"
 	WANT_IDE=no
 	with_readline=no
 	WANT_EVENT_RECORDING=no
@@ -1368,7 +1368,7 @@ src/Makefile
 tools/Makefile
 ])
 if [[ "$a8_target" = "android" ]]; then
-	AC_CONFIG_FILES(src/android/jni/Android.mk)
+	AC_CONFIG_FILES(src/android/app/jni/Android.mk)
 fi
 AC_OUTPUT
 

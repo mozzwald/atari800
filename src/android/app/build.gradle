@@ -1,0 +1,107 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace "name.nick.jubanka.colleen"
+    compileSdkVersion 33
+
+    defaultConfig {
+        applicationId "name.nick.jubanka.colleen"
+        minSdkVersion 16
+        targetSdkVersion 33
+        versionCode 1
+        versionName "1.0"
+
+        // Only ABI filters here
+        ndk {
+            abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+        }
+    }
+
+    buildTypes {
+        debug {
+            // Pass NDK_DEBUG=1 when building debug
+            externalNativeBuild {
+                ndkBuild {
+                    arguments "NDK_DEBUG=1"
+                }
+            }
+        }
+        release {
+            // Pass NDK_DEBUG=0 when building release
+            externalNativeBuild {
+                ndkBuild {
+                    arguments "NDK_DEBUG=0"
+                }
+            }
+            minifyEnabled false
+        }
+    }
+
+    // Point at the generated Android.mk (not the .in)
+    externalNativeBuild {
+        ndkBuild {
+            path file("jni/Android.mk")
+        }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile "AndroidManifest.xml"
+            java.srcDirs   = ["src"]
+            res.srcDirs    = ["res"]
+            // JNI is driven by externalNativeBuild, so no jni.srcDirs here
+        }
+    }
+}
+
+dependencies {
+    implementation fileTree(dir: "libs", include: ["*.jar"])
+}
+
+// -----------------------------------------------------------------
+//  Now hook in your autotools core‐build BEFORE ndkBuild runs
+// -----------------------------------------------------------------
+
+// point at the atari800 root (two levels above app/)
+def coreDir = project.rootDir.parentFile.parentFile
+
+tasks.register("autogenCore", Exec) {
+    description = "Run autogen.sh if configure is missing"
+    workingDir coreDir
+    commandLine "./autogen.sh"
+    onlyIf { !file("${coreDir}/configure").exists() }
+}
+
+tasks.register("configureCore", Exec) {
+    description = "Configure Atari800 core for Android"
+    dependsOn tasks.named("autogenCore")
+    workingDir coreDir
+    commandLine "./configure",
+            "--host=armv7a-linux-androideabi",
+            "--build=x86_64-unknown-linux-gnu",
+            "--target=android",
+            "--enable-seriosound",
+            "--disable-monitorbreak",
+            "--enable-pagedattrib",
+            "--disable-crashmenu",
+            "--disable-monitorasm",
+            "--disable-monitorhints",
+            "--without-readline",
+            "--enable-clipsound",
+            "--disable-riodevice"
+}
+
+tasks.register("buildCore", Exec) {
+    description = "Compile the Atari800 core (make -jN)"
+    dependsOn tasks.named("configureCore")
+    workingDir coreDir
+    commandLine "make", "-j${Runtime.runtime.availableProcessors()}"
+}
+
+afterEvaluate {
+    // make every externalNativeBuild task depend on buildCore
+    tasks.matching { it.name.startsWith("externalNativeBuild") }
+         .configureEach { it.dependsOn tasks.named("buildCore") }
+}
