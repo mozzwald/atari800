@@ -340,7 +340,9 @@ int SIO_Mount(int diskno, const char *filename, int b_open_readonly)
 		vapi_additional_info_t *info;
 		vapi_file_header_t fileheader;
 		vapi_track_header_t trackheader;
-		int trackoffset, totalsectors;
+		int trackoffset;
+		/* Variable stores the total sector count from track headers but not currently used */
+		int totalsectors __attribute__((unused));
 
 		/* .atx is read only for now */
 #ifndef VAPI_WRITE_ENABLE

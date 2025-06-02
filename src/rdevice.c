@@ -354,9 +354,11 @@ static void xio_34(void)
 ---------------------------------------------------------------------------*/
 static void xio_36(void)
 {
-  int aux1;
 #if defined(R_SERIAL) && !defined(DREAMCAST)
   struct termios options;
+  int aux1;
+#else
+  int aux1 __attribute__((unused));
 #endif /* defined(R_SERIAL) && !defined(DREAMCAST) */
 
   aux1 = MEMORY_dGetByte(Devices_ICAX1Z);
@@ -940,7 +942,8 @@ void RDevice_OPEN(void)
 {
   int  port;
   int  direction;
-  int  devnum;
+  /* Variable not currently used, but might be needed in the future */
+  int  devnum __attribute__((unused));
 
   CPU_regA = 1;
   CPU_regY = 1;

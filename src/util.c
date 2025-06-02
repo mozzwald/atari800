@@ -360,12 +360,18 @@ void Util_splitpath(const char *path, char *dir_part, char *file_part)
 
 void Util_catpath(char *result, const char *path1, const char *path2)
 {
-	snprintf(result, FILENAME_MAX,
-		path1[0] == '\0' || path2[0] == Util_DIR_SEP_CHAR || path1[strlen(path1) - 1] == Util_DIR_SEP_CHAR
+	/* Check if we need to add a directory separator between paths */
+	int add_sep = 0;
+	if (path1[0] == '\0' || path2[0] == Util_DIR_SEP_CHAR || path1[strlen(path1) - 1] == Util_DIR_SEP_CHAR) {
+		add_sep = 1;
+	}
 #ifdef DIR_SEP_BACKSLASH
-		 || path2[0] == '/' || path1[strlen(path1) - 1] == '/'
+	if (path2[0] == '/' || path1[strlen(path1) - 1] == '/') {
+		add_sep = 1;
+	}
 #endif
-			? "%s%s" : "%s" Util_DIR_SEP_STR "%s", path1, path2);
+	/* Format the result based on whether we need a separator */
+	snprintf(result, FILENAME_MAX, add_sep ? "%s%s" : "%s" Util_DIR_SEP_STR "%s", path1, path2);
 }
 
 static int parse_hashes(const char *p, char *buffer, int bufsize)
