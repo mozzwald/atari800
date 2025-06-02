@@ -583,7 +583,6 @@ static void *fujinet_rx_thread(void *arg) {
 #ifdef DEBUG
                 Log_print("netsio: recv: requested baud rate %u", baud);
 #endif
-                /* TODO: apply baud */
                 send_to_fujinet(buf, 5); /* echo back */
                 break;
             }
@@ -638,6 +637,8 @@ static void *fujinet_rx_thread(void *arg) {
                 break;
             }
 
+            /* set_CA1 and set_CB1 wrapped in NETSIO conditional to prevent warnings when disabled */
+#ifdef NETSIO
             /* set_CA1 */
             case NETSIO_PROCEED_ON:
             {
@@ -657,6 +658,7 @@ static void *fujinet_rx_thread(void *arg) {
             {
                 break;
             }
+#endif /* NETSIO */
 
             case NETSIO_DATA_BYTE:
             {
