@@ -113,6 +113,8 @@ static void set_CB2(int value)
     
 /* ----- PROCEED (CA1) and INTERRUPT (CB1) input pin handling ----- */
 /* Update PROCEED pin (CA1) */
+/* Currently unused but kept for potential future use */
+static void set_CA1(int value) __attribute__((unused));
 static void set_CA1(int value)
 {
     if (PIA_CA1 != value) {
@@ -124,6 +126,8 @@ static void set_CA1(int value)
 }
 
 /* Update INTERRUPT pin (CB1) */
+/* Currently unused but kept for potential future use */
+static void set_CB1(int value) __attribute__((unused));
 static void set_CB1(int value)
 {
     if (PIA_CB1 != value) {

@@ -27,8 +27,13 @@
 #include "SDL/SDL.h" /* For SDL_Delay() on Linux */
 #endif
 
+#ifdef DEBUG
 static char *buf_to_hex(const uint8_t *buf, size_t offset, size_t len);
+#endif
+#ifdef NETSIO
+/* Declared but not currently used - kept for potential future use */
 static void send_byte_to_fujinet(uint8_t data_byte);
+#endif
 static void send_block_to_fujinet(const uint8_t *block, size_t len);
 
 /* Flag to know when netsio is enabled */
@@ -54,8 +59,12 @@ static socklen_t fujinet_addr_len = sizeof(fujinet_addr);
 
 /* Thread declarations */
 static void *fujinet_rx_thread(void *arg);
+#ifdef NETSIO
+/* Declared but not currently used - kept for potential future use */
 static void *emu_tx_thread(void *arg);
+#endif
 
+#ifdef DEBUG
 char *buf_to_hex(const uint8_t *buf, size_t offset, size_t len) {
     /* each byte takes "XX " == 3 chars, +1 for trailing NUL */
     size_t needed = len * 3 + 1;
@@ -75,6 +84,7 @@ char *buf_to_hex(const uint8_t *buf, size_t offset, size_t len) {
         *p = '\0';
     return s;
 }
+#endif
 
 /* write data to emulator FIFO (fujinet_rx_thread) */
 static void enqueue_to_emulator(const uint8_t *pkt, size_t len) {
@@ -179,6 +189,7 @@ static void send_to_fujinet(const uint8_t *pkt, size_t len) {
 }
 
 
+#ifdef NETSIO
 /* Send a single byte as a DATA_BYTE packet */
 static void send_byte_to_fujinet(uint8_t data_byte) {
     uint8_t packet[2];
@@ -186,6 +197,7 @@ static void send_byte_to_fujinet(uint8_t data_byte) {
     packet[1] = data_byte;
     send_to_fujinet(packet, sizeof(packet));
 }
+#endif
 
 /* Send up to 512 bytes as a DATA_BLOCK packet */
 static void send_block_to_fujinet(const uint8_t *block, size_t len) {
@@ -450,7 +462,6 @@ void netsio_test_cmd(void)
 /* Thread: receive from FujiNet socket (one packet == one command) */
 static void *fujinet_rx_thread(void *arg) {
     uint8_t buf[4096];
-    uint8_t packet[65536];
     uint8_t cmd;
     ssize_t n;
 
@@ -568,7 +579,7 @@ static void *fujinet_rx_thread(void *arg) {
             case NETSIO_SPEED_CHANGE:
             {
                 /* packet: [cmd][baud32le] */
-                uint32_t baud;
+                uint32_t baud; /* Used only for debug output */
                 if (n < 5)
                 {
 #ifdef DEBUG
