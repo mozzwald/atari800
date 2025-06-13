@@ -933,6 +933,12 @@ A8_OPTION(netsio,yes,
 AM_CONDITIONAL([WANT_NETSIO], test "$WANT_NETSIO" = "yes")
 fi
 
+if test "x$WANT_NETSIO" = "xyes"; then
+    AC_DEFINE([NETSIO], [1], [Define to enable NetSIO (FujiNet) support])
+    CFLAGS="$CFLAGS -DNETSIO"
+    AC_SUBST([CFLAGS])
+fi
+
 dnl Select/detect sound interface.
 
 AC_ARG_WITH([sound],
