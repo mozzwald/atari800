@@ -84,6 +84,8 @@ SUPPORTS_RDEVICE="yes"
 SUPPORTS_NETSIO="yes"
 WANT_NETSIO="yes"
 
+AM_CONDITIONAL([WANT_NETSIO], [test "x$WANT_NETSIO" = "xyes"])
+
 dnl Set a8_host...
 
 if [[ "$host_os" = "cygwin" ]]; then
