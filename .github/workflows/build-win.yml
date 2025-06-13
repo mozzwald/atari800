@@ -1,12 +1,7 @@
 name: Build Atari800 (MSYS2 Windows)
 
 on:
-  push:
-    branches:
-      - netsio-device-agnostic
-  pull_request:
-    branches:
-      - netsio-device-agnostic
+  workflow_dispatch:
 
 jobs:
   build-windows-msys2:
