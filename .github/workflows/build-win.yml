@@ -2,6 +2,12 @@ name: Build Atari800 for WIN
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - netsio-build-win
+  pull_request:
+    branches:
+      - netsio-build-win
 
 jobs:
   build-windows-msys2:
