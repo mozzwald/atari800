@@ -1,4 +1,4 @@
-name: Build Atari800 (MSYS2 Windows)
+name: Build Atari800 for WIN
 
 on:
   workflow_dispatch:
