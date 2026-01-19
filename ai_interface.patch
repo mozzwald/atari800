@@ -1,0 +1,90 @@
+--- AI Interface Integration Patch for Atari800 ---
+This patch integrates the AI interface into the Atari800 emulator.
+
+Apply with: patch -p1 < ai_interface.patch
+
+=== Modified: src/atari.c ===
+
+--- a/src/atari.c
++++ b/src/atari.c
+@@ -73,6 +73,10 @@
+ #include "sysrom.h"
+ #include "ui.h"
+
++#ifdef AI_INTERFACE
++#include "ai_interface.h"
++#endif
++
+ int Atari800_machine_type = Atari800_MACHINE_XLXE;
+ int Atari800_builtin_basic = FALSE;
+ int Atari800_keyboard_leds = FALSE;
+@@ -860,6 +864,11 @@ int Atari800_Initialise(int *argc, char *argv[])
+ 		|| !POKEY_Initialise(argc, argv)
+ 	)
+ 		Atari800_ErrExit();
++
++#ifdef AI_INTERFACE
++	if (!AI_Initialise(argc, argv))
++		Atari800_ErrExit();
++#endif
+
+ 	/* Configure Atari system after initialisation of all modules. */
+ 	if (!Atari800_LoadConfig(CFG_FILENAME))
+@@ -1009,6 +1018,9 @@ int Atari800_Exit(int run_monitor)
+ 		return 1;
+ #endif
+
++#ifdef AI_INTERFACE
++	AI_Exit();
++#endif
+ 	INPUT_Exit();
+ 	Colours_Exit();
+
+@@ -1319,6 +1331,11 @@ void Atari800_Frame(void)
+ {
+ 	INPUT_Frame();
+
++#ifdef AI_INTERFACE
++	/* Process AI commands - may pause execution */
++	AI_Frame();
++#endif
++
+ 	/* Process a frame of display (either direct rendering or drawing
+ 	   into ANTIC_Frame_buffer). */
+
+
+=== Modified: src/memory.c ===
+
+--- a/src/memory.c
++++ b/src/memory.c
+@@ -34,6 +34,10 @@
+ #include "sio.h"
+ #include "gtia.h"
+
++#ifdef AI_INTERFACE
++#include "ai_interface.h"
++#endif
++
+ UBYTE MEMORY_mem[65536 + 2];
+
+ #ifndef PAGED_ATTRIB
+@@ -1217,6 +1221,14 @@ void MEMORY_HwPutByte(UWORD addr, UBYTE byte)
+ 		PBI_D6PutByte(addr, byte);
+ 		break;
+ 	case 0xd700:				/* PBI page D7 */
++#ifdef AI_INTERFACE
++		/* AI debug port - capture writes to configured address */
++		if (AI_debug_port && addr == (UWORD)AI_debug_port) {
++			AI_DebugWrite(byte);
++			break;
++		}
++#endif
+ 		PBI_D7PutByte(addr, byte);
+ 		break;
+ 	default:
+
+=== Modified: src/Makefile.in (add to SOURCES) ===
+
+Add ai_interface.c to the list of sources in Makefile.in
+Add -DAI_INTERFACE to CFLAGS
+

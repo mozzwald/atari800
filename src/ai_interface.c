@@ -305,20 +305,19 @@ static void process_command(const char *cmd) {
     /* === SCREEN === */
     else if (strcmp(cmd_type, "screenshot") == 0) {
         json_get_string(cmd, "path", path, sizeof(path));
-        if (path[0]) {
-            if (Screen_SaveScreenshot(path, 0)) {
-                snprintf(ai_response, sizeof(ai_response),
-                    "{\"status\":\"ok\",\"path\":\"%s\"}", path);
-            } else {
-                snprintf(ai_response, sizeof(ai_response),
-                    "{\"status\":\"error\",\"msg\":\"Failed to save screenshot\"}");
-            }
-        } else {
-            /* Default path */
+        if (!path[0]) {
             snprintf(path, sizeof(path), "/tmp/atari800_ai_%ld.png", (long)time(NULL));
-            Screen_SaveScreenshot(path, 0);
+        }
+        /* Debug: log screen dimensions */
+        Log_print("AI screenshot: path=%s vis=%d,%d-%d,%d", path,
+            Screen_visible_x1, Screen_visible_y1, Screen_visible_x2, Screen_visible_y2);
+        if (Screen_SaveScreenshot(path, 0)) {
             snprintf(ai_response, sizeof(ai_response),
                 "{\"status\":\"ok\",\"path\":\"%s\"}", path);
+        } else {
+            snprintf(ai_response, sizeof(ai_response),
+                "{\"status\":\"error\",\"msg\":\"Failed to save screenshot vis=%d,%d-%d,%d\"}",
+                Screen_visible_x1, Screen_visible_y1, Screen_visible_x2, Screen_visible_y2);
         }
         AI_SendResponse(ai_response);
     }
@@ -367,7 +366,7 @@ static void process_command(const char *cmd) {
                     while (*data == ' ' || *data == ',') data++;
                     if (*data >= '0' && *data <= '9') {
                         int val = atoi(data);
-                        MEMORY_PutByte((UWORD)addr++, (UBYTE)val);
+                        MEMORY_mem[(UWORD)addr++] = (UBYTE)val;  /* Direct write - bypasses attribute check */
                         while (*data >= '0' && *data <= '9') data++;
                     } else {
                         break;

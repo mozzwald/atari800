@@ -879,6 +879,7 @@ int Screen_SaveScreenshot(const char *filename, int interlaced)
 	UBYTE *ptr1;
 	UBYTE *ptr2;
 
+	Log_print("Screen_SaveScreenshot: filename=%s Screen_atari=%p", filename, (void*)Screen_atari);
 	if (!File_Export_ImageTypeSupported(filename)) {
 		Log_print("Unsupported image type for file: %s", filename);
 		return FALSE;

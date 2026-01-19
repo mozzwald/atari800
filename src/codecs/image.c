@@ -89,5 +89,8 @@ int CODECS_IMAGE_Init(const char *filename)
 {
 	image_codec = match_image_codec(filename);
 	CODECS_IMAGE_SetMargins();
+	fprintf(stderr, "CODECS_IMAGE_Init: %s -> codec=%p margins=%d,%d size=%dx%d\n",
+		filename, (void*)image_codec, image_codec_left_margin, image_codec_top_margin,
+		image_codec_width, image_codec_height);
 	return (image_codec != NULL);
 }

@@ -378,12 +378,17 @@ int File_Export_SaveScreen(const char *filename, UBYTE *ptr1, UBYTE *ptr2) {
 	FILE *fp;
 
 	CODECS_IMAGE_Init(filename);
+	fprintf(stderr, "File_Export_SaveScreen: codec=%p ptr1=%p\n", (void*)image_codec, (void*)ptr1);
 	if (image_codec) {
 		fp = fopen(filename, "wb");
+		fprintf(stderr, "File_Export_SaveScreen: fopen(%s) = %p\n", filename, (void*)fp);
 		if (fp == NULL)
 			return 0;
 		result = image_codec->to_file(fp, ptr1, ptr2);
+		fprintf(stderr, "File_Export_SaveScreen: to_file returned %d\n", result);
 		fclose(fp);
+	} else {
+		fprintf(stderr, "File_Export_SaveScreen: No codec found!\n");
 	}
 	return result;
 }

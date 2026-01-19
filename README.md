@@ -12,7 +12,7 @@ This fork adds a **real-time AI interface** that allows external programs to:
 - Save/load emulator state
 - Run frame-by-frame for precise control
 
-This enables **autonomous game testing**, **AI training**, **automated debugging**, and **tool-assisted development**.
+Useful for automated testing, debugging tools, and programmatic emulator control.
 
 ## Building
 
@@ -216,7 +216,7 @@ See [COPYING](COPYING) for the full license text.
 ## Credits
 
 - **Original atari800 emulator:** https://github.com/atari800/atari800
-- **AI Interface additions:** Benj Edwards with Claude (Anthropic)
+- **AI Interface additions:** Benj Edwards using Claude Code
 
 ## See Also
 
