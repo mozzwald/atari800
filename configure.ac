@@ -22,6 +22,8 @@ dnl   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 
 
 AC_PREREQ(2.57)
 AC_INIT(Atari800, 5.2.0, pstehlik@sophics.cz)
+AC_PROG_CC
+AC_PROG_CC_C99
 AC_CONFIG_SRCDIR(src/atari.c)
 AC_CONFIG_HEADER(src/config.h)
 AC_CONFIG_MACRO_DIR([m4])
@@ -206,8 +208,6 @@ fi
 
 dnl Check for programs...
 
-AC_PROG_CC
-AC_PROG_CC_C_O
 AC_PROG_INSTALL
 AC_PROG_RANLIB
 AC_CHECK_TOOLS(WINDRES, [windres], :)
@@ -826,6 +826,12 @@ AC_DEFUN([A8_OPTION],[
     fi
 ])
 
+A8_OPTION(ai-interface,no,
+          [Enable AI interface integration (default=OFF)],
+          AI_INTERFACE,[Define to enable AI interface integration.]
+         )
+AM_CONDITIONAL(AI_INTERFACE, test "$WANT_AI_INTERFACE" = "yes")
+
 if [[ "$a8_target" = "libatari800" ]]; then
     WANT_NEW_CYCLE_EXACT=yes
     WANT_VERY_SLOW=no
@@ -1440,6 +1446,7 @@ AC_SUBST(JAVACFLAGS)
 AC_SUBST(CCAS)
 AC_SUBST(CCASFLAGS)
 CFLAGS_NOANSI=`echo $CFLAGS | sed -e 's/-ansi//' -e 's/-pedantic//'`
+CFLAGS=`echo "$CFLAGS" | sed -e 's/-ansi//g' -e 's/-pedantic//g'`
 AC_SUBST(CFLAGS_NOANSI)
 
 AC_CONFIG_FILES([
