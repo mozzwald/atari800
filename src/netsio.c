@@ -339,7 +339,30 @@ void netsio_wait_for_sync(void)
 
 /* Return number of bytes waiting from FujiNet to emulator */
 int netsio_available(void) {
-    int avail = __sync_fetch_and_add(&netsio_rx_bytes_queued, 0);
+    int avail = 0;
+
+    /* Preserve original ioctl/FIONREAD behavior as authoritative source. */
+    if (fds0[0] >= 0)
+    {
+        if (ioctl(fds0[0], FIONREAD, &avail) < 0)
+        {
+#ifdef DEBUG
+            Log_print("netsio_avail: ioctl error");
+#endif
+            return -1;
+        }
+
+        /* Keep queue counter synchronized with kernel pipe state. */
+        if (avail > 0)
+            __sync_lock_test_and_set(&netsio_rx_bytes_queued, avail);
+        else
+            __sync_lock_test_and_set(&netsio_rx_bytes_queued, 0);
+
+        return avail;
+    }
+
+    /* Fallback if FIFO has not been initialized yet. */
+    avail = __sync_fetch_and_add(&netsio_rx_bytes_queued, 0);
     return avail > 0 ? avail : 0;
 }
 
