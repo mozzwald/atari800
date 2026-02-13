@@ -34,6 +34,8 @@ volatile int netsio_enabled = 0;
 uint8_t netsio_sync_num = 0;
 /* if we have heard from fujinet-pc or not */
 int fujinet_known = 0;
+/* Number of bytes queued in fds0, maintained without ioctl(FIONREAD). */
+static volatile int netsio_rx_bytes_queued = 0;
 /* wait for fujinet sync if true */
 volatile int netsio_sync_wait = 0;
 /* true if cmd line pulled */
@@ -99,6 +101,8 @@ static void enqueue_to_emulator(const uint8_t *pkt, size_t len) {
 #endif
             /*exit(1);*/
         }
+        if (n > 0)
+            __sync_fetch_and_add(&netsio_rx_bytes_queued, (int) n);
         pkt += n;
         len -= n;
     }
@@ -208,6 +212,7 @@ int netsio_init(uint16_t port) {
     struct sockaddr_in addr;
     pthread_t rx_thread;
     int broadcast = 1;
+    netsio_rx_bytes_queued = 0;
 
     /* create emulator <-> netsio FIFOs */
     if (pipe(fds0) < 0)
@@ -299,18 +304,8 @@ void netsio_wait_for_sync(void)
 
 /* Return number of bytes waiting from FujiNet to emulator */
 int netsio_available(void) {
-    int avail = 0;
-    if (fds0[0] >= 0)
-    {
-        if (ioctl(fds0[0], FIONREAD, &avail) < 0)
-        {
-#ifdef DEBUG
-            Log_print("netsio_avail: ioctl error");
-#endif
-            return -1;
-        }
-    }
-    return avail;
+    int avail = __sync_fetch_and_add(&netsio_rx_bytes_queued, 0);
+    return avail > 0 ? avail : 0;
 }
 
 /* COMMAND ON */
@@ -436,6 +431,8 @@ int netsio_recv_byte(uint8_t *b) {
     }
     if (n == 0)
         return -1; /* FIFO closed? */
+    if (__sync_sub_and_fetch(&netsio_rx_bytes_queued, 1) < 0)
+        netsio_rx_bytes_queued = 0;
 #ifdef DEBUG2
     Log_print("netsio: read to emu: %02X", (unsigned)*b);
 #endif

@@ -1643,7 +1643,6 @@ void NetSIO_PutByte(int byte)
 				 /* send checksum byte + sync */
 				netsio_send_byte_sync(DataBuffer[DataIndex-1]);
 				netsio_wait_for_sync() ; /* Wait for sync response (ACK/NAK/NONE) */
-				POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL * 8;
 				DataIndex = 0;
 				TransferStatus = SIO_FinalStatus; /* Receive ACK+COMPLETE/NAK in SIO_GetByte */
 			}
