@@ -68,6 +68,7 @@
 #include "esc.h"
 #include "memory.h"
 #include "monitor.h"
+#include "pokey.h"
 #ifndef BASIC
 #include "statesav.h"
 #ifndef __PLUS
@@ -2427,6 +2428,8 @@ void CPU_GO(int limit)
 	next:
 #endif
 
+		POKEY_AdvanceSerialToClock(ANTIC_CPU_CLOCK);
+
 #ifdef MONITOR_PROFILE
 		{
 			int cyc = ANTIC_xpos - old_xpos;
@@ -2454,6 +2457,7 @@ void CPU_GO(int limit)
 	}
 
 #endif /* FALCON_CPUASM */
+	POKEY_AdvanceSerialToClock(ANTIC_CPU_CLOCK);
 	UPDATE_GLOBAL_REGS;
 }
 

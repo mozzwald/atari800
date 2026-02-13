@@ -59,6 +59,7 @@ UBYTE POKEY_GetByte(UWORD addr, int no_side_effects);
 void POKEY_PutByte(UWORD addr, UBYTE byte);
 int POKEY_Initialise(int *argc, char *argv[]);
 void POKEY_Frame(void);
+void POKEY_AdvanceSerialToClock(unsigned int cpu_clock);
 void POKEY_Scanline(void);
 void POKEY_StateSave(void);
 void POKEY_StateRead(void);

@@ -120,6 +120,7 @@ static void set_CB2(int value)
 /* Set PROCEED pin (CA1) */
 void PIA_SetCA1(int value)
 {
+	value = value ? 1 : 0;
 	if (PIA_CA1 != value) {
 		int active_transition = ((value == 1) == ((PIA_PACTL & 0x01) != 0));
 		if (active_transition) {
@@ -133,6 +134,7 @@ void PIA_SetCA1(int value)
 /* Set INTERRUPT pin (CB1) */
 void PIA_SetCB1(int value)
 {
+	value = value ? 1 : 0;
 	if (PIA_CB1 != value) {
 		int active_transition = ((value == 1) == ((PIA_PBCTL & 0x01) != 0));
 		if (active_transition) {
