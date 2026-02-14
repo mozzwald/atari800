@@ -94,7 +94,13 @@ static unsigned int POKEY_serial_last_cpu_clock;
 static int POKEY_netsio_serin_cycles;
 static int POKEY_netsio_serout_cycles;
 static int POKEY_netsio_xmtdone_cycles;
-static int POKEY_SerialDivisor(void);
+typedef enum POKEY_SerialClockSource {
+	POKEY_SERIAL_CLOCK_EXTERNAL = 0,
+	POKEY_SERIAL_CLOCK_CH4,
+	POKEY_SERIAL_CLOCK_CH2
+} POKEY_SerialClockSource;
+static int POKEY_SerialRxByteCycles(void);
+static int POKEY_SerialTxByteCycles(void);
 static void POKEY_NetSIOScheduleSerin(void);
 #endif
 
@@ -215,30 +221,114 @@ static void POKEY_TriggerSeroutDone(int force_irqst_update)
 }
 
 #ifdef NETSIO
-static int POKEY_SerialDivisor(void)
+static int POKEY_SerialTimer2PeriodCycles(void)
 {
-	int divisor;
+	if (POKEY_AUDCTL[0] & POKEY_CH1_CH2) {
+		if (POKEY_AUDCTL[0] & POKEY_CH1_179)
+			return (int) POKEY_AUDF[POKEY_CHAN2] * 256 + (int) POKEY_AUDF[POKEY_CHAN1] + 7;
+		return ((int) POKEY_AUDF[POKEY_CHAN2] * 256 + (int) POKEY_AUDF[POKEY_CHAN1] + 1) * POKEY_Base_mult[0];
+	}
+	return ((int) POKEY_AUDF[POKEY_CHAN2] + 1) * POKEY_Base_mult[0];
+}
 
-	if ((POKEY_AUDCTL[0] & (POKEY_CH3_179 | POKEY_CH3_CH4)) == (POKEY_CH3_179 | POKEY_CH3_CH4))
-		divisor = (int) POKEY_AUDF[POKEY_CHAN3] + ((int) POKEY_AUDF[POKEY_CHAN4] << 8);
+static int POKEY_SerialTimer4PeriodCycles(void)
+{
+	if (POKEY_AUDCTL[0] & POKEY_CH3_CH4) {
+		if (POKEY_AUDCTL[0] & POKEY_CH3_179)
+			return (int) POKEY_AUDF[POKEY_CHAN4] * 256 + (int) POKEY_AUDF[POKEY_CHAN3] + 7;
+		return ((int) POKEY_AUDF[POKEY_CHAN4] * 256 + (int) POKEY_AUDF[POKEY_CHAN3] + 1) * POKEY_Base_mult[0];
+	}
+	return ((int) POKEY_AUDF[POKEY_CHAN4] + 1) * POKEY_Base_mult[0];
+}
+
+static POKEY_SerialClockSource POKEY_SerialRxClockSource(void)
+{
+	switch ((POKEY_SKCTL >> 4) & 0x07) {
+	case 0x00: /* 000: RX external, TX external */
+	case 0x04: /* 100: RX external, TX CH4 */
+		return POKEY_SERIAL_CLOCK_EXTERNAL;
+	default:
+		/* 001/011/101/111 use CH3+4 async for RX; 010/110 use CH4. */
+		return POKEY_SERIAL_CLOCK_CH4;
+	}
+}
+
+static POKEY_SerialClockSource POKEY_SerialTxClockSource(void)
+{
+	switch ((POKEY_SKCTL >> 4) & 0x07) {
+	case 0x00: /* 000: RX external, TX external */
+	case 0x01: /* 001: RX CH3+4 async, TX external */
+		return POKEY_SERIAL_CLOCK_EXTERNAL;
+	case 0x06: /* 110: RX CH4, TX CH2 */
+	case 0x07: /* 111: RX CH3+4 async, TX CH2 */
+		return POKEY_SERIAL_CLOCK_CH2;
+	default:
+		/* 010/011/100/101 use CH4 as TX source. */
+		return POKEY_SERIAL_CLOCK_CH4;
+	}
+}
+
+static unsigned int POKEY_MachineClockHz(void)
+{
+	double hz;
+	if (Atari800_tv_mode == Atari800_TV_PAL)
+		hz = Atari800_FPS_PAL * Atari800_TV_PAL * ANTIC_LINE_C;
 	else
-		/* Default SIO divisor for ~19.2 kbps. */
-		divisor = 0x28;
-
-	return divisor;
+		hz = Atari800_FPS_NTSC * Atari800_TV_NTSC * ANTIC_LINE_C;
+	return (unsigned int) (hz + 0.5);
 }
 
-static int POKEY_SerialBitCycles(void)
+static int POKEY_SerialBitCyclesFromBaud(unsigned int baud)
 {
-	int bit_cycles = 2 * (POKEY_SerialDivisor() + 7);
-	if (bit_cycles < 2)
-		bit_cycles = 2;
-	return bit_cycles;
+	unsigned int machine_hz;
+	unsigned int bit_cycles;
+	if (baud == 0)
+		return 0;
+	machine_hz = POKEY_MachineClockHz();
+	if (machine_hz == 0)
+		return 0;
+	bit_cycles = (machine_hz + baud / 2) / baud;
+	if (bit_cycles == 0)
+		bit_cycles = 1;
+	return (int) bit_cycles;
 }
 
-static int POKEY_SerialByteCycles(void)
+static int POKEY_SerialInternalBitCycles(POKEY_SerialClockSource source)
 {
-	return POKEY_SerialBitCycles() * 10;
+	int period_cycles;
+
+	if (source == POKEY_SERIAL_CLOCK_CH2)
+		period_cycles = POKEY_SerialTimer2PeriodCycles();
+	else
+		period_cycles = POKEY_SerialTimer4PeriodCycles();
+
+	if (period_cycles < 1)
+		period_cycles = 1;
+
+	return period_cycles * 2;
+}
+
+static int POKEY_SerialResolvedBitCycles(POKEY_SerialClockSource source)
+{
+	if (source == POKEY_SERIAL_CLOCK_EXTERNAL && netsio_enabled) {
+		int bit_cycles = POKEY_SerialBitCyclesFromBaud(netsio_get_current_baud());
+		if (bit_cycles > 0)
+			return bit_cycles;
+		/* If no NetSIO baud is known yet, fall back to internal CH4 timing. */
+		source = POKEY_SERIAL_CLOCK_CH4;
+	}
+
+	return POKEY_SerialInternalBitCycles(source);
+}
+
+static int POKEY_SerialRxByteCycles(void)
+{
+	return POKEY_SerialResolvedBitCycles(POKEY_SerialRxClockSource()) * 10;
+}
+
+static int POKEY_SerialTxByteCycles(void)
+{
+	return POKEY_SerialResolvedBitCycles(POKEY_SerialTxClockSource()) * 10;
 }
 
 static void POKEY_NetSIOScheduleSerin(void)
@@ -250,7 +340,7 @@ static void POKEY_NetSIOScheduleSerin(void)
 		return;
 	if (netsio_available() <= 0)
 		return;
-	POKEY_netsio_serin_cycles = POKEY_SerialByteCycles();
+	POKEY_netsio_serin_cycles = POKEY_SerialRxByteCycles();
 	POKEY_SKSTAT &= (UBYTE) ~0x02; /* serial input busy */
 }
 
@@ -406,14 +496,12 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 #endif
 			SIO_PutByte(byte);
 #ifdef NETSIO
-		/* TODO: proper way to enable modem
-		 * When testing various FujiNet provided peripherals, I've noticed modem was not working.
-		 * Quick fix was to test (POKEY_SKCTL & 0x70) == 0x70 instead of calling more complex POKEY_siocheck().
-		 * Modem started to work (tested Ice-T with CP/M, BobTerm). However, I'm not sure how to test POKEY
-		 * registers for only valid serial port output modes.
-		 */
-		else if (netsio_enabled && (POKEY_SKCTL & 0x70) == 0x70)
-			NetSIO_PutByte(byte);
+		/* NETStream/direct-serial TX can use external clock modes (e.g. SKCTL 000/001). */
+		else if (netsio_enabled && POKEY_SerialTxClockSource() == POKEY_SERIAL_CLOCK_EXTERNAL)
+			SIO_PutByte(byte);
+		/* NetSIO modem-style TX can use CH2-clocked output modes (SKCTL 110/111). */
+		else if (netsio_enabled && POKEY_SerialTxClockSource() == POKEY_SERIAL_CLOCK_CH2)
+			SIO_PutByte(byte);
 #endif
 
 		/* check if cassette 2-tone mode has been enabled */
@@ -421,7 +509,7 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 			/* intelligent device */
 #ifdef NETSIO
 			if (netsio_enabled) {
-				int byte_cycles = POKEY_SerialByteCycles();
+				int byte_cycles = POKEY_SerialTxByteCycles();
 				POKEY_netsio_serout_cycles = byte_cycles;
 				/* XMTDONE follows serial-out complete in current emulation model. */
 				POKEY_netsio_xmtdone_cycles = byte_cycles * 2 - 1;
