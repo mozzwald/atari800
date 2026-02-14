@@ -38,6 +38,8 @@ uint8_t netsio_sync_num = 0;
 int fujinet_known = 0;
 /* Number of bytes queued in fds0, maintained without ioctl(FIONREAD). */
 static volatile int netsio_rx_bytes_queued = 0;
+/* Latest baud rate requested via NETSIO_SPEED_CHANGE. */
+static volatile unsigned int netsio_current_baud = 0;
 /* wait for fujinet sync if true */
 volatile int netsio_sync_wait = 0;
 /* true if cmd line pulled */
@@ -246,6 +248,7 @@ int netsio_init(uint16_t port) {
     }
 
     netsio_rx_bytes_queued = 0;
+    netsio_current_baud = 0;
 
     /* create emulator <-> netsio FIFOs */
     if (pipe(fds0) < 0)
@@ -392,6 +395,11 @@ int netsio_available(void) {
     /* Fallback if FIFO has not been initialized yet. */
     avail = __sync_fetch_and_add(&netsio_rx_bytes_queued, 0);
     return avail > 0 ? avail : 0;
+}
+
+unsigned int netsio_get_current_baud(void)
+{
+    return __sync_fetch_and_add(&netsio_current_baud, 0);
 }
 
 /* COMMAND ON */
@@ -598,6 +606,7 @@ int netsio_recv_byte(uint8_t *b) {
 /* Send netsio COLD reset 0xFF */
 int netsio_cold_reset(void) {
     uint8_t pkt = 0xFF;
+    __sync_lock_test_and_set(&netsio_current_baud, 0);
 #ifdef DEBUG
     Log_print("netsio: cold reset");
 #endif
@@ -611,6 +620,7 @@ int netsio_cold_reset(void) {
 /* Send netsio WARM reset 0xFE */
 int netsio_warm_reset(void) {
     uint8_t pkt = 0xFE;
+    __sync_lock_test_and_set(&netsio_current_baud, 0);
 #ifdef DEBUG
     Log_print("netsio: warm reset");
 #endif
@@ -719,6 +729,7 @@ static void *fujinet_rx_thread(void *arg) {
                 netsio_netstream_pending_enable = 0;
                 netsio_netstream_fuji_enabled = 0;
                 netsio_netstream_is_active = 0;
+                __sync_lock_test_and_set(&netsio_current_baud, 0);
                 break;
             }
             
@@ -766,6 +777,7 @@ static void *fujinet_rx_thread(void *arg) {
                 baud |= (uint32_t)buf[2] <<  8;
                 baud |= (uint32_t)buf[3] << 16;
                 baud |= (uint32_t)buf[4] << 24;
+                __sync_lock_test_and_set(&netsio_current_baud, (unsigned int) baud);
 #ifdef DEBUG
                 Log_print("netsio: recv: requested baud rate %u", baud);
 #endif
@@ -953,6 +965,7 @@ void netsio_shutdown(void) {
     netsio_netstream_motor_on = 0;
     netsio_netstream_pokey_ok = 0;
     netsio_netstream_is_active = 0;
+    netsio_current_baud = 0;
 
     /* Clear address info */
     memset(&fujinet_addr, 0, sizeof(fujinet_addr));
