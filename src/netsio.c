@@ -27,6 +27,19 @@
 static char *buf_to_hex(const uint8_t *buf, size_t offset, size_t len);
 #endif /* DEBUG */
 static void send_block_to_fujinet(const uint8_t *block, size_t len);
+static void netsio_reset_stage_queue(void);
+static int netsio_pending_total_bytes(void);
+static int netsio_credit_soft_limit_bytes(void);
+static int netsio_advertised_credit(void);
+static void *netsio_fifo_writer_thread(void *arg);
+
+#define NETSIO_STAGE_RING_SIZE (256 * 1024)
+#define NETSIO_CREDIT_MAX 8
+#define NETSIO_CREDIT_BUFFER_SECONDS 2U
+#define NETSIO_CREDIT_MIN_SOFT_LIMIT 256
+#define NETSIO_CREDIT_MAX_SOFT_LIMIT (NETSIO_FIFO_SIZE * 16)
+#define NETSIO_CREDIT_MIN_HARD_LIMIT 512
+#define NETSIO_CREDIT_HARD_LIMIT_CAP ((NETSIO_STAGE_RING_SIZE * 3) / 4)
 
 /* Flag to know when netsio is enabled */
 volatile int netsio_enabled = 0;
@@ -46,9 +59,26 @@ volatile int netsio_sync_wait = 0;
 int netsio_cmd_state = 0;
 /* data frame size for SIO write commands */
 volatile int netsio_next_write_size = 0;
+/* Latched PROCEED/INTERRUPT input pins (PIA CA1/CB1), default inactive/high. */
+static volatile int netsio_ca1_state = 1;
+static volatile int netsio_cb1_state = 1;
+/* Last states applied to PIA from emulator thread. */
+static int netsio_ca1_applied = 1;
+static int netsio_cb1_applied = 1;
+
+/* Stage ring decouples UDP RX from blocking emulator FIFO writes. */
+static uint8_t netsio_stage_ring[NETSIO_STAGE_RING_SIZE];
+static size_t netsio_stage_head = 0;
+static size_t netsio_stage_tail = 0;
+static size_t netsio_stage_count = 0;
+static pthread_mutex_t netsio_stage_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t netsio_stage_cond = PTHREAD_COND_INITIALIZER;
+static volatile int netsio_stage_stop = 0;
+static volatile int netsio_rx_thread_running = 0;
+static volatile int netsio_writer_thread_running = 0;
 
 /* FIFO pipe: fds0: FujiNet->emulator */
-int fds0[2];
+int fds0[2] = { -1, -1 };
 
 /* UDP socket for NetSIO and return address holder */
 static int sockfd = -1;
@@ -67,6 +97,75 @@ static void millisleep(unsigned int ms)
     while (nanosleep(&req, &rem) == -1 && errno == EINTR) {
         req = rem;
     }
+}
+
+static void netsio_reset_stage_queue(void)
+{
+    pthread_mutex_lock(&netsio_stage_mutex);
+    netsio_stage_head = 0;
+    netsio_stage_tail = 0;
+    netsio_stage_count = 0;
+    pthread_mutex_unlock(&netsio_stage_mutex);
+}
+
+static int netsio_pending_total_bytes(void)
+{
+    int queued_pipe;
+    int queued_stage;
+    queued_pipe = __sync_fetch_and_add(&netsio_rx_bytes_queued, 0);
+    if (queued_pipe < 0)
+        queued_pipe = 0;
+    pthread_mutex_lock(&netsio_stage_mutex);
+    queued_stage = (int) netsio_stage_count;
+    pthread_mutex_unlock(&netsio_stage_mutex);
+    return queued_pipe + queued_stage;
+}
+
+static int netsio_credit_soft_limit_bytes(void)
+{
+    unsigned int baud = __sync_fetch_and_add(&netsio_current_baud, 0);
+    unsigned int bytes_per_second;
+    unsigned int target;
+
+    if (baud == 0)
+        target = NETSIO_CREDIT_MIN_SOFT_LIMIT;
+    else {
+        bytes_per_second = baud / 10U;
+        if (bytes_per_second == 0)
+            bytes_per_second = 1U;
+        target = bytes_per_second * NETSIO_CREDIT_BUFFER_SECONDS;
+        if (target < NETSIO_CREDIT_MIN_SOFT_LIMIT)
+            target = NETSIO_CREDIT_MIN_SOFT_LIMIT;
+        if (target > NETSIO_CREDIT_MAX_SOFT_LIMIT)
+            target = NETSIO_CREDIT_MAX_SOFT_LIMIT;
+    }
+    return (int) target;
+}
+
+static int netsio_advertised_credit(void)
+{
+    int pending = netsio_pending_total_bytes();
+    int soft_limit = netsio_credit_soft_limit_bytes();
+    int emergency_limit = soft_limit * 8;
+
+    if (emergency_limit < NETSIO_CREDIT_MIN_HARD_LIMIT)
+        emergency_limit = NETSIO_CREDIT_MIN_HARD_LIMIT;
+    if (emergency_limit > NETSIO_CREDIT_HARD_LIMIT_CAP)
+        emergency_limit = NETSIO_CREDIT_HARD_LIMIT_CAP;
+
+    /* Avoid credit=0 storms unless queue is truly near exhaustion. */
+    if (pending >= emergency_limit)
+        return 0;
+
+    if (pending >= soft_limit * 2)
+        return 1;
+    if (pending >= soft_limit)
+        return 2;
+    if (pending >= soft_limit / 2)
+        return 4;
+    if (pending >= soft_limit / 4)
+        return 6;
+    return NETSIO_CREDIT_MAX;
 }
 
 #ifdef DEBUG
@@ -91,25 +190,110 @@ char *buf_to_hex(const uint8_t *buf, size_t offset, size_t len) {
 }
 #endif
 
-/* write data to emulator FIFO (fujinet_rx_thread) */
-static void enqueue_to_emulator(const uint8_t *pkt, size_t len) {
-    ssize_t n;
-    while (len > 0)
-    {
-        n = write(fds0[1], pkt, len);
-        if (n < 0)
-        {
-            if (errno == EINTR) continue;
-#ifdef DEBUG
-            Log_print("netsio: write to emulator FIFO");
-#endif
-            /*exit(1);*/
-        }
-        if (n > 0)
-            __sync_fetch_and_add(&netsio_rx_bytes_queued, (int) n);
-        pkt += n;
-        len -= n;
+/* Stage incoming bytes so UDP RX thread never blocks on emulator FIFO writes. */
+static int enqueue_to_emulator(const uint8_t *pkt, size_t len) {
+    size_t free_space;
+    size_t first_chunk;
+
+    if (fds0[1] < 0 || pkt == NULL) {
+        return -1;
     }
+    if (len == 0)
+        return 0;
+    if (len > NETSIO_STAGE_RING_SIZE) {
+        Log_print("netsio: stage enqueue too large: %zu", len);
+        return -1;
+    }
+
+    pthread_mutex_lock(&netsio_stage_mutex);
+    free_space = NETSIO_STAGE_RING_SIZE - netsio_stage_count;
+    if (netsio_stage_stop || len > free_space) {
+        pthread_mutex_unlock(&netsio_stage_mutex);
+        return -1;
+    }
+
+    first_chunk = NETSIO_STAGE_RING_SIZE - netsio_stage_head;
+    if (first_chunk > len)
+        first_chunk = len;
+    memcpy(netsio_stage_ring + netsio_stage_head, pkt, first_chunk);
+    if (len > first_chunk)
+        memcpy(netsio_stage_ring, pkt + first_chunk, len - first_chunk);
+
+    netsio_stage_head = (netsio_stage_head + len) % NETSIO_STAGE_RING_SIZE;
+    netsio_stage_count += len;
+    pthread_cond_signal(&netsio_stage_cond);
+    pthread_mutex_unlock(&netsio_stage_mutex);
+
+    return 0;
+}
+
+/* Move staged bytes into emulator FIFO on a dedicated writer thread. */
+static void *netsio_fifo_writer_thread(void *arg)
+{
+    uint8_t chunk[2048];
+    (void) arg;
+    netsio_writer_thread_running = 1;
+
+    for (;;) {
+        size_t to_copy;
+        size_t first_chunk;
+        size_t offset;
+
+        pthread_mutex_lock(&netsio_stage_mutex);
+        while (netsio_stage_count == 0 && !netsio_stage_stop)
+            pthread_cond_wait(&netsio_stage_cond, &netsio_stage_mutex);
+
+        if (netsio_stage_stop && netsio_stage_count == 0) {
+            pthread_mutex_unlock(&netsio_stage_mutex);
+            break;
+        }
+
+        to_copy = netsio_stage_count;
+        if (to_copy > sizeof(chunk))
+            to_copy = sizeof(chunk);
+        first_chunk = NETSIO_STAGE_RING_SIZE - netsio_stage_tail;
+        if (first_chunk > to_copy)
+            first_chunk = to_copy;
+        memcpy(chunk, netsio_stage_ring + netsio_stage_tail, first_chunk);
+        if (to_copy > first_chunk)
+            memcpy(chunk + first_chunk, netsio_stage_ring, to_copy - first_chunk);
+        netsio_stage_tail = (netsio_stage_tail + to_copy) % NETSIO_STAGE_RING_SIZE;
+        netsio_stage_count -= to_copy;
+        pthread_mutex_unlock(&netsio_stage_mutex);
+
+        offset = 0;
+        while (offset < to_copy) {
+            ssize_t n;
+
+            if (netsio_stage_stop)
+                break;
+            if (fds0[1] < 0) {
+                goto done;
+            }
+
+            n = write(fds0[1], chunk + offset, to_copy - offset);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EBADF || errno == EPIPE)
+                    goto done;
+                Log_print("netsio: writer write error: %s", strerror(errno));
+                millisleep(1);
+                continue;
+            }
+            if (n == 0) {
+                millisleep(1);
+                continue;
+            }
+
+            offset += (size_t) n;
+            __sync_add_and_fetch(&netsio_rx_bytes_queued, (int) n);
+        }
+    }
+
+done:
+    netsio_writer_thread_running = 0;
+    return NULL;
 }
 
 /* send a packet to FujiNet socket */
@@ -215,9 +399,14 @@ static void send_block_to_fujinet(const uint8_t *block, size_t len) {
 int netsio_init(uint16_t port) {
     struct sockaddr_in addr;
     pthread_t rx_thread;
+    pthread_t writer_thread;
     int broadcast = 1;
     netsio_rx_bytes_queued = 0;
     netsio_current_baud = 0;
+    netsio_reset_stage_queue();
+    netsio_stage_stop = 0;
+    netsio_rx_thread_running = 0;
+    netsio_writer_thread_running = 0;
 
     /* Skip re-initialization if already initialized (during emulator restarts) */
     if (netsio_initialized) {
@@ -236,6 +425,20 @@ int netsio_init(uint16_t port) {
         return -1;
     }
 
+    /* spawn stage->FIFO writer thread before UDP RX starts filling stage ring */
+    if (pthread_create(&writer_thread, NULL, netsio_fifo_writer_thread, NULL) != 0)
+    {
+#ifdef DEBUG
+        Log_print("netsio: pthread_create writer");
+#endif
+        close(fds0[0]);
+        close(fds0[1]);
+        fds0[0] = -1;
+        fds0[1] = -1;
+        return -1;
+    }
+    pthread_detach(writer_thread);
+
     /* fcntl(fds0[0], F_SETFL, O_NONBLOCK); */
 
     /* connect socket to FujiNet */
@@ -245,6 +448,12 @@ int netsio_init(uint16_t port) {
 #ifdef DEBUG
         Log_print("netsio: socket error");
 #endif
+        netsio_stage_stop = 1;
+        pthread_cond_broadcast(&netsio_stage_cond);
+        close(fds0[0]);
+        close(fds0[1]);
+        fds0[0] = -1;
+        fds0[1] = -1;
         return -1;
     }
     /* Fill in the structure with port number, any IP */
@@ -299,6 +508,13 @@ int netsio_init(uint16_t port) {
         Log_print("netsio bind socket error");
 #endif
         close(sockfd);
+        sockfd = -1;
+        netsio_stage_stop = 1;
+        pthread_cond_broadcast(&netsio_stage_cond);
+        close(fds0[0]);
+        close(fds0[1]);
+        fds0[0] = -1;
+        fds0[1] = -1;
         return -1;
     }
 
@@ -308,6 +524,14 @@ int netsio_init(uint16_t port) {
 #ifdef DEBUG
         Log_print("netsio: pthread_create rx");
 #endif
+        netsio_stage_stop = 1;
+        pthread_cond_broadcast(&netsio_stage_cond);
+        close(sockfd);
+        sockfd = -1;
+        close(fds0[0]);
+        close(fds0[1]);
+        fds0[0] = -1;
+        fds0[1] = -1;
         return -1;
     }
     pthread_detach(rx_thread);
@@ -374,6 +598,21 @@ unsigned int netsio_get_current_baud(void)
     return __sync_fetch_and_add(&netsio_current_baud, 0);
 }
 
+void netsio_apply_control_lines(void)
+{
+    int ca1 = __sync_fetch_and_add(&netsio_ca1_state, 0);
+    int cb1 = __sync_fetch_and_add(&netsio_cb1_state, 0);
+
+    if (ca1 != netsio_ca1_applied) {
+        PIA_SetCA1(ca1);
+        netsio_ca1_applied = ca1;
+    }
+    if (cb1 != netsio_cb1_applied) {
+        PIA_SetCB1(cb1);
+        netsio_cb1_applied = cb1;
+    }
+}
+
 /* COMMAND ON */
 int netsio_cmd_on(void)
 {
@@ -395,6 +634,7 @@ int netsio_cmd_off(void)
 #ifdef DEBUG
     Log_print("netsio: CMD OFF");
 #endif
+    netsio_cmd_state = 0;
     send_to_fujinet(&p, 1);
     return 0;
 }
@@ -409,6 +649,7 @@ int netsio_cmd_off_sync(void)
 #ifdef DEBUG
     Log_print("netsio: CMD OFF SYNC");
 #endif
+    netsio_cmd_state = 0;
     send_to_fujinet(p, sizeof(p));
     netsio_sync_wait = 1; /* pause emulation until we hear back or timeout */
     return 0;
@@ -541,6 +782,8 @@ static void *fujinet_rx_thread(void *arg) {
     uint8_t buf[4096];
     uint8_t cmd;
     ssize_t n;
+    (void) arg;
+    netsio_rx_thread_running = 1;
 
     for (;;)
     {
@@ -570,8 +813,11 @@ static void *fujinet_rx_thread(void *arg) {
 
         if (n <= 0)
         {
+            if (sockfd < 0 || errno == EBADF || errno == ENOTSOCK) {
+                break;
+            }
 #ifdef DEBUG
-            Log_print("netsio: recv");
+            Log_print("netsio: recv error: %s", strerror(errno));
 #endif
             continue;
         }
@@ -638,6 +884,7 @@ static void *fujinet_rx_thread(void *arg) {
             case NETSIO_CREDIT_STATUS:
             {
                 uint8_t reply[2];
+                int credit;
                 /* packet should be 2 bytes long */
                 if (n < 2)
                 {
@@ -646,10 +893,15 @@ static void *fujinet_rx_thread(void *arg) {
 #endif
                 }
                 reply[0] = NETSIO_CREDIT_UPDATE;
-                reply[1] = 3;
+                credit = netsio_advertised_credit();
+                if (credit < 0)
+                    credit = 0;
+                if (credit > 255)
+                    credit = 255;
+                reply[1] = (uint8_t) credit;
                 send_to_fujinet(reply, sizeof(reply));
 #ifdef DEBUG
-                Log_print("netsio: recv: credit status & response");
+                Log_print("netsio: recv: credit status & response credit=%d", credit);
 #endif
                 break;
             }
@@ -714,7 +966,7 @@ static void *fujinet_rx_thread(void *arg) {
 #ifdef DEBUG
                         Log_print("netsio: recv: sync %u ACK byte=0x%02X  write_size=0x%04X", resp_sync, ack_byte, write_size);
 #endif
-                        enqueue_to_emulator(&ack_byte, 1);
+                        (void) enqueue_to_emulator(&ack_byte, 1);
                     }
                     else
                     {
@@ -730,20 +982,25 @@ static void *fujinet_rx_thread(void *arg) {
             /* set_CA1 */
             case NETSIO_PROCEED_ON:
             {
+                /* NetSIO uses active-low lines; ON means asserted/low. */
+                __sync_lock_test_and_set(&netsio_ca1_state, 0);
                 break;
             }
             case NETSIO_PROCEED_OFF:
             {
+                __sync_lock_test_and_set(&netsio_ca1_state, 1);
                 break;
             }
 
             /* set_CB1 */
             case NETSIO_INTERRUPT_ON:
             {
+                __sync_lock_test_and_set(&netsio_cb1_state, 0);
                 break;
             }
             case NETSIO_INTERRUPT_OFF:
             {
+                __sync_lock_test_and_set(&netsio_cb1_state, 1);
                 break;
             }
 
@@ -762,7 +1019,7 @@ static void *fujinet_rx_thread(void *arg) {
 #ifdef DEBUG
                 Log_print("netsio: recv: data byte: 0x%02X", data);
 #endif
-                enqueue_to_emulator(&data, 1);
+                (void) enqueue_to_emulator(&data, 1);
                 break;
             }
 
@@ -783,7 +1040,7 @@ static void *fujinet_rx_thread(void *arg) {
                 Log_print("netsio: recv: data block %zu bytes:\n  %s", payload_len, buf_to_hex(buf, 1, payload_len));
 #endif
                 /* forward only buf[1]..buf[n-1] */
-                enqueue_to_emulator(buf + 1, payload_len);
+                (void) enqueue_to_emulator(buf + 1, payload_len);
                 break;
             }            
 
@@ -796,6 +1053,7 @@ static void *fujinet_rx_thread(void *arg) {
             }
         }
     }
+    netsio_rx_thread_running = 0;
     return NULL;
 }
 
@@ -814,6 +1072,10 @@ void netsio_shutdown(void) {
 #endif
     }
 
+    /* Stop writer stage first so pending writes don't continue during teardown. */
+    netsio_stage_stop = 1;
+    pthread_cond_broadcast(&netsio_stage_cond);
+
     /* Close UDP socket - this will cause fujinet_rx_thread's recvfrom() to fail and exit */
     if (sockfd >= 0) {
 #ifdef DEBUG
@@ -821,6 +1083,13 @@ void netsio_shutdown(void) {
 #endif
         close(sockfd);
         sockfd = -1;
+    }
+
+    /* Give detached threads a brief chance to observe stop conditions. */
+    {
+        int spins = 20;
+        while (spins-- > 0 && (netsio_rx_thread_running || netsio_writer_thread_running))
+            millisleep(5);
     }
 
     /* Close FIFO pipes */
@@ -842,6 +1111,14 @@ void netsio_shutdown(void) {
     netsio_cmd_state = 0;
     netsio_next_write_size = 0;
     netsio_current_baud = 0;
+    netsio_ca1_state = 1;
+    netsio_cb1_state = 1;
+    netsio_ca1_applied = 1;
+    netsio_cb1_applied = 1;
+    netsio_stage_stop = 0;
+    netsio_rx_thread_running = 0;
+    netsio_writer_thread_running = 0;
+    netsio_reset_stage_queue();
 
     /* Clear address info */
     memset(&fujinet_addr, 0, sizeof(fujinet_addr));
