@@ -85,6 +85,7 @@ int netsio_motor_on(void);
 int netsio_motor_off(void);
 void netsio_wait_for_sync(void);
 int netsio_available(void);
+unsigned int netsio_get_current_baud(void);
 int netsio_cold_reset(void);
 int netsio_warm_reset(void);
 
