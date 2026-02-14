@@ -96,6 +96,7 @@ void netsio_poll(void);
 void netsio_wait_for_sync(void);
 int netsio_available(void);
 unsigned int netsio_get_current_baud(void);
+void netsio_apply_control_lines(void);
 int netsio_cold_reset(void);
 int netsio_warm_reset(void);
 

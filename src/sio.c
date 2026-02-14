@@ -1570,6 +1570,7 @@ void SIO_SwitchCommandFrame(int onoff)
 					netsio_send_block(CommandFrame, CommandIndex);
 				*/
 				/* b) Skip sending short/invalid CF */
+				netsio_cmd_off();
 				TransferStatus = SIO_NoFrame;
 			}
 			else
@@ -1751,6 +1752,7 @@ void SIO_PutByte(int byte)
 int NetSIO_GetByte(void)
 {
 	UBYTE b;
+	netsio_apply_control_lines();
 
 	if(netsio_available() > 0)
 	{
