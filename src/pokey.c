@@ -335,7 +335,6 @@ static void POKEY_NetSIOScheduleSerin(void)
 {
 	if (!netsio_enabled || POKEY_netsio_serin_cycles > 0)
 		return;
-	/* SERIN is still pending consumption, emulate PROCEED pacing by stalling. */
 	if ((POKEY_IRQST & 0x20) == 0)
 		return;
 	if (netsio_available() <= 0)
@@ -397,6 +396,8 @@ void POKEY_AdvanceSerialToClock(unsigned int cpu_clock)
 		POKEY_serial_last_cpu_clock = cpu_clock;
 		return;
 	}
+	/* Apply latched NetSIO PROCEED/INTERRUPT transitions continuously, not only on byte reads. */
+	netsio_apply_control_lines();
 	unsigned int elapsed = cpu_clock - POKEY_serial_last_cpu_clock;
 	POKEY_serial_last_cpu_clock = cpu_clock;
 	if (elapsed == 0)
