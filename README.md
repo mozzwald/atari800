@@ -44,6 +44,10 @@ Or use the included build script:
 
 The `-ai` flag enables the AI interface, which creates a Unix socket at `/tmp/atari800_ai.sock`.
 
+Frame streaming is only active when both are true:
+- Build was configured with `--enable-ai-interface`
+- Emulator is launched with `-ai`
+
 ## Socket Protocol
 
 The AI interface uses a simple length-prefixed JSON protocol:
@@ -52,6 +56,51 @@ The AI interface uses a simple length-prefixed JSON protocol:
 Client -> Server: <json_length>\n<json_command>
 Server -> Client: <json_length>\n<json_response>
 ```
+
+## Video Frame Streaming Interface
+
+In addition to JSON control on `/tmp/atari800_ai.sock`, the emulator exposes two
+binary frame sockets when AI is enabled:
+
+- Push stream: `/tmp/atari800-fb-push.sock`
+- Pull stream: `/tmp/atari800-fb-pull.sock`
+
+Frames are streamed as final rendered pixels in **RGB565**.
+
+### Frame Record (`A8FB`)
+
+Each frame is:
+- 36-byte header (little-endian)
+- RGB565 payload (`stride * height` bytes)
+
+Header layout:
+- `magic[4]` = `"A8FB"`
+- `version u16` = `1`
+- `flags u16` (`bit0=rgb565`, `bit1=timestamp`)
+- `width u16`
+- `height u16`
+- `stride u32`
+- `frame_no u32`
+- `payload_len u32`
+- `timestamp_us u64`
+- `crc32 u32` (CRC of payload)
+
+### Pull Request (`A8RQ`)
+
+Pull socket requests are fixed 16 bytes (little-endian):
+- `magic[4]` = `"A8RQ"`
+- `version u16` = `1`
+- `command u16`
+- `arg0 u32`
+- `arg1 u32` (reserved)
+
+Commands:
+- `1` = `GET_LATEST`
+- `2` = `RUN_FRAMES_AND_GET` (`arg0` = frames to run)
+
+Responses:
+- Frame: `A8FB` + payload
+- Error: `A8ER`
 
 ### Example (Python)
 
@@ -124,6 +173,19 @@ for line in resp['data']:
 | `screen_ascii` | - | Get 40x24 ASCII representation |
 | `screen_raw` | - | Get raw screen memory |
 
+### Video Commands
+
+| Command | Parameters | Description |
+|---------|------------|-------------|
+| `video.enable_push` | - | Enable push streaming socket |
+| `video.disable_push` | - | Disable push streaming socket |
+| `video.enable_pull` | - | Enable pull request socket |
+| `video.disable_pull` | - | Disable pull request socket |
+| `video.push.set_fps_cap` | `value` | Set push max FPS (`0` = uncapped) |
+| `video.push.set_frameskip` | `n` | Send 1 frame every `n` emulator frames |
+| `video.push.enable_change_triggered` | `enabled` | Only push when frame CRC changes |
+| `video.status` | - | Return socket paths and current video stream status |
+
 ### Memory Commands
 
 | Command | Parameters | Description |
@@ -166,15 +228,59 @@ for line in resp['data']:
 | `debug_enable` | `port` | Enable debug port at $D7xx |
 | `debug_read` | - | Read data from debug port |
 
+### Video Usage Examples
+
+Get streaming status through AI JSON socket:
+
+```python
+resp = send_command({'cmd': 'video.status'})
+print(resp)
+```
+
+Pull one frame (`GET_LATEST`) directly from pull socket:
+
+```python
+import socket, struct
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect('/tmp/atari800-fb-pull.sock')
+s.sendall(b'A8RQ' + struct.pack('<HHII', 1, 1, 0, 0))  # version=1, command=GET_LATEST
+header = s.recv(36)
+magic = header[:4]
+ver, flags, w, h, stride, frame_no, payload_len = struct.unpack('<HHHHIII', header[4:24])
+payload = b''
+while len(payload) < payload_len:
+    payload += s.recv(payload_len - len(payload))
+s.close()
+print(magic, w, h, frame_no, len(payload))
+```
+
+Subscribe to push stream and read one frame:
+
+```python
+import socket, struct
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect('/tmp/atari800-fb-push.sock')
+header = s.recv(36)
+ver, flags, w, h, stride, frame_no, payload_len = struct.unpack('<HHHHIII', header[4:24])
+payload = b''
+while len(payload) < payload_len:
+    payload += s.recv(payload_len - len(payload))
+s.close()
+print(w, h, frame_no, len(payload))
+```
+
 ## Files Modified
 
 From the original atari800:
 
-- **`src/ai_interface.c`** - NEW: AI socket server implementation (~720 lines)
+- **`src/ai_interface.c`** - NEW: AI socket server + frame streaming implementation
 - **`src/ai_interface.h`** - NEW: API header with documentation
 - **`src/atari.c`** - Modified: Added `AI_Initialise()`, `AI_Frame()`, `AI_ApplyInput()` hooks
+- **`src/sdl/video_sw.c`** - Modified: Added final-frame tap for RGB565 frame streaming
 - **`src/memory.c`** - Modified: Debug port hook at $D7xx range
-- **`configure.ac`** - Modified: Added `--enable-ai` option
+- **`configure.ac`** - Modified: Added `--enable-ai-interface` option
 - **`build_ai.sh`** - NEW: Build script with correct SDL 1.2 flags
 
 ## Technical Notes
