@@ -32,6 +32,7 @@
 #include "sio.h"
 #include "statesav.h"
 #include "log.h"
+#include "crc32.h"
 
 /* Configuration */
 int AI_enabled = 0;
@@ -56,6 +57,91 @@ static int ai_debug_buffer_pos = 0;
 
 /* Response buffer */
 static char ai_response[AI_MAX_RESPONSE];
+
+/* Frame streaming (RGB565 over UNIX sockets) */
+#define AI_FB_PUSH_SOCKET_PATH "/tmp/atari800-fb-push.sock"
+#define AI_FB_PULL_SOCKET_PATH "/tmp/atari800-fb-pull.sock"
+
+#define AI_FB_HEADER_SIZE 36
+#define AI_FB_PULL_REQ_SIZE 16
+
+enum {
+    AI_FB_FLAG_RGB565 = 1 << 0,
+    AI_FB_FLAG_TIMESTAMP = 1 << 1
+};
+
+enum {
+    AI_FB_PULL_GET_LATEST = 1,
+    AI_FB_PULL_RUN_FRAMES_AND_GET = 2
+};
+
+static int ai_fb_push_server_fd = -1;
+static int ai_fb_push_client_fd = -1;
+static int ai_fb_pull_server_fd = -1;
+static int ai_fb_pull_client_fd = -1;
+
+static int ai_fb_push_enabled = 1;
+static int ai_fb_pull_enabled = 1;
+static int ai_fb_fps_cap = 0;             /* 0 = uncapped */
+static int ai_fb_send_every_n_frames = 1; /* 1 = send all */
+static int ai_fb_change_triggered = 0;
+
+static UBYTE *ai_fb_buf_a = NULL;
+static UBYTE *ai_fb_buf_b = NULL;
+static UBYTE *ai_fb_latest_buf = NULL;
+static UBYTE *ai_fb_write_buf = NULL;
+static ULONG ai_fb_buf_size = 0;
+
+static int ai_fb_width = 0;
+static int ai_fb_height = 0;
+static ULONG ai_fb_stride = 0;
+static ULONG ai_fb_frame_no = 0;
+static ULONG ai_fb_latest_crc32 = 0;
+static unsigned long long ai_fb_latest_timestamp_us = 0;
+
+static int ai_fb_have_last_push_crc = 0;
+static ULONG ai_fb_last_push_crc = 0;
+static unsigned long long ai_fb_last_push_us = 0;
+static UBYTE *ai_fb_push_tx_buf = NULL;
+static ULONG ai_fb_push_tx_buf_size = 0;
+static ULONG ai_fb_push_tx_len = 0;
+static ULONG ai_fb_push_tx_sent = 0;
+
+static UBYTE ai_fb_pull_rx_buf[AI_FB_PULL_REQ_SIZE];
+static int ai_fb_pull_rx_len = 0;
+
+static int ai_fb_pull_waiting = 0;
+static ULONG ai_fb_pull_target_frame = 0;
+static int ai_fb_pull_restore_pause = 0;
+
+static unsigned long long monotonic_us(void);
+static void put_u16le(UBYTE *dst, UWORD value);
+static void put_u32le(UBYTE *dst, ULONG value);
+static void put_u64le(UBYTE *dst, unsigned long long value);
+static UWORD get_u16le(const UBYTE *src);
+static ULONG get_u32le(const UBYTE *src);
+static int set_nonblocking(int fd);
+static int create_unix_server_socket(const char *path);
+static int send_all_blocking(int fd, const UBYTE *data, ULONG len);
+static int send_all_nonblocking(int fd, const UBYTE *data, ULONG len);
+static void ai_fb_close_push_client(void);
+static void ai_fb_close_pull_client(void);
+static void ai_fb_accept_push_client(void);
+static void ai_fb_accept_pull_client(void);
+static int ai_fb_send_error(int fd, UWORD code, const char *msg, int nonblocking);
+static void ai_fb_build_frame_header(UBYTE *header);
+static int ai_fb_send_frame(int fd, int nonblocking);
+static int ai_fb_push_try_flush(void);
+static int ai_fb_push_queue_latest(void);
+static void ai_fb_process_pull_request(const UBYTE *req);
+static void ai_fb_poll_pull_requests(void);
+static void ai_fb_poll_sockets(void);
+static int ai_fb_ensure_buffers(int width, int height);
+static void ai_fb_convert_surface_to_rgb565(const void *pixels, int width, int height, int pitch,
+                                            int bits_per_pixel, unsigned int rmask,
+                                            unsigned int gmask, unsigned int bmask);
+static int ai_fb_init(void);
+static void ai_fb_shutdown(void);
 
 /* Simple JSON helpers - minimal implementation */
 
@@ -116,6 +202,740 @@ static int base64_encode(const UBYTE *data, int len, char *out, int outsize) {
     }
     out[j] = '\0';
     return j;
+}
+
+static unsigned long long monotonic_us(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return (unsigned long long) time(NULL) * 1000000ULL;
+    }
+    return (unsigned long long) ts.tv_sec * 1000000ULL + (unsigned long long) ts.tv_nsec / 1000ULL;
+}
+
+static void put_u16le(UBYTE *dst, UWORD value)
+{
+    dst[0] = (UBYTE) (value & 0xff);
+    dst[1] = (UBYTE) ((value >> 8) & 0xff);
+}
+
+static void put_u32le(UBYTE *dst, ULONG value)
+{
+    dst[0] = (UBYTE) (value & 0xff);
+    dst[1] = (UBYTE) ((value >> 8) & 0xff);
+    dst[2] = (UBYTE) ((value >> 16) & 0xff);
+    dst[3] = (UBYTE) ((value >> 24) & 0xff);
+}
+
+static void put_u64le(UBYTE *dst, unsigned long long value)
+{
+    int i;
+    for (i = 0; i < 8; i++) {
+        dst[i] = (UBYTE) ((value >> (8 * i)) & 0xff);
+    }
+}
+
+static UWORD get_u16le(const UBYTE *src)
+{
+    return (UWORD) (src[0] | (src[1] << 8));
+}
+
+static ULONG get_u32le(const UBYTE *src)
+{
+    return (ULONG) src[0]
+         | ((ULONG) src[1] << 8)
+         | ((ULONG) src[2] << 16)
+         | ((ULONG) src[3] << 24);
+}
+
+static int set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return FALSE;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static int create_unix_server_socket(const char *path)
+{
+    int fd;
+    struct sockaddr_un addr;
+
+    unlink(path);
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    if (!set_nonblocking(fd)) {
+        close(fd);
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 1) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int send_all_impl(int fd, const UBYTE *data, ULONG len, int nonblocking)
+{
+    ULONG sent = 0;
+    int send_flags = 0;
+#ifdef MSG_DONTWAIT
+    if (nonblocking) {
+        send_flags |= MSG_DONTWAIT;
+    }
+#endif
+#ifdef MSG_NOSIGNAL
+    send_flags |= MSG_NOSIGNAL;
+#endif
+
+    while (sent < len) {
+        ssize_t n = send(fd, data + sent, len - sent, send_flags);
+        if (n > 0) {
+            sent += (ULONG) n;
+            continue;
+        }
+        if (n == 0) {
+            return FALSE;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!nonblocking) {
+                usleep(1000);
+                continue;
+            }
+            return FALSE;
+        }
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static int send_all_nonblocking(int fd, const UBYTE *data, ULONG len)
+{
+    return send_all_impl(fd, data, len, TRUE);
+}
+
+static int send_all_blocking(int fd, const UBYTE *data, ULONG len)
+{
+    return send_all_impl(fd, data, len, FALSE);
+}
+
+static void ai_fb_close_push_client(void)
+{
+    if (ai_fb_push_client_fd >= 0) {
+        close(ai_fb_push_client_fd);
+        ai_fb_push_client_fd = -1;
+    }
+    ai_fb_push_tx_len = 0;
+    ai_fb_push_tx_sent = 0;
+}
+
+static void ai_fb_close_pull_client(void)
+{
+    if (ai_fb_pull_client_fd >= 0) {
+        close(ai_fb_pull_client_fd);
+        ai_fb_pull_client_fd = -1;
+    }
+    ai_fb_pull_rx_len = 0;
+    if (ai_fb_pull_waiting) {
+        ai_paused = ai_fb_pull_restore_pause;
+    }
+    ai_fb_pull_waiting = 0;
+}
+
+static void ai_fb_accept_push_client(void)
+{
+    int client;
+
+    if (ai_fb_push_server_fd < 0) {
+        return;
+    }
+    client = accept(ai_fb_push_server_fd, NULL, NULL);
+    if (client < 0) {
+        return;
+    }
+    set_nonblocking(client);
+    if (ai_fb_push_client_fd >= 0) {
+        close(ai_fb_push_client_fd);
+    }
+    ai_fb_push_client_fd = client;
+    ai_fb_have_last_push_crc = 0;
+    ai_fb_push_tx_len = 0;
+    ai_fb_push_tx_sent = 0;
+    Log_print("AI: Frame push client connected");
+}
+
+static void ai_fb_accept_pull_client(void)
+{
+    int client;
+
+    if (ai_fb_pull_server_fd < 0) {
+        return;
+    }
+    client = accept(ai_fb_pull_server_fd, NULL, NULL);
+    if (client < 0) {
+        return;
+    }
+    set_nonblocking(client);
+    if (ai_fb_pull_client_fd >= 0) {
+        close(ai_fb_pull_client_fd);
+    }
+    ai_fb_pull_client_fd = client;
+    ai_fb_pull_rx_len = 0;
+    if (ai_fb_pull_waiting) {
+        ai_paused = ai_fb_pull_restore_pause;
+        ai_fb_pull_waiting = 0;
+    }
+    Log_print("AI: Frame pull client connected");
+}
+
+static int ai_fb_send_error(int fd, UWORD code, const char *msg, int nonblocking)
+{
+    UBYTE header[12];
+    ULONG msg_len = (ULONG) strlen(msg);
+    memcpy(header, "A8ER", 4);
+    put_u16le(header + 4, 1);
+    put_u16le(header + 6, code);
+    put_u32le(header + 8, msg_len);
+    if ((nonblocking ? !send_all_nonblocking(fd, header, sizeof(header))
+                     : !send_all_blocking(fd, header, sizeof(header)))) {
+        return FALSE;
+    }
+    if (msg_len > 0 && (nonblocking ? !send_all_nonblocking(fd, (const UBYTE *) msg, msg_len)
+                                    : !send_all_blocking(fd, (const UBYTE *) msg, msg_len))) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static int ai_fb_send_frame(int fd, int nonblocking)
+{
+    UBYTE header[AI_FB_HEADER_SIZE];
+    ULONG payload_len;
+
+    if (ai_fb_latest_buf == NULL || ai_fb_width <= 0 || ai_fb_height <= 0 || ai_fb_stride == 0) {
+        return ai_fb_send_error(fd, 2, "NO_FRAME", nonblocking);
+    }
+
+    payload_len = ai_fb_stride * (ULONG) ai_fb_height;
+    ai_fb_build_frame_header(header);
+
+    if ((nonblocking ? !send_all_nonblocking(fd, header, sizeof(header))
+                     : !send_all_blocking(fd, header, sizeof(header)))) {
+        return FALSE;
+    }
+    if ((nonblocking ? !send_all_nonblocking(fd, ai_fb_latest_buf, payload_len)
+                     : !send_all_blocking(fd, ai_fb_latest_buf, payload_len))) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void ai_fb_build_frame_header(UBYTE *header)
+{
+    ULONG payload_len = ai_fb_stride * (ULONG) ai_fb_height;
+
+    memcpy(header, "A8FB", 4);
+    put_u16le(header + 4, 1);
+    put_u16le(header + 6, AI_FB_FLAG_RGB565 | AI_FB_FLAG_TIMESTAMP);
+    put_u16le(header + 8, (UWORD) ai_fb_width);
+    put_u16le(header + 10, (UWORD) ai_fb_height);
+    put_u32le(header + 12, ai_fb_stride);
+    put_u32le(header + 16, ai_fb_frame_no);
+    put_u32le(header + 20, payload_len);
+    put_u64le(header + 24, ai_fb_latest_timestamp_us);
+    put_u32le(header + 32, ai_fb_latest_crc32);
+}
+
+static int ai_fb_push_try_flush(void)
+{
+    if (ai_fb_push_client_fd < 0) {
+        return FALSE;
+    }
+
+    while (ai_fb_push_tx_sent < ai_fb_push_tx_len) {
+        ssize_t n = send(ai_fb_push_client_fd,
+                         ai_fb_push_tx_buf + ai_fb_push_tx_sent,
+                         ai_fb_push_tx_len - ai_fb_push_tx_sent,
+#ifdef MSG_NOSIGNAL
+                         MSG_DONTWAIT | MSG_NOSIGNAL
+#else
+                         MSG_DONTWAIT
+#endif
+                         );
+        if (n > 0) {
+            ai_fb_push_tx_sent += (ULONG) n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return TRUE;
+        }
+        ai_fb_close_push_client();
+        return FALSE;
+    }
+
+    ai_fb_push_tx_len = 0;
+    ai_fb_push_tx_sent = 0;
+    return TRUE;
+}
+
+static int ai_fb_push_queue_latest(void)
+{
+    ULONG payload_len;
+    ULONG needed;
+
+    if (ai_fb_latest_buf == NULL || ai_fb_width <= 0 || ai_fb_height <= 0 || ai_fb_stride == 0) {
+        return FALSE;
+    }
+
+    payload_len = ai_fb_stride * (ULONG) ai_fb_height;
+    needed = AI_FB_HEADER_SIZE + payload_len;
+    if (needed > ai_fb_push_tx_buf_size) {
+        UBYTE *new_buf = (UBYTE *) realloc(ai_fb_push_tx_buf, needed);
+        if (new_buf == NULL) {
+            return FALSE;
+        }
+        ai_fb_push_tx_buf = new_buf;
+        ai_fb_push_tx_buf_size = needed;
+    }
+
+    ai_fb_build_frame_header(ai_fb_push_tx_buf);
+    memcpy(ai_fb_push_tx_buf + AI_FB_HEADER_SIZE, ai_fb_latest_buf, payload_len);
+    ai_fb_push_tx_len = needed;
+    ai_fb_push_tx_sent = 0;
+    return TRUE;
+}
+
+static void ai_fb_process_pull_request(const UBYTE *req)
+{
+    UWORD version;
+    UWORD command;
+    ULONG arg0;
+
+    if (memcmp(req, "A8RQ", 4) != 0) {
+        if (!ai_fb_send_error(ai_fb_pull_client_fd, 1, "BAD_MAGIC", FALSE)) {
+            ai_fb_close_pull_client();
+        }
+        return;
+    }
+
+    version = get_u16le(req + 4);
+    command = get_u16le(req + 6);
+    arg0 = get_u32le(req + 8);
+    if (version != 1) {
+        if (!ai_fb_send_error(ai_fb_pull_client_fd, 1, "BAD_VERSION", FALSE)) {
+            ai_fb_close_pull_client();
+        }
+        return;
+    }
+
+    if (!ai_fb_pull_enabled) {
+        if (!ai_fb_send_error(ai_fb_pull_client_fd, 4, "PULL_DISABLED", FALSE)) {
+            ai_fb_close_pull_client();
+        }
+        return;
+    }
+
+    if (command == AI_FB_PULL_GET_LATEST) {
+        if (!ai_fb_send_frame(ai_fb_pull_client_fd, FALSE)) {
+            ai_fb_close_pull_client();
+        }
+        return;
+    }
+
+    if (command == AI_FB_PULL_RUN_FRAMES_AND_GET) {
+        if (arg0 == 0) {
+            if (!ai_fb_send_frame(ai_fb_pull_client_fd, FALSE)) {
+                ai_fb_close_pull_client();
+            }
+            return;
+        }
+
+        if (ai_fb_pull_waiting) {
+            if (!ai_fb_send_error(ai_fb_pull_client_fd, 5, "BUSY", FALSE)) {
+                ai_fb_close_pull_client();
+            }
+            return;
+        }
+
+        ai_fb_pull_waiting = TRUE;
+        ai_fb_pull_target_frame = ai_fb_frame_no + arg0;
+        ai_fb_pull_restore_pause = ai_paused;
+        ai_paused = 0;
+        return;
+    }
+
+    if (!ai_fb_send_error(ai_fb_pull_client_fd, 3, "BAD_COMMAND", FALSE)) {
+        ai_fb_close_pull_client();
+    }
+}
+
+static void ai_fb_poll_pull_requests(void)
+{
+    while (ai_fb_pull_client_fd >= 0) {
+        ssize_t r;
+        int handled = FALSE;
+
+        if (ai_fb_pull_rx_len < AI_FB_PULL_REQ_SIZE) {
+            r = recv(ai_fb_pull_client_fd,
+                     ai_fb_pull_rx_buf + ai_fb_pull_rx_len,
+                     AI_FB_PULL_REQ_SIZE - ai_fb_pull_rx_len,
+                     MSG_DONTWAIT);
+            if (r > 0) {
+                ai_fb_pull_rx_len += (int) r;
+            }
+            else if (r == 0) {
+                ai_fb_close_pull_client();
+                break;
+            }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                ai_fb_close_pull_client();
+                break;
+            }
+        }
+
+        while (ai_fb_pull_client_fd >= 0 && ai_fb_pull_rx_len >= AI_FB_PULL_REQ_SIZE) {
+            UBYTE req[AI_FB_PULL_REQ_SIZE];
+            memcpy(req, ai_fb_pull_rx_buf, AI_FB_PULL_REQ_SIZE);
+            if (ai_fb_pull_rx_len > AI_FB_PULL_REQ_SIZE) {
+                memmove(ai_fb_pull_rx_buf,
+                        ai_fb_pull_rx_buf + AI_FB_PULL_REQ_SIZE,
+                        ai_fb_pull_rx_len - AI_FB_PULL_REQ_SIZE);
+            }
+            ai_fb_pull_rx_len -= AI_FB_PULL_REQ_SIZE;
+            ai_fb_process_pull_request(req);
+            handled = TRUE;
+        }
+
+        if (!handled) {
+            break;
+        }
+    }
+}
+
+static void ai_fb_poll_sockets(void)
+{
+    if (!AI_enabled) {
+        return;
+    }
+
+    if (ai_fb_push_enabled) {
+        ai_fb_accept_push_client();
+    }
+    else {
+        ai_fb_close_push_client();
+    }
+
+    if (ai_fb_pull_enabled) {
+        ai_fb_accept_pull_client();
+        ai_fb_poll_pull_requests();
+    }
+    else {
+        ai_fb_close_pull_client();
+    }
+}
+
+static int ai_fb_ensure_buffers(int width, int height)
+{
+    ULONG needed;
+
+    if (width <= 0 || height <= 0) {
+        return FALSE;
+    }
+    if (width > 8192 || height > 8192) {
+        return FALSE;
+    }
+
+    needed = (ULONG) width * (ULONG) height * 2U;
+    if (needed == 0) {
+        return FALSE;
+    }
+
+    if (needed != ai_fb_buf_size) {
+        UBYTE *new_a = (UBYTE *) malloc(needed);
+        UBYTE *new_b = (UBYTE *) malloc(needed);
+        if (new_a == NULL || new_b == NULL) {
+            free(new_a);
+            free(new_b);
+            return FALSE;
+        }
+        free(ai_fb_buf_a);
+        free(ai_fb_buf_b);
+        ai_fb_buf_a = new_a;
+        ai_fb_buf_b = new_b;
+        ai_fb_latest_buf = ai_fb_buf_a;
+        ai_fb_write_buf = ai_fb_buf_b;
+        ai_fb_buf_size = needed;
+        ai_fb_have_last_push_crc = 0;
+    }
+
+    ai_fb_width = width;
+    ai_fb_height = height;
+    ai_fb_stride = (ULONG) width * 2U;
+    return TRUE;
+}
+
+static int color_shift(unsigned int mask)
+{
+    int shift = 0;
+    if (mask == 0) {
+        return 0;
+    }
+    while ((mask & 1U) == 0U) {
+        shift++;
+        mask >>= 1;
+    }
+    return shift;
+}
+
+static int color_bits(unsigned int mask)
+{
+    int bits = 0;
+    if (mask == 0) {
+        return 0;
+    }
+    while ((mask & 1U) == 0U) {
+        mask >>= 1;
+    }
+    while (mask & 1U) {
+        bits++;
+        mask >>= 1;
+    }
+    return bits;
+}
+
+static UBYTE color_to_8bit(unsigned int raw, unsigned int mask, int shift, int bits)
+{
+    unsigned int v;
+    unsigned int maxv;
+    if (mask == 0 || bits <= 0) {
+        return 0;
+    }
+    v = (raw & mask) >> shift;
+    if (bits >= 31) {
+        maxv = 0xffffffffU;
+    }
+    else {
+        maxv = (1U << bits) - 1U;
+    }
+    if (maxv == 0) {
+        return 0;
+    }
+    return (UBYTE) ((v * 255U + maxv / 2U) / maxv);
+}
+
+static void ai_fb_convert_surface_to_rgb565(const void *pixels, int width, int height, int pitch,
+                                            int bits_per_pixel, unsigned int rmask,
+                                            unsigned int gmask, unsigned int bmask)
+{
+    int x, y;
+    int rshift = color_shift(rmask);
+    int gshift = color_shift(gmask);
+    int bshift = color_shift(bmask);
+    int rbits = color_bits(rmask);
+    int gbits = color_bits(gmask);
+    int bbits = color_bits(bmask);
+    ULONG crc = 0xffffffffU;
+    int bytes_per_pixel = (bits_per_pixel + 7) / 8;
+
+    for (y = 0; y < height; y++) {
+        const UBYTE *src = (const UBYTE *) pixels + y * pitch;
+        UWORD *dst = (UWORD *) (ai_fb_write_buf + y * ai_fb_stride);
+
+        if (bits_per_pixel == 16 && rmask == 0xF800U && gmask == 0x07E0U && bmask == 0x001FU) {
+            memcpy(dst, src, width * 2U);
+        }
+        else if (bits_per_pixel == 16) {
+            const UWORD *src16 = (const UWORD *) src;
+            for (x = 0; x < width; x++) {
+                unsigned int raw = src16[x];
+                UBYTE r = color_to_8bit(raw, rmask, rshift, rbits);
+                UBYTE g = color_to_8bit(raw, gmask, gshift, gbits);
+                UBYTE b = color_to_8bit(raw, bmask, bshift, bbits);
+                dst[x] = (UWORD) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            }
+        }
+        else if (bits_per_pixel == 32) {
+            const ULONG *src32 = (const ULONG *) src;
+            for (x = 0; x < width; x++) {
+                unsigned int raw = src32[x];
+                UBYTE r = color_to_8bit(raw, rmask, rshift, rbits);
+                UBYTE g = color_to_8bit(raw, gmask, gshift, gbits);
+                UBYTE b = color_to_8bit(raw, bmask, bshift, bbits);
+                dst[x] = (UWORD) (((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            }
+        }
+        else {
+            for (x = 0; x < width; x++) {
+                unsigned int raw = 0;
+                int b;
+                const UBYTE *p = src + x * bytes_per_pixel;
+                for (b = 0; b < bytes_per_pixel && b < 4; b++) {
+                    raw |= ((unsigned int) p[b]) << (8 * b);
+                }
+                dst[x] = (UWORD) (((color_to_8bit(raw, rmask, rshift, rbits) >> 3) << 11)
+                               | ((color_to_8bit(raw, gmask, gshift, gbits) >> 2) << 5)
+                               | (color_to_8bit(raw, bmask, bshift, bbits) >> 3));
+            }
+        }
+
+        crc = CRC32_Update(crc, (UBYTE const *) dst, width * 2U);
+    }
+
+    ai_fb_latest_crc32 = ~crc;
+}
+
+void AI_FrameStreamSubmitSurface(const void *pixels, int width, int height, int pitch,
+                                 int bits_per_pixel, unsigned int rmask,
+                                 unsigned int gmask, unsigned int bmask)
+{
+    UBYTE *tmp;
+    unsigned long long now_us;
+
+    if (!AI_enabled || pixels == NULL) {
+        return;
+    }
+    if (bits_per_pixel <= 0) {
+        return;
+    }
+
+    ai_fb_poll_sockets();
+
+    if (!ai_fb_ensure_buffers(width, height)) {
+        return;
+    }
+
+    ai_fb_convert_surface_to_rgb565(pixels, width, height, pitch, bits_per_pixel, rmask, gmask, bmask);
+    now_us = monotonic_us();
+
+    tmp = ai_fb_latest_buf;
+    ai_fb_latest_buf = ai_fb_write_buf;
+    ai_fb_write_buf = tmp;
+
+    ai_fb_latest_timestamp_us = now_us;
+    ai_fb_frame_no++;
+
+    if (ai_fb_pull_waiting && ai_fb_pull_client_fd >= 0 && ai_fb_frame_no >= ai_fb_pull_target_frame) {
+        if (!ai_fb_send_frame(ai_fb_pull_client_fd, FALSE)) {
+            ai_fb_close_pull_client();
+        }
+        else {
+            ai_fb_pull_waiting = FALSE;
+            ai_paused = ai_fb_pull_restore_pause;
+        }
+    }
+
+    if (ai_fb_push_enabled && ai_fb_push_client_fd >= 0) {
+        if (!ai_fb_push_try_flush()) {
+            return;
+        }
+        if (ai_fb_push_tx_len > 0) {
+            /* Keep stream framing intact: don't start a new frame until current frame is fully sent. */
+            return;
+        }
+        if (ai_fb_send_every_n_frames > 1 && (ai_fb_frame_no % (ULONG) ai_fb_send_every_n_frames) != 0) {
+            return;
+        }
+        if (ai_fb_fps_cap > 0) {
+            unsigned long long min_interval = 1000000ULL / (unsigned long long) ai_fb_fps_cap;
+            if (now_us < ai_fb_last_push_us + min_interval) {
+                return;
+            }
+        }
+        if (ai_fb_change_triggered && ai_fb_have_last_push_crc && ai_fb_last_push_crc == ai_fb_latest_crc32) {
+            return;
+        }
+
+        if (!ai_fb_push_queue_latest()) {
+            ai_fb_close_push_client();
+            return;
+        }
+        ai_fb_last_push_us = now_us;
+        ai_fb_last_push_crc = ai_fb_latest_crc32;
+        ai_fb_have_last_push_crc = TRUE;
+        ai_fb_push_try_flush();
+    }
+}
+
+static int ai_fb_init(void)
+{
+    ai_fb_push_server_fd = create_unix_server_socket(AI_FB_PUSH_SOCKET_PATH);
+    if (ai_fb_push_server_fd < 0) {
+        Log_print("AI: Failed to create frame push socket %s: %s", AI_FB_PUSH_SOCKET_PATH, strerror(errno));
+    }
+    else {
+        Log_print("AI: Frame push socket listening on %s", AI_FB_PUSH_SOCKET_PATH);
+    }
+
+    ai_fb_pull_server_fd = create_unix_server_socket(AI_FB_PULL_SOCKET_PATH);
+    if (ai_fb_pull_server_fd < 0) {
+        Log_print("AI: Failed to create frame pull socket %s: %s", AI_FB_PULL_SOCKET_PATH, strerror(errno));
+    }
+    else {
+        Log_print("AI: Frame pull socket listening on %s", AI_FB_PULL_SOCKET_PATH);
+    }
+
+    return ai_fb_push_server_fd >= 0 || ai_fb_pull_server_fd >= 0;
+}
+
+static void ai_fb_shutdown(void)
+{
+    ai_fb_close_push_client();
+    ai_fb_close_pull_client();
+
+    if (ai_fb_push_server_fd >= 0) {
+        close(ai_fb_push_server_fd);
+        ai_fb_push_server_fd = -1;
+    }
+    if (ai_fb_pull_server_fd >= 0) {
+        close(ai_fb_pull_server_fd);
+        ai_fb_pull_server_fd = -1;
+    }
+    unlink(AI_FB_PUSH_SOCKET_PATH);
+    unlink(AI_FB_PULL_SOCKET_PATH);
+
+    free(ai_fb_buf_a);
+    free(ai_fb_buf_b);
+    free(ai_fb_push_tx_buf);
+    ai_fb_buf_a = NULL;
+    ai_fb_buf_b = NULL;
+    ai_fb_push_tx_buf = NULL;
+    ai_fb_latest_buf = NULL;
+    ai_fb_write_buf = NULL;
+    ai_fb_buf_size = 0;
+    ai_fb_width = 0;
+    ai_fb_height = 0;
+    ai_fb_stride = 0;
+    ai_fb_frame_no = 0;
+    ai_fb_latest_crc32 = 0;
+    ai_fb_latest_timestamp_us = 0;
+    ai_fb_have_last_push_crc = 0;
+    ai_fb_last_push_crc = 0;
+    ai_fb_last_push_us = 0;
+    ai_fb_pull_rx_len = 0;
+    ai_fb_pull_waiting = 0;
+    ai_fb_push_tx_buf_size = 0;
+    ai_fb_push_tx_len = 0;
+    ai_fb_push_tx_sent = 0;
 }
 
 /* Socket setup */
@@ -336,6 +1156,64 @@ static void process_command(const char *cmd) {
         snprintf(ai_response, sizeof(ai_response),
             "{\"status\":\"ok\",\"width\":%d,\"height\":%d,\"data\":\"%s\"}",
             Screen_WIDTH, Screen_HEIGHT, b64_buf);
+        AI_SendResponse(ai_response);
+    }
+    else if (strcmp(cmd_type, "video.enable_push") == 0) {
+        ai_fb_push_enabled = TRUE;
+        AI_SendResponse("{\"status\":\"ok\"}");
+    }
+    else if (strcmp(cmd_type, "video.disable_push") == 0) {
+        ai_fb_push_enabled = FALSE;
+        ai_fb_close_push_client();
+        AI_SendResponse("{\"status\":\"ok\"}");
+    }
+    else if (strcmp(cmd_type, "video.enable_pull") == 0) {
+        ai_fb_pull_enabled = TRUE;
+        AI_SendResponse("{\"status\":\"ok\"}");
+    }
+    else if (strcmp(cmd_type, "video.disable_pull") == 0) {
+        ai_fb_pull_enabled = FALSE;
+        ai_fb_close_pull_client();
+        AI_SendResponse("{\"status\":\"ok\"}");
+    }
+    else if (strcmp(cmd_type, "video.push.set_fps_cap") == 0) {
+        int fps_cap = json_get_int(cmd, "value", 0);
+        if (fps_cap < 0) {
+            fps_cap = 0;
+        }
+        ai_fb_fps_cap = fps_cap;
+        snprintf(ai_response, sizeof(ai_response),
+            "{\"status\":\"ok\",\"fps_cap\":%d}", ai_fb_fps_cap);
+        AI_SendResponse(ai_response);
+    }
+    else if (strcmp(cmd_type, "video.push.set_frameskip") == 0) {
+        int frame_skip = json_get_int(cmd, "n", 1);
+        if (frame_skip < 1) {
+            frame_skip = 1;
+        }
+        ai_fb_send_every_n_frames = frame_skip;
+        snprintf(ai_response, sizeof(ai_response),
+            "{\"status\":\"ok\",\"send_every_n_frames\":%d}", ai_fb_send_every_n_frames);
+        AI_SendResponse(ai_response);
+    }
+    else if (strcmp(cmd_type, "video.push.enable_change_triggered") == 0) {
+        ai_fb_change_triggered = json_get_bool(cmd, "enabled", TRUE);
+        AI_SendResponse("{\"status\":\"ok\"}");
+    }
+    else if (strcmp(cmd_type, "video.status") == 0) {
+        snprintf(ai_response, sizeof(ai_response),
+            "{\"status\":\"ok\","
+            "\"push_socket\":\"%s\",\"pull_socket\":\"%s\","
+            "\"push_enabled\":%s,\"pull_enabled\":%s,"
+            "\"fps_cap\":%d,\"send_every_n_frames\":%d,"
+            "\"change_triggered\":%s,"
+            "\"width\":%d,\"height\":%d,\"stride\":%u,\"frame_no\":%u}",
+            AI_FB_PUSH_SOCKET_PATH, AI_FB_PULL_SOCKET_PATH,
+            ai_fb_push_enabled ? "true" : "false",
+            ai_fb_pull_enabled ? "true" : "false",
+            ai_fb_fps_cap, ai_fb_send_every_n_frames,
+            ai_fb_change_triggered ? "true" : "false",
+            ai_fb_width, ai_fb_height, ai_fb_stride, ai_fb_frame_no);
         AI_SendResponse(ai_response);
     }
 
@@ -642,6 +1520,7 @@ int AI_Initialise(int *argc, char *argv[]) {
             AI_enabled = FALSE;
             return FALSE;
         }
+        ai_fb_init();
         Log_print("AI: Interface enabled");
     }
 
@@ -650,6 +1529,8 @@ int AI_Initialise(int *argc, char *argv[]) {
 
 /* Cleanup */
 void AI_Exit(void) {
+    ai_fb_shutdown();
+
     if (ai_client_fd >= 0) {
         close(ai_client_fd);
         ai_client_fd = -1;
@@ -667,6 +1548,7 @@ void AI_Frame(void) {
 
     if (!AI_enabled) return;
 
+    ai_fb_poll_sockets();
     check_connections();
 
     /* If we were running frames, decrement and check */
@@ -682,6 +1564,7 @@ void AI_Frame(void) {
 
     /* Process commands while paused */
     while (ai_paused && ai_client_fd >= 0) {
+        ai_fb_poll_sockets();
         if (read_command(cmd_buf, sizeof(cmd_buf)) > 0) {
             process_command(cmd_buf);
         } else {

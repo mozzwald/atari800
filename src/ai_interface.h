@@ -181,6 +181,9 @@ int AI_IsPaused(void);
 void AI_SendResponse(const char *json);
 void AI_DebugWrite(UBYTE byte);
 void AI_ApplyInput(void);  /* Apply AI input overrides after INPUT_Frame */
+void AI_FrameStreamSubmitSurface(const void *pixels, int width, int height, int pitch,
+                                 int bits_per_pixel, unsigned int rmask,
+                                 unsigned int gmask, unsigned int bmask);
 
 /* AI input overrides - set by joystick command, applied after INPUT_Frame */
 extern int AI_joy_override[4];     /* -1 = no override, 0-15 = stick value */

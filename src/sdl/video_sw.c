@@ -48,6 +48,9 @@
 #include "xep80.h"
 #include "xep80_fonts.h"
 #include "util.h"
+#ifdef AI_INTERFACE
+#include "ai_interface.h"
+#endif
 
 #include "sdl/palette.h"
 #include "sdl/video.h"
@@ -920,6 +923,16 @@ void SDL_VIDEO_SW_DisplayScreen(void)
 		return;
 	}
 	(*blit_funcs[SDL_VIDEO_current_display_mode])();
+#ifdef AI_INTERFACE
+	AI_FrameStreamSubmitSurface(SDL_VIDEO_screen->pixels,
+	                            SDL_VIDEO_screen->w,
+	                            SDL_VIDEO_screen->h,
+	                            SDL_VIDEO_screen->pitch,
+	                            SDL_VIDEO_screen->format->BitsPerPixel,
+	                            SDL_VIDEO_screen->format->Rmask,
+	                            SDL_VIDEO_screen->format->Gmask,
+	                            SDL_VIDEO_screen->format->Bmask);
+#endif
 	SDL_UpdateTexture(SDL_VIDEO_texture, NULL, SDL_VIDEO_screen->pixels, SDL_VIDEO_screen->pitch);
 	SDL_RenderClear(SDL_VIDEO_renderer);
 	SDL_RenderCopy(SDL_VIDEO_renderer, SDL_VIDEO_texture, NULL, NULL);
@@ -936,6 +949,16 @@ void SDL_VIDEO_SW_DisplayScreen(void)
 		   return;
 	/* Use function corresponding to the current_display_mode. */
 	(*blit_funcs[SDL_VIDEO_current_display_mode])();
+#ifdef AI_INTERFACE
+	AI_FrameStreamSubmitSurface(SDL_VIDEO_screen->pixels,
+	                            SDL_VIDEO_screen->w,
+	                            SDL_VIDEO_screen->h,
+	                            SDL_VIDEO_screen->pitch,
+	                            SDL_VIDEO_screen->format->BitsPerPixel,
+	                            SDL_VIDEO_screen->format->Rmask,
+	                            SDL_VIDEO_screen->format->Gmask,
+	                            SDL_VIDEO_screen->format->Bmask);
+#endif
 	SDL_UnlockSurface(SDL_VIDEO_screen);
 	/* SDL_UpdateRect is faster than SDL_Flip for a software surface, because
 	   it copies only the used part of the screen. */
