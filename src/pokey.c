@@ -357,14 +357,14 @@ static void POKEY_NetSIOAdvanceCycles(int cycles)
 		if (POKEY_netsio_serin_cycles <= 0) {
 			POKEY_netsio_serin_cycles = 0;
 			POKEY_SKSTAT |= 0x02; /* serial input idle */
-			POKEY_TriggerSerinReady((UBYTE) SIO_GetByte(), 1);
+			POKEY_TriggerSerinReady((UBYTE) SIO_GetByte(), 0);
 		}
 	}
 	if (POKEY_netsio_serout_cycles > 0) {
 		POKEY_netsio_serout_cycles -= cycles;
 		if (POKEY_netsio_serout_cycles <= 0) {
 			POKEY_netsio_serout_cycles = 0;
-			POKEY_TriggerSeroutDone(1);
+			POKEY_TriggerSeroutDone(0);
 		}
 	}
 	if (POKEY_netsio_xmtdone_cycles > 0) {
