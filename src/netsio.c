@@ -55,6 +55,9 @@ static volatile int netsio_rx_bytes_queued = 0;
 static volatile unsigned int netsio_current_baud = 0;
 /* wait for fujinet sync if true */
 volatile int netsio_sync_wait = 0;
+static volatile int netsio_sync_timed_out = 0;
+static pthread_mutex_t netsio_sync_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t netsio_sync_cv = PTHREAD_COND_INITIALIZER;
 /* true if cmd line pulled */
 int netsio_cmd_state = 0;
 /* data frame size for SIO write commands */
@@ -94,8 +97,6 @@ static socklen_t fujinet_addr_len = sizeof(fujinet_addr);
 
 /* Thread declaration */
 static void *fujinet_rx_thread(void *arg);
-static pthread_mutex_t netsio_sync_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t netsio_sync_cond = PTHREAD_COND_INITIALIZER;
 
 static void netsio_netstream_recalc(void)
 {
@@ -114,6 +115,27 @@ static void netsio_netstream_recalc(void)
             netsio_netstream_motor_on,
             netsio_netstream_pokey_ok);
 #endif
+    }
+}
+
+static void millisleep(unsigned int ms)
+{
+    struct timespec req, rem;
+    req.tv_sec  = ms / 1000;
+    req.tv_nsec = (long)(ms % 1000) * 1000000L;
+
+    while (nanosleep(&req, &rem) == -1 && errno == EINTR) {
+        req = rem;
+    }
+}
+
+static void netsio_timespec_add_ms(struct timespec *ts, long ms)
+{
+    ts->tv_sec += ms / 1000;
+    ts->tv_nsec += (ms % 1000) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= 1000000000L;
     }
 }
 
@@ -567,26 +589,49 @@ int netsio_init(uint16_t port) {
 /* Called when a command frame with sync response is sent to FujiNet */
 void netsio_wait_for_sync(void)
 {
-    struct timespec deadline;
+    struct timespec abstime;
+    int rc;
+    int signaled = 0;
+    uint8_t wait_sync_num = 0;
 
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_nsec += 40 * 1000000L;
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
-        deadline.tv_nsec %= 1000000000L;
+    if (clock_gettime(CLOCK_REALTIME, &abstime) != 0) {
+        /* Extremely unlikely fallback: avoid deadlock if realtime clock is unavailable. */
+        millisleep(5);
+        return;
     }
+    netsio_timespec_add_ms(&abstime, 5000);
 
-    pthread_mutex_lock(&netsio_sync_mutex);
-    while (netsio_sync_wait) {
-#ifdef DEBUG
-        Log_print("netsio: waiting for sync response");
+    pthread_mutex_lock(&netsio_sync_mtx);
+    wait_sync_num = netsio_sync_num;
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+    Log_print("netsio: sync wait begin sync=%u", wait_sync_num);
 #endif
-        if (pthread_cond_timedwait(&netsio_sync_cond, &netsio_sync_mutex, &deadline) == ETIMEDOUT) {
+    while (netsio_sync_wait) {
+        rc = pthread_cond_timedwait(&netsio_sync_cv, &netsio_sync_mtx, &abstime);
+        if (rc == 0) {
+            signaled = 1;
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+            Log_print("netsio: sync wait wake signaled sync=%u wait=%d", wait_sync_num, netsio_sync_wait);
+#endif
+            continue;
+        }
+        if (rc == ETIMEDOUT && netsio_sync_wait) {
+            netsio_sync_timed_out = 1;
             netsio_sync_wait = 0;
+            netsio_next_write_size = 0;
+            netsio_cmd_state = 0;
+            Log_print("netsio: sync wait TIMEOUT sync=%u, forcing idle/reset", wait_sync_num);
             break;
         }
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+        Log_print("netsio: sync wait wake rc=%d sync=%u wait=%d", rc, wait_sync_num, netsio_sync_wait);
+#endif
     }
-    pthread_mutex_unlock(&netsio_sync_mutex);
+
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+    Log_print("netsio: sync wait end sync=%u signaled=%d timed_out=%d", wait_sync_num, signaled, netsio_sync_timed_out);
+#endif
+    pthread_mutex_unlock(&netsio_sync_mtx);
 }
 
 /* Return number of bytes waiting from FujiNet to emulator */
@@ -668,14 +713,18 @@ int netsio_cmd_off(void)
 int netsio_cmd_off_sync(void)
 {
     uint8_t p[2];
-    pthread_mutex_lock(&netsio_sync_mutex);
-    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout */
-    pthread_mutex_unlock(&netsio_sync_mutex);
     p[0] = NETSIO_COMMAND_OFF_SYNC;
+    pthread_mutex_lock(&netsio_sync_mtx);
     netsio_sync_num++;
     p[1] = netsio_sync_num;
+    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout */
+    netsio_sync_timed_out = 0;
+    pthread_mutex_unlock(&netsio_sync_mtx);
 #ifdef DEBUG
     Log_print("netsio: CMD OFF SYNC");
+#endif
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+    Log_print("netsio: sync wait set=1 reason=cmd_off_sync sync=%u", p[1]);
 #endif
     netsio_cmd_state = 0;
     send_to_fujinet(p, sizeof(p));
@@ -806,15 +855,19 @@ int netsio_send_block(const uint8_t *block, ssize_t len) {
 int netsio_send_byte_sync(uint8_t b)
 {
     uint8_t p[3];
-    pthread_mutex_lock(&netsio_sync_mutex);
-    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout s*/
-    pthread_mutex_unlock(&netsio_sync_mutex);
     p[0] = NETSIO_DATA_BYTE_SYNC;
     p[1] = b;
+    pthread_mutex_lock(&netsio_sync_mtx);
     netsio_sync_num++;
     p[2] = netsio_sync_num;
+    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout */
+    netsio_sync_timed_out = 0;
+    pthread_mutex_unlock(&netsio_sync_mtx);
 #ifdef DEBUG
     Log_print("netsio: send byte: 0x%02X sync: %d", b, netsio_sync_num);
+#endif
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+    Log_print("netsio: sync wait set=1 reason=data_byte_sync sync=%u", p[2]);
 #endif
     send_to_fujinet(p, sizeof(p));
     return 0;
@@ -1039,6 +1092,9 @@ static void *fujinet_rx_thread(void *arg) {
                 /* packet: [cmd][sync#][ack_type][ack_byte][write_lo][write_hi] */
                 uint8_t resp_sync, ack_type, ack_byte;
                 uint16_t write_size;
+                int enqueue_ack = 0;
+                uint8_t ack_out = 0;
+                uint8_t want_sync;
 
                 if (n < 6)
                 {
@@ -1051,40 +1107,53 @@ static void *fujinet_rx_thread(void *arg) {
                 ack_type   = buf[2];
                 ack_byte   = buf[3];
                 write_size = buf[4] | (uint16_t)buf[5] << 8;
+                pthread_mutex_lock(&netsio_sync_mtx);
+                want_sync = netsio_sync_num;
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                Log_print("netsio: recv: sync-response resp=%u want=%u ack_type=%u ack_byte=0x%02X write_size=0x%04X wait=%d",
+                          resp_sync, want_sync, ack_type, ack_byte, write_size, netsio_sync_wait);
+#endif
+                if (!netsio_sync_wait) {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                    Log_print("netsio: recv: late sync-response resp=%u ignored (not waiting)", resp_sync);
+#endif
+                    pthread_mutex_unlock(&netsio_sync_mtx);
+                    break;
+                }
 
-                if (resp_sync != netsio_sync_num)
-                {
-#ifdef DEBUG
-                    Log_print("netsio: recv: sync-response: got %u, want %u", resp_sync, netsio_sync_num);
+                if (resp_sync != want_sync) {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                    Log_print("netsio: recv: sync-response mismatch resp=%u want=%u (still waiting)", resp_sync, want_sync);
+#endif
+                    pthread_mutex_unlock(&netsio_sync_mtx);
+                    break;
+                }
+
+                if (ack_type == 1) {
+                    netsio_next_write_size = write_size;
+                    ack_out = ack_byte;
+                    enqueue_ack = 1;
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                    Log_print("netsio: recv: sync %u ACK byte=0x%02X write_size=0x%04X", resp_sync, ack_byte, write_size);
 #endif
                 }
-                else
-                {
-                    if (ack_type == 0)
-                    {
-#ifdef DEBUG
-                        Log_print("netsio: recv: sync %u NAK, dropping", resp_sync);
+                else if (ack_type == 0) {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                    Log_print("netsio: recv: sync %u NAK", resp_sync);
 #endif
-                    }
-                    else if (ack_type == 1)
-                    {
-                        netsio_next_write_size = write_size;
-#ifdef DEBUG
-                        Log_print("netsio: recv: sync %u ACK byte=0x%02X  write_size=0x%04X", resp_sync, ack_byte, write_size);
-#endif
-                        (void) enqueue_to_emulator(&ack_byte, 1);
-                    }
-                    else
-                    {
-#ifdef DEBUG
-                        Log_print("netsio: recv: sync %u unknown ack_type %u", resp_sync, ack_type);
-#endif
-                    }
                 }
-                pthread_mutex_lock(&netsio_sync_mutex);
-                netsio_sync_wait = 0; /* continue emulation */
-                pthread_cond_broadcast(&netsio_sync_cond);
-                pthread_mutex_unlock(&netsio_sync_mutex);
+                else {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                    Log_print("netsio: recv: sync %u unknown ack_type %u", resp_sync, ack_type);
+#endif
+                }
+
+                netsio_sync_wait = 0; /* continue emulation only for matched sync */
+                pthread_cond_signal(&netsio_sync_cv);
+                pthread_mutex_unlock(&netsio_sync_mtx);
+
+                if (enqueue_ack)
+                    (void) enqueue_to_emulator(&ack_out, 1);
                 break;
             }
 
@@ -1214,12 +1283,13 @@ void netsio_shutdown(void) {
     /* Reset global state variables */
     netsio_enabled = 0;
     netsio_initialized = 0;  /* Allow re-initialization after shutdown */
+    pthread_mutex_lock(&netsio_sync_mtx);
     netsio_sync_num = 0;
     fujinet_known = 0;
-    pthread_mutex_lock(&netsio_sync_mutex);
     netsio_sync_wait = 0;
-    pthread_cond_broadcast(&netsio_sync_cond);
-    pthread_mutex_unlock(&netsio_sync_mutex);
+    netsio_sync_timed_out = 0;
+    pthread_cond_broadcast(&netsio_sync_cv);
+    pthread_mutex_unlock(&netsio_sync_mtx);
     netsio_cmd_state = 0;
     netsio_next_write_size = 0;
     netsio_netstream_pending_enable = 0;
