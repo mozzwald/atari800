@@ -90,10 +90,15 @@ UBYTE POKEY_poly9_lookup[511];
 UBYTE POKEY_poly17_lookup[16385];
 static ULONG random_scanline_counter;
 #ifdef NETSIO
-static unsigned int POKEY_serial_last_cpu_clock;
-static int POKEY_netsio_serin_cycles;
-static int POKEY_netsio_serout_cycles;
-static int POKEY_netsio_xmtdone_cycles;
+static unsigned int POKEY_netsio_serout_done_clock;
+static unsigned int POKEY_netsio_xmtdone_clock;
+static unsigned int POKEY_netsio_serin_ready_clock;
+static int POKEY_netsio_serout_pending;
+static int POKEY_netsio_xmtdone_pending;
+static int POKEY_netsio_serin_pending;
+static int POKEY_netsio_serout_holding_full;
+static UBYTE POKEY_netsio_serout_holding_byte;
+static int POKEY_netsio_serout_holding_route;
 typedef enum POKEY_SerialClockSource {
 	POKEY_SERIAL_CLOCK_EXTERNAL = 0,
 	POKEY_SERIAL_CLOCK_CH4,
@@ -101,7 +106,9 @@ typedef enum POKEY_SerialClockSource {
 } POKEY_SerialClockSource;
 static int POKEY_SerialRxByteCycles(void);
 static int POKEY_SerialTxByteCycles(void);
-static void POKEY_NetSIOScheduleSerin(void);
+static void POKEY_NetSIOScheduleSerin(unsigned int cpu_clock);
+static void POKEY_NetSIOScheduleSerout(unsigned int cpu_clock);
+static void POKEY_NetSIOClearPacingState(unsigned int cpu_clock);
 #endif
 
 ULONG POKEY_GetRandomCounter(void)
@@ -163,7 +170,7 @@ UBYTE POKEY_GetByte(UWORD addr, int no_side_effects)
 			if ((~POKEY_IRQST & POKEY_IRQEN) == 0 && PBI_IRQ == 0 && PIA_IRQ == 0)
 				CPU_IRQ = 0;
 #ifdef NETSIO
-			POKEY_NetSIOScheduleSerin();
+				POKEY_NetSIOScheduleSerin(ANTIC_CPU_CLOCK);
 #endif
 		}
 #ifdef DEBUG3
@@ -314,8 +321,7 @@ static int POKEY_SerialResolvedBitCycles(POKEY_SerialClockSource source)
 		int bit_cycles = POKEY_SerialBitCyclesFromBaud(netsio_get_current_baud());
 		if (bit_cycles > 0)
 			return bit_cycles;
-		/* If no NetSIO baud is known yet, fall back to internal CH4 timing. */
-		source = POKEY_SERIAL_CLOCK_CH4;
+		return 0;
 	}
 
 	return POKEY_SerialInternalBitCycles(source);
@@ -331,52 +337,107 @@ static int POKEY_SerialTxByteCycles(void)
 	return POKEY_SerialResolvedBitCycles(POKEY_SerialTxClockSource()) * 10;
 }
 
-static void POKEY_NetSIOScheduleSerin(void)
+static int POKEY_NetSIOClockReached(unsigned int now, unsigned int deadline)
 {
-	if (!netsio_enabled || POKEY_netsio_serin_cycles > 0)
+	return (int) (now - deadline) >= 0;
+}
+
+static void POKEY_NetSIOClearPacingState(unsigned int cpu_clock)
+{
+	POKEY_netsio_serout_pending = 0;
+	POKEY_netsio_xmtdone_pending = 0;
+	POKEY_netsio_serin_pending = 0;
+	POKEY_netsio_serout_done_clock = 0;
+	POKEY_netsio_xmtdone_clock = cpu_clock;
+	POKEY_netsio_serin_ready_clock = cpu_clock;
+	POKEY_netsio_serout_holding_full = 0;
+	POKEY_netsio_serout_holding_byte = 0;
+	POKEY_netsio_serout_holding_route = 0;
+	POKEY_SKSTAT |= 0x02;
+}
+
+static void POKEY_NetSIOScheduleSerout(unsigned int cpu_clock)
+{
+	int tx_byte_cycles;
+	if (!netsio_enabled || !POKEY_netsio_serout_pending || POKEY_netsio_serout_done_clock != 0)
+		return;
+	tx_byte_cycles = POKEY_SerialTxByteCycles();
+	if (tx_byte_cycles <= 0)
+		return;
+	POKEY_netsio_serout_done_clock = cpu_clock + (unsigned int) tx_byte_cycles;
+#ifdef DEBUG_NETSIO_PACING
+	Log_print("netsio pacing tx schedule: now=%u done=%u tx_cycles=%d holding=%d",
+	          cpu_clock, POKEY_netsio_serout_done_clock, tx_byte_cycles, POKEY_netsio_serout_holding_full);
+#endif
+}
+
+static void POKEY_NetSIOScheduleSerin(unsigned int cpu_clock)
+{
+	int rx_byte_cycles;
+	if (!netsio_enabled || POKEY_netsio_serin_pending)
 		return;
 	if ((POKEY_IRQST & 0x20) == 0)
 		return;
 	if (netsio_available() <= 0)
 		return;
-	POKEY_netsio_serin_cycles = POKEY_SerialRxByteCycles();
+	rx_byte_cycles = POKEY_SerialRxByteCycles();
+	if (rx_byte_cycles <= 0)
+		return;
+	POKEY_netsio_serin_ready_clock = cpu_clock + (unsigned int) rx_byte_cycles;
+	POKEY_netsio_serin_pending = 1;
 	POKEY_SKSTAT &= (UBYTE) ~0x02; /* serial input busy */
+#ifdef DEBUG_NETSIO_PACING
+	Log_print("netsio pacing rx schedule: now=%u ready=%u rx_cycles=%d rx_fifo=%d",
+	          cpu_clock, POKEY_netsio_serin_ready_clock, rx_byte_cycles, netsio_available());
+#endif
 }
 
-static void POKEY_NetSIOAdvanceCycles(int cycles)
+static void POKEY_NetSIOAdvanceToClock(unsigned int cpu_clock)
 {
-	if (!netsio_enabled) {
-		POKEY_netsio_serin_cycles = 0;
-		POKEY_netsio_serout_cycles = 0;
-		POKEY_netsio_xmtdone_cycles = 0;
-		POKEY_SKSTAT |= 0x02;
-		return;
-	}
-	if (POKEY_netsio_serin_cycles > 0) {
-		POKEY_netsio_serin_cycles -= cycles;
-		if (POKEY_netsio_serin_cycles <= 0) {
-			POKEY_netsio_serin_cycles = 0;
-			POKEY_SKSTAT |= 0x02; /* serial input idle */
-			POKEY_TriggerSerinReady((UBYTE) SIO_GetByte(), 0);
+	if (POKEY_netsio_serout_pending && POKEY_netsio_serout_done_clock != 0
+	    && POKEY_NetSIOClockReached(cpu_clock, POKEY_netsio_serout_done_clock)) {
+		POKEY_netsio_serout_pending = 0;
+		POKEY_netsio_serout_done_clock = 0;
+		POKEY_TriggerSeroutDone(0);
+#ifdef DEBUG_NETSIO_PACING
+		Log_print("netsio pacing serout done: now=%u holding=%d",
+		          cpu_clock, POKEY_netsio_serout_holding_full);
+#endif
+		if (POKEY_netsio_serout_holding_full) {
+			UBYTE held_byte = POKEY_netsio_serout_holding_byte;
+			int held_route = POKEY_netsio_serout_holding_route;
+			POKEY_netsio_serout_holding_full = 0;
+			if (held_route)
+				SIO_PutByte(held_byte);
+			POKEY_netsio_serout_pending = 1;
+#ifdef DEBUG_NETSIO_PACING
+			Log_print("netsio pacing serout holding->shifter: now=%u byte=%02x routed=%d",
+			          cpu_clock, held_byte, held_route);
+#endif
+			POKEY_NetSIOScheduleSerout(cpu_clock);
 		}
 	}
-	if (POKEY_netsio_serout_cycles > 0) {
-		POKEY_netsio_serout_cycles -= cycles;
-		if (POKEY_netsio_serout_cycles <= 0) {
-			POKEY_netsio_serout_cycles = 0;
-			POKEY_TriggerSeroutDone(0);
-		}
+	if (POKEY_netsio_xmtdone_pending && POKEY_NetSIOClockReached(cpu_clock, POKEY_netsio_xmtdone_clock)) {
+		POKEY_netsio_xmtdone_pending = 0;
+		POKEY_IRQST &= 0xf7;
+		if (POKEY_IRQEN & 0x08)
+			CPU_GenerateIRQ();
 	}
-	if (POKEY_netsio_xmtdone_cycles > 0) {
-		POKEY_netsio_xmtdone_cycles -= cycles;
-		if (POKEY_netsio_xmtdone_cycles <= 0) {
-			POKEY_netsio_xmtdone_cycles = 0;
-			POKEY_IRQST &= 0xf7;
-			if (POKEY_IRQEN & 0x08)
-				CPU_GenerateIRQ();
+	if (POKEY_netsio_serin_pending && POKEY_NetSIOClockReached(cpu_clock, POKEY_netsio_serin_ready_clock)) {
+		POKEY_netsio_serin_pending = 0;
+		POKEY_SKSTAT |= 0x02; /* serial input idle */
+		if ((POKEY_IRQST & 0x20) != 0 && netsio_available() > 0) {
+			UBYTE rx_byte = (UBYTE) SIO_GetByte();
+			POKEY_TriggerSerinReady(rx_byte, 0);
+#ifdef DEBUG_NETSIO_PACING
+			Log_print("netsio pacing rx deliver: now=%u byte=%02x rx_fifo=%d",
+			          cpu_clock, rx_byte, netsio_available());
+#endif
 		}
+		POKEY_NetSIOScheduleSerin(cpu_clock);
 	}
-	POKEY_NetSIOScheduleSerin();
+	POKEY_NetSIOScheduleSerout(cpu_clock);
+	POKEY_NetSIOScheduleSerin(cpu_clock);
 }
 #endif /* NETSIO */
 
@@ -390,22 +451,19 @@ static void POKEY_NetSIOAdvanceCycles(int cycles)
 
 void POKEY_AdvanceSerialToClock(unsigned int cpu_clock)
 {
-#ifdef NETSIO
-	if (!netsio_enabled) {
-		/* Keep baseline clock in sync while NetSIO is inactive. */
-		POKEY_serial_last_cpu_clock = cpu_clock;
-		return;
-	}
+	#ifdef NETSIO
 	/* Apply latched NetSIO PROCEED/INTERRUPT transitions continuously, not only on byte reads. */
 	netsio_apply_control_lines();
-	unsigned int elapsed = cpu_clock - POKEY_serial_last_cpu_clock;
-	POKEY_serial_last_cpu_clock = cpu_clock;
-	if (elapsed == 0)
+	if (!netsio_enabled) {
+		if (POKEY_netsio_serout_pending || POKEY_netsio_xmtdone_pending || POKEY_netsio_serin_pending
+		    || POKEY_netsio_serout_holding_full)
+			POKEY_NetSIOClearPacingState(cpu_clock);
 		return;
+	}
 	/* Keep cycle tracking monotonic while reset is active. */
 	if ((POKEY_SKCTL & 0x03) == 0)
 		return;
-	POKEY_NetSIOAdvanceCycles((int) elapsed);
+	POKEY_NetSIOAdvanceToClock(cpu_clock);
 #else
 	(void) cpu_clock;
 #endif
@@ -486,60 +544,97 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 			pot_scanline = 0;	/* slow pot mode */
 		break;
 	case POKEY_OFFSET_SEROUT:
+		{
 #ifdef VOICEBOX
-		VOICEBOX_SEROUTPutByte(byte);
+			VOICEBOX_SEROUTPutByte(byte);
 #endif
 #ifdef NETSIO
-		/* NetSIO must honor arbitrary high-speed divisors, not only legacy whitelist values. */
-		if ((POKEY_SKCTL & 0x70) == 0x20 && (POKEY_siocheck() || netsio_enabled))
+			int netsio_route_serout = 0;
+			/* NetSIO must honor arbitrary high-speed divisors, not only legacy whitelist values. */
+			if ((POKEY_SKCTL & 0x70) == 0x20 && (POKEY_siocheck() || netsio_enabled)) {
+				if (netsio_enabled)
+					netsio_route_serout = 1;
+				else
+					SIO_PutByte(byte);
+			}
+			/* NetSIO direct/modem TX modes that physically drive SIO must also be paced. */
+			else if (netsio_enabled && POKEY_SerialTxClockSource() == POKEY_SERIAL_CLOCK_EXTERNAL)
+				netsio_route_serout = 1;
+			else if (netsio_enabled && POKEY_SerialTxClockSource() == POKEY_SERIAL_CLOCK_CH2)
+				netsio_route_serout = 1;
 #else
-		if ((POKEY_SKCTL & 0x70) == 0x20 && POKEY_siocheck())
-#endif
-			SIO_PutByte(byte);
-#ifdef NETSIO
-		/* NETStream/direct-serial TX can use external clock modes (e.g. SKCTL 000/001). */
-		else if (netsio_enabled && POKEY_SerialTxClockSource() == POKEY_SERIAL_CLOCK_EXTERNAL)
-			SIO_PutByte(byte);
-		/* NetSIO modem-style TX can use CH2-clocked output modes (SKCTL 110/111). */
-		else if (netsio_enabled && POKEY_SerialTxClockSource() == POKEY_SERIAL_CLOCK_CH2)
-			SIO_PutByte(byte);
+			if ((POKEY_SKCTL & 0x70) == 0x20 && POKEY_siocheck())
+				SIO_PutByte(byte);
 #endif
 
-		/* check if cassette 2-tone mode has been enabled */
-		if ((POKEY_SKCTL & 0x08) == 0x00) {
-			/* intelligent device */
+			/* check if cassette 2-tone mode has been enabled */
+			if ((POKEY_SKCTL & 0x08) == 0x00) {
+				/* intelligent device */
 #ifdef NETSIO
-			if (netsio_enabled) {
-				int byte_cycles = POKEY_SerialTxByteCycles();
-				POKEY_netsio_serout_cycles = byte_cycles;
-				/* XMTDONE follows serial-out complete in current emulation model. */
-				POKEY_netsio_xmtdone_cycles = byte_cycles * 2 - 1;
-				POKEY_DELAYED_SEROUT_IRQ = 0;
-				POKEY_DELAYED_XMTDONE_IRQ = 0;
-				POKEY_IRQST |= 0x08;
-				break;
-			}
+					if (netsio_enabled) {
+						int byte_cycles = POKEY_SerialTxByteCycles();
+						if (!POKEY_netsio_serout_pending) {
+							if (netsio_route_serout)
+								SIO_PutByte(byte);
+							POKEY_netsio_serout_pending = 1;
+							POKEY_netsio_serout_done_clock = 0;
+							POKEY_NetSIOScheduleSerout(ANTIC_CPU_CLOCK);
+						}
+							else if (!POKEY_netsio_serout_holding_full) {
+								POKEY_netsio_serout_holding_full = 1;
+								POKEY_netsio_serout_holding_byte = byte;
+								POKEY_netsio_serout_holding_route = netsio_route_serout;
+#ifdef DEBUG_NETSIO_PACING
+								Log_print("netsio pacing serout store holding: now=%u byte=%02x routed=%d",
+								          ANTIC_CPU_CLOCK, byte, netsio_route_serout);
 #endif
-			POKEY_DELAYED_SEROUT_IRQ = SIO_SEROUT_INTERVAL;
-			POKEY_IRQST |= 0x08;
-			POKEY_DELAYED_XMTDONE_IRQ = SIO_XMTDONE_INTERVAL;
-		}
-		else {
-			/* cassette */
-			/* some savers patch the cassette baud rate, so we evaluate it here */
-			/* scanlines per second*10 bit*audiofrequency/(1.79 MHz/2) */
-                        POKEY_DELAYED_SEROUT_IRQ = 312*50*10*(POKEY_AUDF[POKEY_CHAN3] + POKEY_AUDF[POKEY_CHAN4]*0x100)/895000;
-			/* safety check */
-			if (POKEY_DELAYED_SEROUT_IRQ >= 3) {
-                        	POKEY_IRQST |= 0x08;
-                        	POKEY_DELAYED_XMTDONE_IRQ = 2*POKEY_DELAYED_SEROUT_IRQ - 2;
+							}
+							else {
+								/* Hardware has a 1-byte holding register; overwrite oldest pending held byte. */
+								POKEY_netsio_serout_holding_byte = byte;
+								POKEY_netsio_serout_holding_route = netsio_route_serout;
+#ifdef DEBUG_NETSIO_PACING
+								Log_print("netsio pacing serout overwrite holding: now=%u byte=%02x routed=%d",
+								          ANTIC_CPU_CLOCK, byte, netsio_route_serout);
+#endif
+							}
+#ifdef DEBUG_NETSIO_PACING
+						Log_print("netsio pacing serout write: now=%u byte=%02x tx_cycles=%d routed=%d busy=%d holding=%d",
+						          ANTIC_CPU_CLOCK, byte, byte_cycles, netsio_route_serout,
+						          POKEY_netsio_serout_pending, POKEY_netsio_serout_holding_full);
+#endif
+						if (byte_cycles > 0) {
+							/* XMTDONE follows serial-out complete in current emulation model. */
+							POKEY_netsio_xmtdone_clock = ANTIC_CPU_CLOCK + (unsigned int) (byte_cycles * 2 - 1);
+							POKEY_netsio_xmtdone_pending = 1;
+						}
+						POKEY_DELAYED_SEROUT_IRQ = 0;
+						POKEY_DELAYED_XMTDONE_IRQ = 0;
+						POKEY_IRQST |= 0x08;
+					break;
+				}
+#endif
+				POKEY_DELAYED_SEROUT_IRQ = SIO_SEROUT_INTERVAL;
+				POKEY_IRQST |= 0x08;
+				POKEY_DELAYED_XMTDONE_IRQ = SIO_XMTDONE_INTERVAL;
 			}
 			else {
-				POKEY_DELAYED_SEROUT_IRQ = 0;
-				POKEY_DELAYED_XMTDONE_IRQ = 0;
-			}
-		};
-		break;
+				/* cassette */
+				/* some savers patch the cassette baud rate, so we evaluate it here */
+				/* scanlines per second*10 bit*audiofrequency/(1.79 MHz/2) */
+	                        POKEY_DELAYED_SEROUT_IRQ = 312*50*10*(POKEY_AUDF[POKEY_CHAN3] + POKEY_AUDF[POKEY_CHAN4]*0x100)/895000;
+				/* safety check */
+				if (POKEY_DELAYED_SEROUT_IRQ >= 3) {
+	                        	POKEY_IRQST |= 0x08;
+	                        	POKEY_DELAYED_XMTDONE_IRQ = 2*POKEY_DELAYED_SEROUT_IRQ - 2;
+				}
+				else {
+					POKEY_DELAYED_SEROUT_IRQ = 0;
+					POKEY_DELAYED_XMTDONE_IRQ = 0;
+				}
+			};
+			break;
+		}
 	case POKEY_OFFSET_STIMER:
 		POKEY_DivNIRQ[POKEY_CHAN1] = POKEY_DivNMax[POKEY_CHAN1];
 		POKEY_DivNIRQ[POKEY_CHAN2] = POKEY_DivNMax[POKEY_CHAN2];
@@ -564,10 +659,7 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 			POKEY_DELAYED_SEROUT_IRQ = 0;
 			POKEY_DELAYED_XMTDONE_IRQ = 0;
 #ifdef NETSIO
-			POKEY_netsio_serin_cycles = 0;
-			POKEY_netsio_serout_cycles = 0;
-			POKEY_netsio_xmtdone_cycles = 0;
-			POKEY_SKSTAT |= 0x02;
+			POKEY_NetSIOClearPacingState(ANTIC_CPU_CLOCK);
 #endif
 			CASSETTE_ResetPOKEY();
 			/* TODO other registers should also be reset. */
@@ -636,10 +728,7 @@ int POKEY_Initialise(int *argc, char *argv[])
 	POKEY_DELAYED_SEROUT_IRQ = 0;
 	POKEY_DELAYED_XMTDONE_IRQ = 0;
 #ifdef NETSIO
-	POKEY_netsio_serin_cycles = 0;
-	POKEY_netsio_serout_cycles = 0;
-	POKEY_netsio_xmtdone_cycles = 0;
-	POKEY_serial_last_cpu_clock = ANTIC_CPU_CLOCK;
+	POKEY_NetSIOClearPacingState(ANTIC_CPU_CLOCK);
 #endif
 
 	POKEY_KBCODE = 0xff;
@@ -728,8 +817,6 @@ void POKEY_Scanline(void)
 						/* It's not a part of POKEY emulation, */
 						/* but it looks to be the best place to put it. */
 #endif
-	POKEY_AdvanceSerialToClock(ANTIC_CPU_CLOCK);
-
 	/* on nonpatched i/o-operation, enable the cassette timing */
 	if (!ESC_enable_sio_patch) {
 		if (CASSETTE_AddScanLine())
@@ -927,10 +1014,7 @@ void POKEY_StateRead(void)
 	StateSav_ReadINT(&POKEY_DivNMax[0], 4);
 	StateSav_ReadINT(&POKEY_Base_mult[0], 1);
 #ifdef NETSIO
-	POKEY_netsio_serin_cycles = 0;
-	POKEY_netsio_serout_cycles = 0;
-	POKEY_netsio_xmtdone_cycles = 0;
-	POKEY_serial_last_cpu_clock = ANTIC_CPU_CLOCK;
+	POKEY_NetSIOClearPacingState(ANTIC_CPU_CLOCK);
 #endif
 }
 
