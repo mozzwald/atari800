@@ -1030,7 +1030,7 @@ static void *fujinet_rx_thread(void *arg) {
                     ack_out = ack_byte;
                     enqueue_ack = 1;
 #if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
-                    Log_print("netsio: recv: sync %u ACK byte=0x%02X write_size=0x%04X", resp_sync, ack_byte, write_size);
+                    Log_print("netsio: recv: sync %u ACK byte=0x%02X write_size=0x%04X cmd_state=%d", resp_sync, ack_byte, write_size, netsio_cmd_state);
 #endif
                 }
                 else if (ack_type == 0) {
@@ -1048,8 +1048,17 @@ static void *fujinet_rx_thread(void *arg) {
                 pthread_cond_signal(&netsio_sync_cv);
                 pthread_mutex_unlock(&netsio_sync_mtx);
 
-                if (enqueue_ack)
+                if (enqueue_ack) {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                    Log_print("netsio: recv: sync %u enqueue ACK byte=0x%02X queued_before=%d",
+                              resp_sync, ack_out, netsio_available());
+#endif
                     (void) enqueue_to_emulator(&ack_out, 1);
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+                    Log_print("netsio: recv: sync %u enqueue ACK done queued_after=%d",
+                              resp_sync, netsio_available());
+#endif
+                }
                 break;
             }
 

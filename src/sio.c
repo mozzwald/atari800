@@ -189,6 +189,22 @@ int NetSIO_GetByte(void);
 
 int ignore_header_writeprotect = FALSE;
 
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+static const char *SIO_TransferStatusName(int status)
+{
+	switch (status) {
+	case SIO_NoFrame: return "NoFrame";
+	case SIO_CommandFrame: return "CommandFrame";
+	case SIO_StatusRead: return "StatusRead";
+	case SIO_ReadFrame: return "ReadFrame";
+	case SIO_WriteFrame: return "WriteFrame";
+	case SIO_FinalStatus: return "FinalStatus";
+	case SIO_FormatFrame: return "FormatFrame";
+	default: return "Unknown";
+	}
+}
+#endif
+
 int SIO_Initialise(int *argc, char *argv[])
 {
 	int i;
@@ -1531,8 +1547,19 @@ void SIO_SwitchCommandFrame(int onoff)
 	if (onoff)
 	{				/* Enabled */
 #ifdef NETSIO
-		if (netsio_enabled)
+		if (netsio_enabled) {
+			/* Some devices start the next command after ACK; finish prior final-status implicitly. */
+			if (TransferStatus == SIO_FinalStatus && DataIndex == 1) {
+				TransferStatus = SIO_NoFrame;
+				CommandIndex = 0;
+				DataIndex = 0;
+				ExpectedBytes = 0;
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+				Log_print("SIO cmdframe ON: implicit finalize of prior FinalStatus before new command");
+#endif
+			}
 			netsio_cmd_on();
+		}
 #endif /* NETSIO */
 		if (TransferStatus != SIO_NoFrame) 
 #ifdef NETSIO
@@ -1540,6 +1567,11 @@ void SIO_SwitchCommandFrame(int onoff)
 			if (netsio_enabled && TransferStatus != SIO_ReadFrame)
 #endif /* NETSIO */
 				Log_print("Unexpected command frame at state %x.", TransferStatus);
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+		Log_print("SIO cmdframe ON: prev=%s(0x%x) cmd_idx=%d data_idx=%d expected=%d",
+		          SIO_TransferStatusName(TransferStatus), TransferStatus,
+		          CommandIndex, DataIndex, ExpectedBytes);
+#endif
 		CommandIndex = 0;
 		DataIndex = 0;
 		ExpectedBytes = 5;
@@ -1569,6 +1601,11 @@ void SIO_SwitchCommandFrame(int onoff)
 				netsio_wait_for_sync(); /* Wait for sync response (ACK/NAK/NONE) */
 				/* POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL * 8;*/
 				TransferStatus = SIO_StatusRead; /* Receive ACK/NAK in SIO_GetByte */
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+				Log_print("SIO cmdframe OFF(sync): -> %s cmd_idx=%d data_idx=%d expected=%d",
+				          SIO_TransferStatusName(TransferStatus),
+				          CommandIndex, DataIndex, ExpectedBytes);
+#endif
 			}
 		}
 		else
@@ -1579,6 +1616,11 @@ void SIO_SwitchCommandFrame(int onoff)
 				Log_print("Command frame %02x unfinished.", TransferStatus);
 			TransferStatus = SIO_NoFrame;
 		}
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+		Log_print("SIO cmdframe OFF: now=%s(0x%x) cmd_idx=%d data_idx=%d expected=%d",
+		          SIO_TransferStatusName(TransferStatus), TransferStatus,
+		          CommandIndex, DataIndex, ExpectedBytes);
+#endif
 		CommandIndex = 0;
 	}
 }
@@ -1741,6 +1783,7 @@ void SIO_PutByte(int byte)
 int NetSIO_GetByte(void)
 {
 	UBYTE b;
+	int prev_status = TransferStatus;
 	netsio_apply_control_lines();
 
 	if(netsio_available() > 0)
@@ -1755,6 +1798,12 @@ int NetSIO_GetByte(void)
 	}
 	else
 		b = 0xFF;
+
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+	Log_print("NetSIO_GetByte pre: status=%s(0x%x) byte=0x%02x cmd_idx=%d data_idx=%d expected=%d",
+	          SIO_TransferStatusName(TransferStatus), TransferStatus, b,
+	          CommandIndex, DataIndex, ExpectedBytes);
+#endif
 
 	switch (TransferStatus) {
 	case SIO_StatusRead:
@@ -1780,6 +1829,15 @@ int NetSIO_GetByte(void)
 		}
 		else
 		{
+#ifdef NETSIO
+			/* Tolerate late final-status bytes from prior write transaction. */
+			if (b == 'C' || b == 'E') {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+				Log_print("NetSIO_GetByte: late final-status byte in StatusRead ignored: %02x", b);
+#endif
+				break;
+			}
+#endif
 #ifdef DEBUG
 			Log_print("NetSIO_GetByte: unexpected byte %02x", b);
 #endif
@@ -1819,6 +1877,14 @@ int NetSIO_GetByte(void)
 		/* Receiving other bytes (maybe modem) */
 		break;
 	}
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+	if (prev_status != TransferStatus || b != 0xFF) {
+		Log_print("NetSIO_GetByte post: %s(0x%x)->%s(0x%x) byte=0x%02x data_idx=%d expected=%d",
+		          SIO_TransferStatusName(prev_status), prev_status,
+		          SIO_TransferStatusName(TransferStatus), TransferStatus,
+		          b, DataIndex, ExpectedBytes);
+	}
+#endif
 #ifdef DEBUG2
 	Log_print("NetSIO_GetByte_%d: %02x", ts, (int)b);
 #endif

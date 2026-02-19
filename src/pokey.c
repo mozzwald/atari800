@@ -166,6 +166,10 @@ UBYTE POKEY_GetByte(UWORD addr, int no_side_effects)
 		byte = POKEY_SERIN;
 		if (!no_side_effects) {
 			/* Reading SERIN acknowledges pending input-ready status. */
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+			Log_print("POKEY SERIN read: byte=%02x irqst(before)=%02x irqen=%02x skstat=%02x clock=%u",
+			          byte, POKEY_IRQST, POKEY_IRQEN, POKEY_SKSTAT, ANTIC_CPU_CLOCK);
+#endif
 			POKEY_IRQST |= 0x20;
 			if ((~POKEY_IRQST & POKEY_IRQEN) == 0 && PBI_IRQ == 0 && PIA_IRQ == 0)
 				CPU_IRQ = 0;
@@ -208,6 +212,10 @@ static void POKEY_TriggerSerinReady(UBYTE byte, int force_irqst_update)
 {
 	/* Load a byte to SERIN even when IRQ is disabled. */
 	POKEY_SERIN = byte;
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+	Log_print("POKEY serin ready: byte=%02x force=%d irqen=%02x irqst(before)=%02x skstat=%02x clock=%u",
+	          byte, force_irqst_update, POKEY_IRQEN, POKEY_IRQST, POKEY_SKSTAT, ANTIC_CPU_CLOCK);
+#endif
 	if (force_irqst_update || (POKEY_IRQEN & 0x20)) {
 		if (POKEY_IRQST & 0x20)
 			POKEY_IRQST &= 0xdf;
@@ -220,6 +228,10 @@ static void POKEY_TriggerSerinReady(UBYTE byte, int force_irqst_update)
 
 static void POKEY_TriggerSeroutDone(int force_irqst_update)
 {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+	Log_print("POKEY serout done: force=%d irqen=%02x irqst(before)=%02x clock=%u",
+	          force_irqst_update, POKEY_IRQEN, POKEY_IRQST, ANTIC_CPU_CLOCK);
+#endif
 	if (force_irqst_update || (POKEY_IRQEN & 0x10)) {
 		POKEY_IRQST &= 0xef;
 		if (POKEY_IRQEN & 0x10)
@@ -562,6 +574,12 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 				netsio_route_serout = 1;
 			else if (netsio_enabled && POKEY_SerialTxClockSource() == POKEY_SERIAL_CLOCK_CH2)
 				netsio_route_serout = 1;
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+			Log_print("POKEY SEROUT write: byte=%02x skctl=%02x audctl=%02x audf3=%02x audf4=%02x txsrc=%d route=%d busy=%d holding=%d clock=%u",
+			          byte, POKEY_SKCTL, POKEY_AUDCTL[0], POKEY_AUDF[POKEY_CHAN3], POKEY_AUDF[POKEY_CHAN4],
+			          (int) POKEY_SerialTxClockSource(), netsio_route_serout,
+			          POKEY_netsio_serout_pending, POKEY_netsio_serout_holding_full, ANTIC_CPU_CLOCK);
+#endif
 #else
 			if ((POKEY_SKCTL & 0x70) == 0x20 && POKEY_siocheck())
 				SIO_PutByte(byte);
@@ -608,6 +626,11 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 							POKEY_netsio_xmtdone_clock = ANTIC_CPU_CLOCK + (unsigned int) (byte_cycles * 2 - 1);
 							POKEY_netsio_xmtdone_pending = 1;
 						}
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+						Log_print("POKEY SEROUT schedule: byte=%02x tx_cycles=%d serout_done=%u xmtdone=%u busy=%d holding=%d",
+						          byte, byte_cycles, POKEY_netsio_serout_done_clock, POKEY_netsio_xmtdone_clock,
+						          POKEY_netsio_serout_pending, POKEY_netsio_serout_holding_full);
+#endif
 						POKEY_DELAYED_SEROUT_IRQ = 0;
 						POKEY_DELAYED_XMTDONE_IRQ = 0;
 						POKEY_IRQST |= 0x08;
