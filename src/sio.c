@@ -177,6 +177,9 @@ char SIO_status[256];
 #define SIO_WriteFrame      (0x04)
 #define SIO_FinalStatus     (0x05)
 #define SIO_FormatFrame     (0x06)
+#define SIO_DTIMLO_ADDR     (0x0306)
+#define SIO_FINAL_STATUS_FALLBACK_TIMEOUT_MS (5000U)
+#define SIO_FINAL_STATUS_LATENCY_SLACK_MS    (300U)
 static UBYTE CommandFrame[6];
 static int CommandIndex = 0;
 static UBYTE DataBuffer[65535 + 3]; /* large buffer for FujiNet */
@@ -185,6 +188,40 @@ static int TransferStatus = SIO_NoFrame;
 static int ExpectedBytes = 0;
 #ifdef NETSIO
 int NetSIO_GetByte(void);
+static int SIO_WaitForNetSIOFinalStatus(UBYTE *status_byte)
+{
+	int dtimlo = MEMORY_dGetByte(SIO_DTIMLO_ADDR);
+	unsigned int timeout_ms;
+	double deadline;
+
+	if (dtimlo > 0)
+		timeout_ms = (unsigned int) dtimlo * 1000U + SIO_FINAL_STATUS_LATENCY_SLACK_MS;
+	else
+		timeout_ms = SIO_FINAL_STATUS_FALLBACK_TIMEOUT_MS;
+
+	deadline = Util_time() + (double) timeout_ms / 1000.0;
+	while (Util_time() < deadline) {
+		UBYTE b;
+		netsio_apply_control_lines();
+		if (netsio_available() <= 0) {
+			Util_sleep(0.001);
+			continue;
+		}
+		if (netsio_recv_byte(&b) < 0) {
+			Util_sleep(0.001);
+			continue;
+		}
+		if (b == 'C' || b == 'E') {
+			*status_byte = b;
+			return 1;
+		}
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+		Log_print("SIO wait final-status: ignoring non-final byte %02x while waiting for C/E", b);
+#endif
+	}
+
+	return 0;
+}
 #endif
 
 int ignore_header_writeprotect = FALSE;
@@ -1548,15 +1585,25 @@ void SIO_SwitchCommandFrame(int onoff)
 	{				/* Enabled */
 #ifdef NETSIO
 		if (netsio_enabled) {
-			/* Some devices start the next command after ACK; finish prior final-status implicitly. */
+			/* If previous write is waiting for C/E, block here and wait for completion byte. */
 			if (TransferStatus == SIO_FinalStatus && DataIndex == 1) {
+				UBYTE final_status = 0xff;
+				if (SIO_WaitForNetSIOFinalStatus(&final_status)) {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+					Log_print("SIO cmdframe ON: waited for final-status byte %02x (DTIMLO=%u)",
+					          final_status, (unsigned) MEMORY_dGetByte(SIO_DTIMLO_ADDR));
+#endif
+				}
+				else {
+#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
+					Log_print("SIO cmdframe ON: timeout waiting final-status C/E (DTIMLO=%u)",
+					          (unsigned) MEMORY_dGetByte(SIO_DTIMLO_ADDR));
+#endif
+				}
 				TransferStatus = SIO_NoFrame;
 				CommandIndex = 0;
 				DataIndex = 0;
 				ExpectedBytes = 0;
-#if defined(DEBUG) || defined(DEBUG_NETSIO_PACING)
-				Log_print("SIO cmdframe ON: implicit finalize of prior FinalStatus before new command");
-#endif
 			}
 			netsio_cmd_on();
 		}
