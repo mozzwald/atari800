@@ -179,14 +179,15 @@ static void screen_to_ascii(char *out, int outsize) {
     /* Map Atari screen (384x240) to 40x24 ASCII */
     const char *chars = " .:-=+*#%@";
     int char_count = strlen(chars);
-
+    int row;
+    int col;
     int lines = 0;
     int pos = 0;
     out[pos++] = '[';
 
-    for (int row = 0; row < 24 && pos < outsize - 100; row++) {
+    for (row = 0; row < 24 && pos < outsize - 100; row++) {
         out[pos++] = '"';
-        for (int col = 0; col < 40 && pos < outsize - 50; col++) {
+        for (col = 0; col < 40 && pos < outsize - 50; col++) {
             /* Sample screen at this character position */
             int sx = (col * 336 / 40) + 24;  /* 24 pixel left margin */
             int sy = (row * 192 / 24) + 24;  /* 24 pixel top margin */
@@ -214,6 +215,7 @@ static void screen_to_ascii(char *out, int outsize) {
 static void process_command(const char *cmd) {
     char cmd_type[32] = "";
     char path[512] = "";
+    int i;
 
     json_get_string(cmd, "cmd", cmd_type, sizeof(cmd_type));
 
@@ -347,7 +349,7 @@ static void process_command(const char *cmd) {
 
         int pos = snprintf(ai_response, sizeof(ai_response),
             "{\"status\":\"ok\",\"addr\":%d,\"data\":[", addr);
-        for (int i = 0; i < len && pos < sizeof(ai_response) - 20; i++) {
+        for (i = 0; i < len && pos < sizeof(ai_response) - 20; i++) {
             pos += snprintf(ai_response + pos, sizeof(ai_response) - pos,
                 "%s%d", i ? "," : "", MEMORY_SafeGetByte((UWORD)(addr + i)));
         }
@@ -383,7 +385,7 @@ static void process_command(const char *cmd) {
         if (path[0]) {
             FILE *f = fopen(path, "wb");
             if (f) {
-                for (int i = start; i <= end; i++) {
+                for (i = start; i <= end; i++) {
                     UBYTE b = MEMORY_SafeGetByte((UWORD)i);
                     fwrite(&b, 1, 1, f);
                 }
@@ -497,12 +499,12 @@ static void process_command(const char *cmd) {
     else if (strcmp(cmd_type, "debug_read") == 0) {
         int pos = snprintf(ai_response, sizeof(ai_response),
             "{\"status\":\"ok\",\"data\":[");
-        for (int i = 0; i < ai_debug_buffer_pos && pos < sizeof(ai_response) - 100; i++) {
+        for (i = 0; i < ai_debug_buffer_pos && pos < sizeof(ai_response) - 100; i++) {
             pos += snprintf(ai_response + pos, sizeof(ai_response) - pos,
                 "%s%d", i ? "," : "", ai_debug_buffer[i]);
         }
         pos += snprintf(ai_response + pos, sizeof(ai_response) - pos, "],\"ascii\":\"");
-        for (int i = 0; i < ai_debug_buffer_pos && pos < sizeof(ai_response) - 10; i++) {
+        for (i = 0; i < ai_debug_buffer_pos && pos < sizeof(ai_response) - 10; i++) {
             UBYTE c = ai_debug_buffer[i];
             if (c >= 32 && c < 127 && c != '"' && c != '\\') {
                 ai_response[pos++] = c;

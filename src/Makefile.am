@@ -60,6 +60,7 @@ atari800_SOURCES = \
 	akey.h \
 	afile.c afile.h \
 	antic.c antic.h \
+	ai_interface.c ai_interface.h \
 	atari.c atari.h \
 	binload.c binload.h \
 	cartridge.c cartridge.h \
