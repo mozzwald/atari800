@@ -53,6 +53,12 @@
 #include "netsio.h"
 #endif
 
+#if defined(DEBUG_NETSIO_DIAG)
+#define POKEY_NETSIO_TRACE(fmt, ...) Log_print("pokey: " fmt, ##__VA_ARGS__)
+#else
+#define POKEY_NETSIO_TRACE(...) do { } while (0)
+#endif
+
 #ifdef POKEYREC
 #include "pokeyrec.h"
 #endif
@@ -164,15 +170,9 @@ UBYTE POKEY_GetByte(UWORD addr, int no_side_effects)
 		break;
 	case POKEY_OFFSET_SERIN:
 		byte = POKEY_SERIN;
-		if (!no_side_effects) {
-			/* Reading SERIN acknowledges pending input-ready status. */
-			POKEY_IRQST |= 0x20;
-			if ((~POKEY_IRQST & POKEY_IRQEN) == 0 && PBI_IRQ == 0 && PIA_IRQ == 0)
-				CPU_IRQ = 0;
-#ifdef NETSIO
-				POKEY_NetSIOScheduleSerin(ANTIC_CPU_CLOCK);
-#endif
-		}
+		/* Per hardware behavior, reading SERIN has no side effects. */
+		POKEY_NETSIO_TRACE("SERIN read clock=%u byte=%02X irqen=%02X irqst=%02X skstat=%02X sidefx=%d",
+		                   ANTIC_CPU_CLOCK, byte, POKEY_IRQEN, POKEY_IRQST, POKEY_SKSTAT, !no_side_effects);
 #ifdef DEBUG3
 		printf("SERIO: SERIN read, bytevalue %02x\n", POKEY_SERIN);
 #endif
@@ -208,6 +208,8 @@ static void POKEY_TriggerSerinReady(UBYTE byte, int force_irqst_update)
 {
 	/* Load a byte to SERIN even when IRQ is disabled. */
 	POKEY_SERIN = byte;
+	POKEY_NETSIO_TRACE("SERIN ready clock=%u byte=%02X irqen=%02X irqst(before)=%02X skstat(before)=%02X force=%d",
+	                   ANTIC_CPU_CLOCK, byte, POKEY_IRQEN, POKEY_IRQST, POKEY_SKSTAT, force_irqst_update);
 	if (force_irqst_update || (POKEY_IRQEN & 0x20)) {
 		if (POKEY_IRQST & 0x20)
 			POKEY_IRQST &= 0xdf;
@@ -216,15 +218,22 @@ static void POKEY_TriggerSerinReady(UBYTE byte, int force_irqst_update)
 		if (POKEY_IRQEN & 0x20)
 			CPU_GenerateIRQ();
 	}
+	POKEY_NETSIO_TRACE("SERIN ready clock=%u irqst(after)=%02X skstat(after)=%02X",
+	                   ANTIC_CPU_CLOCK, POKEY_IRQST, POKEY_SKSTAT);
 }
 
 static void POKEY_TriggerSeroutDone(int force_irqst_update)
 {
+	POKEY_NETSIO_TRACE("SEROUT done clock=%u irqen=%02X irqst(before)=%02X force=%d",
+	                   ANTIC_CPU_CLOCK, POKEY_IRQEN, POKEY_IRQST, force_irqst_update);
+	/* Shift register has loaded and begun shifting: transmit is now in progress. */
+	POKEY_IRQST |= 0x08;
 	if (force_irqst_update || (POKEY_IRQEN & 0x10)) {
 		POKEY_IRQST &= 0xef;
 		if (POKEY_IRQEN & 0x10)
 			CPU_GenerateIRQ();
 	}
+	POKEY_NETSIO_TRACE("SEROUT done clock=%u irqst(after)=%02X", ANTIC_CPU_CLOCK, POKEY_IRQST);
 }
 
 #ifdef NETSIO
@@ -526,16 +535,24 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 		POKEYSND_Update(POKEY_OFFSET_AUDF4, byte, 0, SOUND_GAIN);
 		break;
 	case POKEY_OFFSET_IRQEN:
+		{
+		UBYTE old_irqst = POKEY_IRQST;
 		POKEY_IRQEN = byte;
 #ifdef DEBUG1
 		printf("WR: IRQEN = %x, PC = %x\n", POKEY_IRQEN, PC);
 #endif
 		POKEY_IRQST |= ~byte & 0xf7;	/* Reset disabled IRQs except XMTDONE */
+#ifdef NETSIO
+		/* ACK of serial-in ready (bit 5) via IRQEN reset enables next queued byte. */
+		if ((old_irqst & 0x20) == 0 && (POKEY_IRQST & 0x20) != 0)
+			POKEY_NetSIOScheduleSerin(ANTIC_CPU_CLOCK);
+#endif
 		if ((~POKEY_IRQST & POKEY_IRQEN) == 0 && PBI_IRQ == 0 && PIA_IRQ == 0)
 			CPU_IRQ = 0;
 		else
 			CPU_GenerateIRQ();
 		break;
+		}
 	case POKEY_OFFSET_SKRES:
 		POKEY_SKSTAT |= 0xe0;
 		break;
@@ -545,6 +562,8 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 		break;
 	case POKEY_OFFSET_SEROUT:
 		{
+			POKEY_NETSIO_TRACE("SEROUT write clock=%u byte=%02X skctl=%02X irqen=%02X irqst(before)=%02X",
+			                   ANTIC_CPU_CLOCK, byte, POKEY_SKCTL, POKEY_IRQEN, POKEY_IRQST);
 #ifdef VOICEBOX
 			VOICEBOX_SEROUTPutByte(byte);
 #endif
@@ -610,13 +629,13 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 						}
 						POKEY_DELAYED_SEROUT_IRQ = 0;
 						POKEY_DELAYED_XMTDONE_IRQ = 0;
-						POKEY_IRQST |= 0x08;
 					break;
 				}
 #endif
 				POKEY_DELAYED_SEROUT_IRQ = SIO_SEROUT_INTERVAL;
-				POKEY_IRQST |= 0x08;
 				POKEY_DELAYED_XMTDONE_IRQ = SIO_XMTDONE_INTERVAL;
+				POKEY_NETSIO_TRACE("SEROUT sched std clock=%u serout_delay=%d xmtdone_delay=%d irqst=%02X",
+				                   ANTIC_CPU_CLOCK, POKEY_DELAYED_SEROUT_IRQ, POKEY_DELAYED_XMTDONE_IRQ, POKEY_IRQST);
 			}
 			else {
 				/* cassette */
@@ -625,7 +644,6 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 	                        POKEY_DELAYED_SEROUT_IRQ = 312*50*10*(POKEY_AUDF[POKEY_CHAN3] + POKEY_AUDF[POKEY_CHAN4]*0x100)/895000;
 				/* safety check */
 				if (POKEY_DELAYED_SEROUT_IRQ >= 3) {
-	                        	POKEY_IRQST |= 0x08;
 	                        	POKEY_DELAYED_XMTDONE_IRQ = 2*POKEY_DELAYED_SEROUT_IRQ - 2;
 				}
 				else {
@@ -840,12 +858,14 @@ void POKEY_Scanline(void)
 
 	if (POKEY_DELAYED_SEROUT_IRQ > 0) {
 		if (--POKEY_DELAYED_SEROUT_IRQ == 0) {
+			POKEY_NETSIO_TRACE("SEROUT delay elapsed clock=%u irqen=%02X irqst(before)=%02X", ANTIC_CPU_CLOCK, POKEY_IRQEN, POKEY_IRQST);
 			POKEY_TriggerSeroutDone(0);
 		}
 	}
 
 	if (POKEY_DELAYED_XMTDONE_IRQ > 0)
 		if (--POKEY_DELAYED_XMTDONE_IRQ == 0) {
+			POKEY_NETSIO_TRACE("XMTDONE elapsed clock=%u irqen=%02X irqst(before)=%02X", ANTIC_CPU_CLOCK, POKEY_IRQEN, POKEY_IRQST);
 			POKEY_IRQST &= 0xf7;
 			if (POKEY_IRQEN & 0x08) {
 #ifdef DEBUG2
@@ -857,6 +877,7 @@ void POKEY_Scanline(void)
 			else
 				printf("SERIO: XMTDONE Interrupt missed\n");
 #endif
+			POKEY_NETSIO_TRACE("XMTDONE elapsed clock=%u irqst(after)=%02X", ANTIC_CPU_CLOCK, POKEY_IRQST);
 		}
 
 	if ((POKEY_DivNIRQ[POKEY_CHAN1] -= ANTIC_LINE_C) < 0 ) {

@@ -185,6 +185,63 @@ static int TransferStatus = SIO_NoFrame;
 static int ExpectedBytes = 0;
 #ifdef NETSIO
 int NetSIO_GetByte(void);
+
+static void NetSIO_ConsumeFinalStatusByte(UBYTE b)
+{
+	int cwndbg = (CommandFrame[0] == 0x43 && CommandFrame[1] == 0x57);
+
+#ifdef DEBUG
+	if (cwndbg)
+		Log_print("NetSIO CWN final-status byte[%d]=0x%02X", DataIndex + 1, b);
+#endif
+	if (++DataIndex == 1) {
+		if (b == 'A') {
+			/* ACK received, wait for COMPLETE/ERROR byte. */
+		}
+		else if (b == 'C' || b == 'E' || b == 'N') {
+			/* Some devices return final status directly without a leading ACK. */
+			TransferStatus = SIO_NoFrame;
+		}
+		else {
+#ifdef DEBUG
+			if (b == 'N')
+				Log_print("NetSIO_GetByte: NAK received");
+			else
+				Log_print("NetSIO_GetByte: unexpected byte %02x", b);
+#endif
+			TransferStatus = SIO_NoFrame;
+		}
+	}
+	else
+		TransferStatus = SIO_NoFrame;
+}
+
+/* When a new command begins, ensure prior write final-status is fully settled. */
+static void NetSIO_SettleFinalStatusBeforeCommand(void)
+{
+	UBYTE b = 0;
+	double waited_s = 0.0;
+	const double wait_step_s = 0.001;
+	const double wait_limit_s = 5.0;
+
+	if (!netsio_enabled || TransferStatus != SIO_FinalStatus)
+		return;
+
+	while (TransferStatus == SIO_FinalStatus && waited_s < wait_limit_s) {
+		if (netsio_available() > 0) {
+			if (netsio_recv_byte(&b) < 0)
+				break;
+			NetSIO_ConsumeFinalStatusByte(b);
+			continue;
+		}
+		Util_sleep(wait_step_s);
+		waited_s += wait_step_s;
+	}
+#ifdef DEBUG
+	if (TransferStatus == SIO_FinalStatus)
+		Log_print("NetSIO: final status settle timeout (%0.3fs)", waited_s);
+#endif
+}
 #endif
 
 int ignore_header_writeprotect = FALSE;
@@ -1531,8 +1588,10 @@ void SIO_SwitchCommandFrame(int onoff)
 	if (onoff)
 	{				/* Enabled */
 #ifdef NETSIO
-		if (netsio_enabled)
+		if (netsio_enabled) {
+			NetSIO_SettleFinalStatusBeforeCommand();
 			netsio_cmd_on();
+		}
 #endif /* NETSIO */
 		if (TransferStatus != SIO_NoFrame) 
 #ifdef NETSIO
@@ -1619,6 +1678,11 @@ void NetSIO_PutByte(int byte)
 			CommandFrame[CommandIndex++] = byte; /* Collect CF bytes into buffer */
 			if (CommandIndex == ExpectedBytes)
 			{
+#ifdef DEBUG
+				if (CommandFrame[0] == 0x43 && CommandFrame[1] == 0x57)
+					Log_print("NetSIO CWN command frame aux=%02X %02X cksum=%02X",
+					          CommandFrame[2], CommandFrame[3], CommandFrame[4]);
+#endif
 				netsio_send_block(CommandFrame, ExpectedBytes); /* Send CF buffer */
 			}
 		}
@@ -1741,6 +1805,7 @@ void SIO_PutByte(int byte)
 int NetSIO_GetByte(void)
 {
 	UBYTE b;
+	int have_byte = 0;
 	netsio_apply_control_lines();
 
 	if(netsio_available() > 0)
@@ -1752,12 +1817,20 @@ int NetSIO_GetByte(void)
 #endif
 			b = 0xFF;
 		}
+		else
+			have_byte = 1;
 	}
 	else
 		b = 0xFF;
 
 	switch (TransferStatus) {
 	case SIO_StatusRead:
+		if (!have_byte)
+			break;
+#ifdef DEBUG
+		if (CommandFrame[0] == 0x43 && CommandFrame[1] == 0x57)
+			Log_print("NetSIO CWN status-read byte=0x%02X write_size=%d", b, netsio_next_write_size);
+#endif
 		if (b == 'A')
 		{ /* ACK received */
 			if (netsio_next_write_size > 0)
@@ -1789,31 +1862,9 @@ int NetSIO_GetByte(void)
 	case SIO_ReadFrame:
 		break;
 	case SIO_FinalStatus: /* After SIO_WriteFrame */
-		if (++DataIndex == 1)
-		{
-			if (b == 'A') /* ACK received */
-			{
-				/* Wait for C/E */
-			}
-			else if (b == 'N') /* NAK received */
-			{
-#ifdef DEBUG
-				Log_print("NetSIO_GetByte: NAK received");
-#endif
-				TransferStatus = SIO_NoFrame;
-			}
-			else
-			{
-#ifdef DEBUG
-				Log_print("NetSIO_GetByte: unexpected byte %02x", b);
-#endif
-				TransferStatus = SIO_NoFrame;
-			}
-		}
-		else
-		{
-			TransferStatus = SIO_NoFrame;
-		}
+		if (!have_byte)
+			break;
+		NetSIO_ConsumeFinalStatusByte(b);
 		break;
 	default:
 		/* Receiving other bytes (maybe modem) */

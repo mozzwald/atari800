@@ -1082,6 +1082,7 @@ static void *fujinet_rx_thread(void *arg) {
             {
                 /* packet: [cmd][data] */
                 uint8_t data;
+                int sync_waiting;
                 if (n < 2)
                 {
 #ifdef DEBUG
@@ -1090,8 +1091,13 @@ static void *fujinet_rx_thread(void *arg) {
                     break;
                 }
                 data = buf[1];
+                sync_waiting = __sync_fetch_and_add(&netsio_sync_wait, 0);
 #ifdef DEBUG
                 Log_print("netsio: recv: data byte: 0x%02X", data);
+                if (sync_waiting && (data == 'A' || data == 'C' || data == 'E' || data == 'N')) {
+                    Log_print("netsio: recv: data byte 0x%02X while waiting for sync %u (treated as serial status)",
+                              data, netsio_sync_num);
+                }
 #endif
                 (void) enqueue_to_emulator(&data, 1);
                 break;
