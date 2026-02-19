@@ -82,7 +82,9 @@
 #include "platform.h"
 #include "pokey.h"
 #include "rtime.h"
+#ifdef AI_INTERFACE
 #include "ai_interface.h"
+#endif
 #include "pbi.h"
 #include "sio.h"
 #include "sysrom.h"
@@ -861,7 +863,9 @@ int Atari800_Initialise(int *argc, char *argv[])
 		|| !GTIA_Initialise(argc, argv)
 		|| !PIA_Initialise(argc, argv)
 		|| !POKEY_Initialise(argc, argv)
+#ifdef AI_INTERFACE
 		|| !AI_Initialise(argc, argv)
+#endif
 	) {
 		Atari800_ErrExit();
 		return FALSE;
@@ -1071,7 +1075,9 @@ int Atari800_Exit(int run_monitor)
 #ifndef BASIC
 		INPUT_Exit();	/* finish event recording */
 #endif
+#ifdef AI_INTERFACE
 		AI_Exit();  /* Clean up AI interface */
+#endif
 		PBI_Exit();
 		CASSETTE_Exit(); /* Finish writing to the cassette file */
 		CARTRIDGE_Exit();
@@ -1325,7 +1331,9 @@ void Atari800_Frame(void)
 	static int refresh_counter = 0;
 
 	/* Process AI interface commands */
+#ifdef AI_INTERFACE
 	AI_Frame();
+#endif
 
 #ifdef CTRL_C_HANDLER
 	if (sigint_flag) {
@@ -1384,7 +1392,9 @@ void Atari800_Frame(void)
 	Devices_Frame();
 #ifndef BASIC
 	INPUT_Frame();
+#ifdef AI_INTERFACE
 	AI_ApplyInput();  /* Apply AI joystick/trigger overrides */
+#endif
 #endif
 	GTIA_Frame();
 

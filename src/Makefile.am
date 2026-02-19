@@ -60,7 +60,6 @@ atari800_SOURCES = \
 	akey.h \
 	afile.c afile.h \
 	antic.c antic.h \
-	ai_interface.c ai_interface.h \
 	atari.c atari.h \
 	binload.c binload.h \
 	cartridge.c cartridge.h \
@@ -87,6 +86,10 @@ atari800_SOURCES = \
 	sysrom.c sysrom.h \
 	util.c util.h
 atari800_LDADD =
+
+if WANT_AI_INTERFACE
+atari800_SOURCES += ai_interface.c ai_interface.h
+endif
 
 if A8_USE_SDL2
 atari800_SOURCES += sdl/init.c sdl/init.h

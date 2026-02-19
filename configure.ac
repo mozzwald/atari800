@@ -977,6 +977,12 @@ A8_OPTION(pbi_bb,yes,
      )
 AM_CONDITIONAL([WANT_PBI_BB], test "$WANT_PBI_BB" = "yes")
 
+A8_OPTION(ai-interface,no,
+      [Enable AI socket interface (default=OFF)],
+      AI_INTERFACE,[Define to enable AI socket interface support.]
+     )
+AM_CONDITIONAL([WANT_AI_INTERFACE], test "$WANT_AI_INTERFACE" = "yes")
+
 if [[ "$SUPPORTS_NETSIO" = "yes" ]]; then
 dnl NetSIO / FujiNet support (only on Linux or MacOS)
 A8_OPTION(netsio,yes,
@@ -1499,6 +1505,7 @@ echo "Using MIO emulation?..................: $WANT_PBI_MIO"
 echo "Using Black Box emulation?............: $WANT_PBI_BB"
 echo "Using IDE emulation?..................: $WANT_IDE"
 echo "Using Pokey registers recording?......: $WANT_POKEYREC"
+echo "Using AI interface?...................: $WANT_AI_INTERFACE"
 if [[ "$SUPPORTS_NETSIO" = "yes" ]]; then
     echo "Using NetSIO/FujiNet emulation?.......: $WANT_NETSIO"
 fi
