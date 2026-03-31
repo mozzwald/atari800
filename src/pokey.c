@@ -174,6 +174,19 @@ static int POKEY_siocheck(void)
 		&& (POKEY_AUDCTL[0] & 0x28) == 0x28;
 }
 
+#ifdef NETSIO
+static int POKEY_serial_byte_delay(void)
+{
+	int divisor = POKEY_AUDF[POKEY_CHAN3];
+
+	if (divisor <= 0)
+		divisor = 1;
+
+	/* Match the existing SIO byte timing formula instead of forcing 19200 baud. */
+	return ((SIO_SERIN_INTERVAL * divisor - 1) / 0x28 + 1);
+}
+#endif /* NETSIO */
+
 #ifndef SOUND_GAIN /* sound gain can be pre-defined in the configure/Makefile */
 #define SOUND_GAIN 4
 #endif
@@ -290,10 +303,17 @@ void POKEY_PutByte(UWORD addr, UBYTE byte)
 
 		/* check if cassette 2-tone mode has been enabled */
 		if ((POKEY_SKCTL & 0x08) == 0x00) {
+#ifdef NETSIO
+			/* Use the active serial divisor for modem/netstream timing. */
+			POKEY_DELAYED_SEROUT_IRQ = POKEY_serial_byte_delay();
+			POKEY_IRQST |= 0x08;
+			POKEY_DELAYED_XMTDONE_IRQ = POKEY_DELAYED_SEROUT_IRQ * 2 - 1;
+#else
 			/* intelligent device */
 			POKEY_DELAYED_SEROUT_IRQ = SIO_SEROUT_INTERVAL;
 			POKEY_IRQST |= 0x08;
 			POKEY_DELAYED_XMTDONE_IRQ = SIO_XMTDONE_INTERVAL;
+#endif /* NETSIO */
 		}
 		else {
 			/* cassette */
@@ -511,43 +531,45 @@ void POKEY_Scanline(void)
 
 	if (POKEY_DELAYED_SERIN_IRQ > 0) {
 		if (--POKEY_DELAYED_SERIN_IRQ == 0) {
-			/* Load a byte to SERIN - even when the IRQ is disabled. */
-			POKEY_SERIN = SIO_GetByte();
-			if (POKEY_IRQEN & 0x20) {
-				if (POKEY_IRQST & 0x20) {
-					POKEY_IRQST &= 0xdf;
-#ifdef DEBUG2
-					printf("SERIO: SERIN Interrupt triggered, bytevalue %02x\n", POKEY_SERIN);
+#ifdef NETSIO
+			/* Preserve FIFO ordering: don't overwrite SERIN while the previous byte is still pending. */
+			if (netsio_enabled && !(POKEY_IRQST & 0x20) && netsio_available() > 0) {
+				POKEY_DELAYED_SERIN_IRQ = 1;
+			}
+			else
 #endif
+			{
+				/* Load a byte to SERIN - even when the IRQ is disabled. */
+				POKEY_SERIN = SIO_GetByte();
+				if (POKEY_IRQEN & 0x20) {
+					if (POKEY_IRQST & 0x20) {
+						POKEY_IRQST &= 0xdf;
+#ifdef DEBUG2
+						printf("SERIO: SERIN Interrupt triggered, bytevalue %02x\n", POKEY_SERIN);
+#endif
+					}
+					else {
+						POKEY_SKSTAT &= 0xdf;
+#ifdef DEBUG2
+						printf("SERIO: SERIN Interrupt triggered, bytevalue %02x\n", POKEY_SERIN);
+#endif
+					}
+					CPU_GenerateIRQ();
 				}
+#ifdef DEBUG2
 				else {
-					POKEY_SKSTAT &= 0xdf;
-#ifdef DEBUG2
-					printf("SERIO: SERIN Interrupt triggered, bytevalue %02x\n", POKEY_SERIN);
-#endif
+					printf("SERIO: SERIN Interrupt missed, bytevalue %02x\n", POKEY_SERIN);
 				}
-				CPU_GenerateIRQ();
-			}
-#ifdef DEBUG2
-			else {
-				printf("SERIO: SERIN Interrupt missed, bytevalue %02x\n", POKEY_SERIN);
-			}
 #endif
+			}
 		}
 	}
 #ifdef NETSIO
 	/* Check NetSIO for pending Rx bytes */
-	if (netsio_enabled && POKEY_DELAYED_SERIN_IRQ == 0) {
+	if (netsio_enabled && POKEY_DELAYED_SERIN_IRQ == 0 && (POKEY_IRQST & 0x20)) {
 		int avail = netsio_available();
 		if (avail > 0) {
-			/* TODO make various SIO speeds working
-			 * currently the POKEY_DELAYED_SERIN_IRQ is set to the same values ignoring the actual speed
-			 * and forcing baud rate to 19200
-			 */
-			if (avail == 1)
-				POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL * 2 + 4;
-			else
-			 	POKEY_DELAYED_SERIN_IRQ = SIO_SERIN_INTERVAL + 2;
+			POKEY_DELAYED_SERIN_IRQ = POKEY_serial_byte_delay();
 		}
 	}
 #endif /* NETSIO */
