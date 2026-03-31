@@ -63,6 +63,8 @@ static socklen_t fujinet_addr_len = sizeof(fujinet_addr);
 
 /* Thread declaration */
 static void *fujinet_rx_thread(void *arg);
+static pthread_mutex_t netsio_sync_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t netsio_sync_cond = PTHREAD_COND_INITIALIZER;
 
 static void netsio_netstream_recalc(void)
 {
@@ -81,17 +83,6 @@ static void netsio_netstream_recalc(void)
             netsio_netstream_motor_on,
             netsio_netstream_pokey_ok);
 #endif
-    }
-}
-
-static void millisleep(unsigned int ms)
-{
-    struct timespec req, rem;
-    req.tv_sec  = ms / 1000;
-    req.tv_nsec = (long)(ms % 1000) * 1000000L;
-
-    while (nanosleep(&req, &rem) == -1 && errno == EINTR) {
-        req = rem;
     }
 }
 
@@ -346,20 +337,26 @@ int netsio_init(uint16_t port) {
 /* Called when a command frame with sync response is sent to FujiNet */
 void netsio_wait_for_sync(void)
 {
-    int ticker = 0;
-    while (netsio_sync_wait)
-    {
+    struct timespec deadline;
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 40 * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+        deadline.tv_nsec %= 1000000000L;
+    }
+
+    pthread_mutex_lock(&netsio_sync_mutex);
+    while (netsio_sync_wait) {
 #ifdef DEBUG
-        Log_print("netsio: waiting for sync response - %d", ticker);
+        Log_print("netsio: waiting for sync response");
 #endif
-        millisleep(5);
-        if (ticker > 7)
-        {
+        if (pthread_cond_timedwait(&netsio_sync_cond, &netsio_sync_mutex, &deadline) == ETIMEDOUT) {
             netsio_sync_wait = 0;
             break;
         }
-        ticker++;
     }
+    pthread_mutex_unlock(&netsio_sync_mutex);
 }
 
 /* Return number of bytes waiting from FujiNet to emulator */
@@ -407,6 +404,9 @@ int netsio_cmd_off(void)
 int netsio_cmd_off_sync(void)
 {
     uint8_t p[2];
+    pthread_mutex_lock(&netsio_sync_mutex);
+    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout */
+    pthread_mutex_unlock(&netsio_sync_mutex);
     p[0] = NETSIO_COMMAND_OFF_SYNC;
     netsio_sync_num++;
     p[1] = netsio_sync_num;
@@ -414,7 +414,6 @@ int netsio_cmd_off_sync(void)
     Log_print("netsio: CMD OFF SYNC");
 #endif
     send_to_fujinet(p, sizeof(p));
-    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout */
     return 0;
 }
 
@@ -542,6 +541,9 @@ int netsio_send_block(const uint8_t *block, ssize_t len) {
 int netsio_send_byte_sync(uint8_t b)
 {
     uint8_t p[3];
+    pthread_mutex_lock(&netsio_sync_mutex);
+    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout s*/
+    pthread_mutex_unlock(&netsio_sync_mutex);
     p[0] = NETSIO_DATA_BYTE_SYNC;
     p[1] = b;
     netsio_sync_num++;
@@ -550,7 +552,6 @@ int netsio_send_byte_sync(uint8_t b)
     Log_print("netsio: send byte: 0x%02X sync: %d", b, netsio_sync_num);
 #endif
     send_to_fujinet(p, sizeof(p));
-    netsio_sync_wait = 1; /* pause emulation until we hear back or timeout s*/
     return 0;
 }
 
@@ -797,7 +798,10 @@ static void *fujinet_rx_thread(void *arg) {
 #endif
                     }
                 }
+                pthread_mutex_lock(&netsio_sync_mutex);
                 netsio_sync_wait = 0; /* continue emulation */
+                pthread_cond_broadcast(&netsio_sync_cond);
+                pthread_mutex_unlock(&netsio_sync_mutex);
                 break;
             }
 
@@ -916,7 +920,10 @@ void netsio_shutdown(void) {
     netsio_initialized = 0;  /* Allow re-initialization after shutdown */
     netsio_sync_num = 0;
     fujinet_known = 0;
+    pthread_mutex_lock(&netsio_sync_mutex);
     netsio_sync_wait = 0;
+    pthread_cond_broadcast(&netsio_sync_cond);
+    pthread_mutex_unlock(&netsio_sync_mutex);
     netsio_cmd_state = 0;
     netsio_next_write_size = 0;
     netsio_netstream_pending_enable = 0;
