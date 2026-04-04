@@ -31,6 +31,7 @@
 #include "cpu.h"
 #include "gtia.h"
 #include "input.h"
+#include "memory.h"
 #ifndef BASIC
 #include "statesav.h"
 #endif
@@ -82,6 +83,8 @@ UBYTE GTIA_GRACTL;
 
 int GTIA_speaker;
 int GTIA_consol_override = 0;
+static int basic_disable_boot_hold_armed = FALSE;
+static int basic_disable_boot_hold_reads_remaining = 0;
 static UBYTE consol;
 UBYTE consol_mask;
 UBYTE GTIA_TRIG[4];
@@ -137,6 +140,44 @@ int hitclr_pos;
 #define M2PL_T GTIA_M2PL
 #define M3PL_T GTIA_M3PL
 #endif /* NEW_CYCLE_EXACT */
+
+static int basic_disable_boot_hold_enabled(void)
+{
+	return Atari800_machine_type == Atari800_MACHINE_XLXE
+	    && Atari800_builtin_basic
+	    && Atari800_disable_basic
+	    && !BINLOAD_loading_basic;
+}
+
+static int basic_disable_boot_hold_read_qualifies(void)
+{
+	return basic_disable_boot_hold_armed
+	    && basic_disable_boot_hold_reads_remaining > 0;
+}
+
+void GTIA_ArmBasicDisableBootHold(void)
+{
+	if (!basic_disable_boot_hold_enabled()) {
+		GTIA_ClearBasicDisableBootHold();
+		return;
+	}
+	if (basic_disable_boot_hold_armed && basic_disable_boot_hold_reads_remaining > 0)
+		return;
+	basic_disable_boot_hold_armed = TRUE;
+	basic_disable_boot_hold_reads_remaining = 2;
+}
+
+void GTIA_ClearBasicDisableBootHold(void)
+{
+	basic_disable_boot_hold_armed = FALSE;
+	basic_disable_boot_hold_reads_remaining = 0;
+}
+
+void GTIA_CheckForBasicDisableColdstart(UWORD pc)
+{
+	if (pc == 0xe477)
+		GTIA_ArmBasicDisableBootHold();
+}
 
 static UBYTE *hposp_ptr[4];
 static UBYTE *hposm_ptr[4];
@@ -560,6 +601,11 @@ UBYTE GTIA_GetByte(UWORD addr, int no_side_effects)
 	case GTIA_OFFSET_CONSOL:
 		{
 			UBYTE byte = consol & consol_mask;
+			if (!no_side_effects && basic_disable_boot_hold_read_qualifies()) {
+				byte &= ~INPUT_CONSOL_OPTION;
+				if (--basic_disable_boot_hold_reads_remaining == 0)
+					GTIA_ClearBasicDisableBootHold();
+			}
 			if (!no_side_effects && GTIA_consol_override > 0) {
 				/* Check if we're called from outside OS. This avoids sending
 				   console keystrokes to diagnostic cartridges. */
@@ -567,10 +613,7 @@ UBYTE GTIA_GetByte(UWORD addr, int no_side_effects)
 					/* Not from OS. Disable console override. */
 					GTIA_consol_override = 0;
 				else {
-				--GTIA_consol_override;
-					if (Atari800_builtin_basic && Atari800_disable_basic && !BINLOAD_loading_basic)
-						/* Only for XL/XE - hold Option during reboot. */
-						byte &= ~INPUT_CONSOL_OPTION;
+					--GTIA_consol_override;
 					if (CASSETTE_hold_start && Atari800_machine_type != Atari800_MACHINE_5200) {
 						/* Only for the computers - hold Start during reboot. */
 						byte &= ~INPUT_CONSOL_START;
@@ -1305,6 +1348,7 @@ void GTIA_StateRead(UBYTE version)
 	StateSav_ReadINT(&next_console_value, 1);
 	if (version >= 7)
 		StateSav_ReadUBYTE(GTIA_TRIG_latch, 4);
+	GTIA_ClearBasicDisableBootHold();
 
 	GTIA_PutByte(GTIA_OFFSET_HPOSP0, GTIA_HPOSP0);
 	GTIA_PutByte(GTIA_OFFSET_HPOSP1, GTIA_HPOSP1);

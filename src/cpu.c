@@ -66,6 +66,7 @@
 #include "antic.h"
 #include "atari.h"
 #include "esc.h"
+#include "gtia.h"
 #include "memory.h"
 #include "monitor.h"
 #ifndef BASIC
@@ -135,7 +136,7 @@ UBYTE CPU_delayed_nmi;
 /* 6502 code fetching */
 #ifdef PC_PTR
 #define GET_PC()            (PC - MEMORY_mem)
-#define SET_PC(newpc)       (PC = MEMORY_mem + (newpc))
+#define SET_PC(newpc)       do { UWORD newpc__ = (newpc); GTIA_CheckForBasicDisableColdstart(newpc__); PC = MEMORY_mem + newpc__; } while (0)
 #define PHPC                { UWORD tmp = PC - MEMORY_mem; PHW(tmp); }
 #define GET_CODE_BYTE()     (*PC++)
 #define PEEK_CODE_BYTE()    (*PC)
@@ -146,7 +147,7 @@ UBYTE CPU_delayed_nmi;
 #endif
 #else /* PC_PTR */
 #define GET_PC()            PC
-#define SET_PC(newpc)       (PC = (newpc))
+#define SET_PC(newpc)       do { UWORD newpc__ = (newpc); GTIA_CheckForBasicDisableColdstart(newpc__); PC = newpc__; } while (0)
 #define PHPC                PHW(PC)
 #define GET_CODE_BYTE()     MEMORY_dGetByte(PC++)
 #define PEEK_CODE_BYTE()    MEMORY_dGetByte(PC)
@@ -355,7 +356,7 @@ void CPU_PutStatus(void)
 #define UPDATE_GLOBAL_REGS
 #define UPDATE_LOCAL_REGS
 
-#define SET_PC(newpc)	(CPU_regPC = (newpc))
+#define SET_PC(newpc)	do { UWORD newpc__ = (newpc); GTIA_CheckForBasicDisableColdstart(newpc__); CPU_regPC = newpc__; } while (0)
 #define PHPC			PHW(CPU_regPC)
 
 #define PHPB0			PH(CPU_regP & 0xef)	/* push flags with B flag clear (NMI, IRQ) */

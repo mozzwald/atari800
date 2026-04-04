@@ -124,6 +124,10 @@ extern UBYTE GTIA_TRIG_latch[4];
 extern int GTIA_consol_override;
 extern int GTIA_speaker;
 
+void GTIA_ArmBasicDisableBootHold(void);
+void GTIA_ClearBasicDisableBootHold(void);
+void GTIA_CheckForBasicDisableColdstart(UWORD pc);
+
 int GTIA_Initialise(int *argc, char *argv[]);
 void GTIA_Frame(void);
 void GTIA_NewPmScanline(void);

@@ -269,6 +269,7 @@ void Atari800_Coldstart(void)
 	MEMORY_dPutByte(0x244, 1);
 	/* handle Option key (disable BASIC in XL/XE)
 	   and Start key (boot from cassette) */
+	GTIA_ArmBasicDisableBootHold();
 	GTIA_consol_override = 2;
 #ifdef AF80
 	if (AF80_enabled) {
@@ -971,6 +972,7 @@ int Atari800_Initialise(int *argc, char *argv[])
 		if (StateSav_ReadAtariState(state_file, "rb"))
 			/* Don't press Start nor Option */
 			GTIA_consol_override = 0;
+		GTIA_ClearBasicDisableBootHold();
 	}
 #endif
 
