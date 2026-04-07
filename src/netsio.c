@@ -755,7 +755,8 @@ static void *fujinet_rx_thread(void *arg) {
             case NETSIO_SYNC_RESPONSE:
             {
                 /* packet: [cmd][sync#][ack_type][ack_byte][write_lo][write_hi] */
-                uint8_t resp_sync, ack_type, ack_byte, write_size;
+                uint8_t resp_sync, ack_type, ack_byte;
+                uint16_t write_size;
 
                 if (n < 6)
                 {
