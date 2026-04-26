@@ -259,7 +259,11 @@ if WANT_PBI_MIO_OR_BB
 atari800_SOURCES += pbi_scsi.c pbi_scsi.h
 endif
 if WANT_NETSIO
+if CONFIGURE_HOST_WIN
+atari800_SOURCES += netsiowin.c netsio.h
+else
 atari800_SOURCES += netsio.c netsio.h
+endif
 endif
 if WANT_PBI_XLD
 if WITH_SOUND

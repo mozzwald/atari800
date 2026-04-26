@@ -5,8 +5,16 @@
 extern volatile int netsio_enabled;
 
 #include <stdint.h>
+#ifndef HAVE_WINDOWS_H
 #include <pthread.h>
 #include <sys/types.h>
+#else
+#include <windows.h>
+#include <winsock2.h>
+#ifdef _MSC_VER
+typedef intptr_t ssize_t;
+#endif
+#endif
 
 /* NetSIO Commands */
 #define NETSIO_DATA_BYTE          0x01
@@ -54,9 +62,10 @@ extern volatile int netsio_sync_wait;
 extern int netsio_cmd_state;
 extern volatile int netsio_next_write_size;
 
-/* FIFO pipes: fds0: FujiNet->emulator
-*/
+/* FIFO pipes: fds0: FujiNet->emulator (POSIX only; not used on Windows) */
+#ifndef HAVE_WINDOWS_H
 extern int fds0[2];
+#endif
 
 /* Initialize NetSIO subsystem, connecting to FujiNet-PC at host:port. */
 /* Returns 0 on success, non-zero on error. */
