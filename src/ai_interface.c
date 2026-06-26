@@ -48,7 +48,9 @@ static int ai_server_fd = -1;
 static int ai_client_fd = -1;
 static int ai_paused = 1;  /* Start paused, waiting for AI */
 static int ai_frames_to_run = 0;
+static int ai_frames_requested = 0;
 static int ai_steps_to_run = 0;
+static int ai_steps_requested = 0;
 
 /* Debug output buffer */
 #define AI_DEBUG_BUFFER_SIZE 4096
@@ -1032,7 +1034,7 @@ static void screen_to_ascii(char *out, int outsize) {
 
 /* Process a command */
 static void process_command(const char *cmd) {
-    char cmd_type[32] = "";
+    char cmd_type[64] = "";
     char path[512] = "";
 
     json_get_string(cmd, "cmd", cmd_type, sizeof(cmd_type));
@@ -1053,11 +1055,17 @@ static void process_command(const char *cmd) {
     }
     else if (strcmp(cmd_type, "run") == 0) {
         ai_frames_to_run = json_get_int(cmd, "frames", 1);
+        if (ai_frames_to_run < 1)
+            ai_frames_to_run = 1;
+        ai_frames_requested = ai_frames_to_run;
         ai_paused = 0;
         /* Response sent after frames complete */
     }
     else if (strcmp(cmd_type, "step") == 0) {
         ai_steps_to_run = json_get_int(cmd, "instructions", 1);
+        if (ai_steps_to_run < 1)
+            ai_steps_to_run = 1;
+        ai_steps_requested = ai_steps_to_run;
         ai_paused = 0;
         /* Response sent after steps complete */
     }
@@ -1557,7 +1565,19 @@ void AI_Frame(void) {
         if (ai_frames_to_run == 0) {
             ai_paused = 1;
             snprintf(ai_response, sizeof(ai_response),
-                "{\"status\":\"ok\",\"frames_run\":1}");
+                "{\"status\":\"ok\",\"frames_run\":%d}", ai_frames_requested);
+            ai_frames_requested = 0;
+            AI_SendResponse(ai_response);
+        }
+    }
+    if (ai_steps_to_run > 0) {
+        ai_steps_to_run--;
+        if (ai_steps_to_run == 0) {
+            ai_paused = 1;
+            CPU_GetStatus();
+            snprintf(ai_response, sizeof(ai_response),
+                "{\"status\":\"ok\",\"steps_run\":%d,\"pc\":%d}", ai_steps_requested, CPU_regPC);
+            ai_steps_requested = 0;
             AI_SendResponse(ai_response);
         }
     }
