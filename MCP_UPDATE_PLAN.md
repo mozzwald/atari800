@@ -860,15 +860,15 @@ Purpose: make FujiNet-PC deterministic and inspectable under MCP control.
 
 Progress checklist:
 
-- [ ] Add FujiNet-PC version selection and optional nightly fetch.
-- [ ] Add pinned version support.
-- [ ] Add offline local FujiNet-PC path support.
-- [ ] Start FujiNet-PC as an MCP-owned sidecar.
-- [ ] Allocate non-default UDP ports.
-- [ ] Pass selected port to Atari800 `-netsio <port>`.
-- [ ] Capture FujiNet-PC stdout/stderr in a bounded ring buffer.
-- [ ] Add `fujinet_status`, `fujinet_logs`, and debug read/clear/status tools.
-- [ ] Stop only MCP-owned FujiNet-PC process.
+- [x] Add FujiNet-PC version selection and optional nightly fetch.
+- [x] Add pinned version support.
+- [x] Add offline local FujiNet-PC path support.
+- [x] Start FujiNet-PC as an MCP-owned sidecar.
+- [x] Allocate non-default UDP ports.
+- [x] Pass selected port to Atari800 `-netsio <port>`.
+- [x] Capture FujiNet-PC stdout/stderr in a bounded ring buffer.
+- [x] Add `fujinet_status`, `fujinet_logs`, and debug read/clear/status tools.
+- [x] Stop only MCP-owned FujiNet-PC process.
 
 ## 8.1 Version Selection / Fetching
 
@@ -959,6 +959,16 @@ Output:
 ```
 
 Include debug excerpts in failed boot/remount/run_until responses.
+
+
+Phase 8 implementation notes:
+
+- MCP tools now support local archive/path selection, pinned local version selection, optional GitHub asset fetch, sidecar start/stop/status, and bounded FujiNet stdout/stderr reads.
+- FujiNet-PC is prepared in the managed runtime directory; user-managed installs and archives are not modified.
+- The packaged `run-fujinet` launcher is used when present so FujiNet-PC exit code 75 performs its intended managed reboot.
+- The MCP writes `[BOIP] port=<selected>` in the managed `fnconfig.ini` so FujiNet-PC uses the allocated non-default NetSIO UDP port.
+- If FujiNet-PC is running, `atari_start` automatically passes `-netsio <selected-port>` unless `netsio=false` is explicitly supplied.
+- `tests/mcp_fujinet_phase8_smoke.mjs` exercises the Phase 8 flow with a local FujiNet-PC archive and a real Atari800 process under headless Xvfb, including port propagation, observed NetSIO connection, debug capture, FujiNet reboot handling, and managed cleanup.
 
 ---
 

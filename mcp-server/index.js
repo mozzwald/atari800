@@ -12,7 +12,9 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import net from 'net';
-import { spawn } from 'child_process';
+import dgram from 'dgram';
+import https from 'https';
+import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -25,8 +27,14 @@ const DEFAULT_SOCKET_PATH = '/tmp/atari800_ai.sock';
 const RUNTIME_ROOT = process.env.ATARI800_MCP_RUNTIME_DIR || path.join(os.tmpdir(), 'atari800-mcp');
 const EMULATOR_PATH = process.env.ATARI800_PATH || path.join(__dirname, '..', 'src', 'atari800');
 const LOG_LIMIT = 200;
+const FUJINET_LOG_LIMIT = 1000;
+const FUJINET_PORT_START = Number(process.env.FUJINET_PORT_START || 19997);
+const FUJINET_PORT_END = Number(process.env.FUJINET_PORT_END || 20097);
+const FUJINET_CACHE_DIR = process.env.FUJINET_CACHE_DIR || path.join(RUNTIME_ROOT, 'cache', 'fujinet-pc');
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 let session = null;
+let fujinetSelection = { local_path: null, version: null, source: null };
 
 function nowIso() {
   return new Date().toISOString();
@@ -81,6 +89,7 @@ function createSession(program, artifactDirOverride = null) {
       sound: null,
       netsio: null,
       netsio_port: null,
+      netsio_connected: false,
     },
     display: null,
     xvfb: null,
@@ -103,6 +112,9 @@ function recordLog(stream, chunk) {
       stream,
       text: line,
     });
+    if (stream === 'stdout' && line.includes('netsio connected after')) {
+      session.emulator.netsio_connected = true;
+    }
   }
 }
 
@@ -117,7 +129,12 @@ function sessionSnapshot(includeLogs = true) {
     artifact_dir: session.artifact_dir,
     emulator: session.emulator,
     xvfb: session.xvfb,
-    fujinet: session.fujinet,
+    fujinet: session.fujinet ? {
+      ...session.fujinet,
+      logs: undefined,
+      last_log_seq: session.fujinet.log_seq || 0,
+      log_count: session.fujinet.logs?.length || 0,
+    } : null,
     owned_paths: session.owned_paths,
     logs: includeLogs ? {
       lines: session.logs,
@@ -125,6 +142,14 @@ function sessionSnapshot(includeLogs = true) {
       limit: LOG_LIMIT,
     } : undefined,
   };
+}
+
+function emulatorProcessRunning() {
+  return Boolean(session?.process && session.process.exitCode === null && session.process.signalCode === null);
+}
+
+function fujinetProcessRunning() {
+  return Boolean(session?.fujinet_process && session.fujinet_process.exitCode === null && session.fujinet_process.signalCode === null);
 }
 
 function formatJson(value) {
@@ -195,6 +220,504 @@ async function runCapture(command, args = [], timeoutMs = 2000) {
   });
 }
 
+function recordFujiNetLog(stream, chunk) {
+  if (!session?.fujinet) return;
+  if (!session.fujinet.logs) session.fujinet.logs = [];
+  if (!session.fujinet.dropped_logs) session.fujinet.dropped_logs = 0;
+  const text = chunk.toString();
+  for (const line of text.split(/\r?\n/)) {
+    if (line.length === 0) continue;
+    if (session.fujinet.logs.length >= FUJINET_LOG_LIMIT) {
+      session.fujinet.logs.shift();
+      session.fujinet.dropped_logs += 1;
+    }
+    session.fujinet.log_seq = (session.fujinet.log_seq || 0) + 1;
+    const entry = {
+      seq: session.fujinet.log_seq,
+      timestamp: nowIso(),
+      stream,
+      text: line,
+    };
+    session.fujinet.logs.push(entry);
+    recordLog(`fujinet.${stream}`, Buffer.from(line));
+  }
+}
+
+function findLocalFujiNetArchives() {
+  const entries = [];
+  for (const dir of [PROJECT_ROOT, FUJINET_CACHE_DIR]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (/^fujinet-pc-ATARI_.*\.(tar\.gz|tgz)$/i.test(name)) {
+        entries.push(path.join(dir, name));
+      }
+    }
+  }
+  return entries.sort();
+}
+
+function describeFujiNetPath(file) {
+  const name = path.basename(file);
+  const match = /^fujinet-pc-ATARI_(.+?)_(.+)\.(?:tar\.gz|tgz)$/i.exec(name);
+  return {
+    path: file,
+    name,
+    version: match?.[1] || null,
+    platform: match?.[2] || null,
+    selected: fujinetSelection.local_path === file,
+  };
+}
+
+function detectFujiNetAssetPattern() {
+  if (process.platform === 'linux') {
+    if (process.arch !== 'x64' || !fs.existsSync('/etc/os-release')) return null;
+    const release = fs.readFileSync('/etc/os-release', 'utf8');
+    const distro = /^ID=(?:"([^"]+)"|([^\n]+))$/m.exec(release);
+    const version = /^VERSION_ID=(?:"([^"]+)"|([^\n]+))$/m.exec(release);
+    const distroId = (distro?.[1] || distro?.[2] || '').trim();
+    const versionId = (version?.[1] || version?.[2] || '').trim();
+    if (distroId !== 'ubuntu' || !['22.04', '24.04'].includes(versionId)) return null;
+    return `ubuntu-${versionId}-amd64`;
+  }
+  if (process.platform === 'darwin') {
+    if (!['arm64', 'x64'].includes(process.arch)) return null;
+    const macosByDarwin = { 23: '14', 24: '15' };
+    const macos = macosByDarwin[Number(os.release().split('.')[0])];
+    if (!macos) return null;
+    return `macos-${macos}-${process.arch === 'arm64' ? 'arm64' : 'x64'}`;
+  }
+  return null;
+}
+
+function currentFujiNetSelection() {
+  const localArchives = findLocalFujiNetArchives().map(describeFujiNetPath);
+  return {
+    selected: fujinetSelection,
+    detected_asset_pattern: detectFujiNetAssetPattern(),
+    local_archives: localArchives,
+    cache_dir: FUJINET_CACHE_DIR,
+    port_range: { start: FUJINET_PORT_START, end: FUJINET_PORT_END },
+  };
+}
+
+function selectedOrDiscoveredFujiNetPath(explicitPath = null) {
+  if (explicitPath) return path.resolve(explicitPath);
+  if (fujinetSelection.local_path) return fujinetSelection.local_path;
+  const archives = findLocalFujiNetArchives();
+  const pattern = detectFujiNetAssetPattern();
+  if (pattern) {
+    const matched = archives.find((archive) => archive.includes(pattern));
+    if (matched) return matched;
+  }
+  if (archives.length > 0) {
+    throw makeError('BAD_ARGUMENT', 'FujiNet-PC host asset could not be selected automatically; select one explicitly', {
+      detected_asset_pattern: pattern,
+      archives: archives.map(describeFujiNetPath),
+      hint: 'Use fujinet_set_local_path or pass asset_pattern to fujinet_fetch_latest.',
+    });
+  }
+  throw makeError('CAPABILITY_UNAVAILABLE', 'FujiNet-PC is not selected and no local archive was found', {
+    hint: 'Use fujinet_set_local_path with an unpacked FujiNet-PC directory or tar.gz archive.',
+  });
+}
+
+function findFujiNetExecutable(root) {
+  const candidates = [
+    path.join(root, 'fujinet'),
+    path.join(root, 'fujinet-pc-ATARI', 'fujinet'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const nested = path.join(root, entry.name, 'fujinet');
+    if (fs.existsSync(nested)) return nested;
+  }
+  return null;
+}
+
+function copyOrExtractFujiNet(sourcePath, targetRoot) {
+  ensureDir(targetRoot);
+  const stat = fs.statSync(sourcePath);
+  if (stat.isDirectory()) {
+    const target = path.join(targetRoot, 'fujinet-pc-ATARI');
+    fs.cpSync(sourcePath, target, { recursive: true, force: true, dereference: true });
+    return target;
+  }
+  if (!/\.(tar\.gz|tgz)$/i.test(sourcePath)) {
+    throw makeError('BAD_ARGUMENT', 'FujiNet local path must be an unpacked directory or .tar.gz archive', { path: sourcePath });
+  }
+  const result = spawnSync('tar', ['-xzf', sourcePath, '-C', targetRoot], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw makeError('IO_ERROR', 'failed to extract FujiNet-PC archive', { stderr: result.stderr, sourcePath });
+  }
+  const executable = findFujiNetExecutable(targetRoot);
+  if (!executable) {
+    throw makeError('BAD_ARGUMENT', 'FujiNet-PC archive did not contain a fujinet executable', { sourcePath });
+  }
+  return path.dirname(executable);
+}
+
+function prepareFujiNetInstall(sourcePath) {
+  if (!session) {
+    cleanupStaleRuntimeDirs();
+    session = createSession(null);
+    session.state = 'not_started';
+  }
+  const resolvedSource = selectedOrDiscoveredFujiNetPath(sourcePath);
+  const installRoot = path.join(session.runtime_dir, 'fujinet-install');
+  fs.rmSync(installRoot, { recursive: true, force: true });
+  const workDir = copyOrExtractFujiNet(resolvedSource, installRoot);
+  const executable = findFujiNetExecutable(workDir) || path.join(workDir, 'fujinet');
+  if (!fs.existsSync(executable)) {
+    throw makeError('BAD_ARGUMENT', 'FujiNet-PC executable not found after preparation', { workDir });
+  }
+  fs.chmodSync(executable, 0o755);
+  const packagedLauncher = path.join(workDir, 'run-fujinet');
+  const launcher = fs.existsSync(packagedLauncher) ? packagedLauncher : executable;
+  fs.chmodSync(launcher, 0o755);
+  const sdPath = path.join(workDir, 'SD');
+  ensureDir(sdPath);
+  const configPath = path.join(workDir, 'fnconfig.ini');
+  if (!fs.existsSync(configPath)) {
+    const dataConfig = path.join(workDir, 'data', 'fnconfig.ini');
+    if (fs.existsSync(dataConfig)) fs.copyFileSync(dataConfig, configPath);
+    else fs.writeFileSync(configPath, '[BOIP]\nenabled=1\nhost=localhost\nport=\n');
+  }
+  return { sourcePath: resolvedSource, workDir, executable, launcher, sdPath, configPath };
+}
+
+function setIniSectionValue(text, section, key, value) {
+  const lines = text.split(/\r?\n/);
+  let sectionStart = -1;
+  let sectionEnd = lines.length;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].trim().toLowerCase() === `[${section.toLowerCase()}]`) {
+      sectionStart = i;
+      for (let j = i + 1; j < lines.length; j += 1) {
+        if (/^\s*\[.*\]\s*$/.test(lines[j])) {
+          sectionEnd = j;
+          break;
+        }
+      }
+      break;
+    }
+  }
+  if (sectionStart < 0) {
+    lines.push('', `[${section}]`, `${key}=${value}`);
+    return lines.join('\n');
+  }
+  const keyRe = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=`, 'i');
+  for (let i = sectionStart + 1; i < sectionEnd; i += 1) {
+    if (keyRe.test(lines[i])) {
+      lines[i] = `${key}=${value}`;
+      return lines.join('\n');
+    }
+  }
+  lines.splice(sectionEnd, 0, `${key}=${value}`);
+  return lines.join('\n');
+}
+
+function writeFujiNetConfig(configPath, port) {
+  let text = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
+  text = setIniSectionValue(text, 'BOIP', 'enabled', '1');
+  text = setIniSectionValue(text, 'BOIP', 'host', 'localhost');
+  text = setIniSectionValue(text, 'BOIP', 'port', String(port));
+  const tmp = `${configPath}.tmp`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, configPath);
+}
+
+async function udpPortAvailable(port) {
+  return new Promise((resolve) => {
+    const socket = dgram.createSocket('udp4');
+    socket.once('error', () => {
+      socket.close();
+      resolve(false);
+    });
+    socket.once('listening', () => {
+      socket.close();
+      resolve(true);
+    });
+    socket.bind(port, '127.0.0.1');
+  });
+}
+
+async function allocateFujiNetPort(preferred = null) {
+  if (preferred !== null && preferred !== undefined) {
+    const port = Number(preferred);
+    if (port === 9997) throw makeError('BAD_ARGUMENT', 'FujiNet sidecar must not use default NetSIO port 9997 by default');
+    if (!(await udpPortAvailable(port))) throw makeError('BUSY', 'requested FujiNet NetSIO port is unavailable', { port });
+    return port;
+  }
+  for (let port = FUJINET_PORT_START; port <= FUJINET_PORT_END; port += 1) {
+    if (port === 9997) continue;
+    if (await udpPortAvailable(port)) return port;
+  }
+  throw makeError('BUSY', 'no free FujiNet NetSIO UDP port found', { start: FUJINET_PORT_START, end: FUJINET_PORT_END });
+}
+
+async function waitForFujiNetReady(port, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (session?.fujinet?.exit_code !== null || session?.fujinet?.signal !== null) {
+      throw makeError('EMULATOR_EXITED', 'FujiNet-PC exited during startup', { fujinet: session.fujinet });
+    }
+    const lines = session?.fujinet?.logs || [];
+    if (lines.some((line) => line.text.includes(`Setting up NetSIO (localhost:${port})`))) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw makeError('TIMEOUT', 'FujiNet-PC did not report NetSIO startup before timeout', {
+    port,
+    logs: session?.fujinet?.logs?.slice(-40) || [],
+  });
+}
+
+function signalFujiNetProcess(proc, signal) {
+  try {
+    if (session?.fujinet?.process_group) process.kill(-proc.pid, signal);
+    else proc.kill(signal);
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+}
+
+async function stopFujiNet({ force = false } = {}) {
+  if (!session?.fujinet_process || !session.fujinet) {
+    return { status: 'ok', state: 'not_started' };
+  }
+  const proc = session.fujinet_process;
+  if (proc.exitCode === null && proc.signalCode === null) {
+    signalFujiNetProcess(proc, 'SIGTERM');
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && proc.exitCode === null && proc.signalCode === null) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (force && proc.exitCode === null && proc.signalCode === null) {
+      proc.kill('SIGKILL');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    if (proc.exitCode === null && proc.signalCode === null) {
+      throw makeError('BUSY', 'tracked FujiNet-PC process did not exit after SIGTERM; retry with force=true');
+    }
+  }
+  session.fujinet.state = 'exited';
+  const snapshot = session.fujinet;
+  session.fujinet_process = null;
+  return { status: 'ok', fujinet: snapshot };
+}
+
+function fujinetStatusSnapshot() {
+  const info = session?.fujinet || null;
+  return {
+    state: info?.state || 'not_started',
+    running: fujinetProcessRunning(),
+    selection: currentFujiNetSelection(),
+    fujinet: info ? {
+      ...info,
+      logs: undefined,
+      last_log_seq: info.log_seq || 0,
+      log_count: info.logs?.length || 0,
+      dropped_logs: info.dropped_logs || 0,
+      atari_netsio_connected: Boolean(
+        session?.emulator?.netsio_connected && session.emulator.netsio_port === info.udp_port
+      ),
+    } : null,
+  };
+}
+
+async function startFujiNetSidecar(args = {}) {
+  if (session?.fujinet_process && session.fujinet_process.exitCode === null && session.fujinet_process.signalCode === null) {
+    throw makeError('BUSY', 'FujiNet-PC sidecar is already running', { fujinet: session.fujinet });
+  }
+  const port = await allocateFujiNetPort(args.port ?? args.netsio_port ?? null);
+  const prepared = prepareFujiNetInstall(args.local_path || args.archive_path || null);
+  writeFujiNetConfig(prepared.configPath, port);
+
+  const argv = ['-c', prepared.configPath, '-s', prepared.sdPath];
+  if (args.web_url) argv.unshift('-u', args.web_url);
+  const proc = spawn(prepared.launcher, argv, {
+    cwd: prepared.workDir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+  });
+  session.fujinet = {
+    state: 'starting',
+    selected_version: fujinetSelection.version || path.basename(prepared.sourcePath),
+    source_path: prepared.sourcePath,
+    executable_path: prepared.executable,
+    launcher_path: prepared.launcher,
+    working_dir: prepared.workDir,
+    argv: [prepared.launcher, ...argv],
+    pid: proc.pid,
+    udp_port: port,
+    config_path: prepared.configPath,
+    sd_path: prepared.sdPath,
+    data_path: path.join(prepared.workDir, 'data'),
+    started_at: nowIso(),
+    exit_code: null,
+    signal: null,
+    process_group: true,
+    logs: [],
+    dropped_logs: 0,
+    log_seq: 0,
+  };
+  session.fujinet_process = proc;
+  session.owned_paths.push(path.dirname(prepared.workDir));
+  proc.stdout.on('data', (chunk) => recordFujiNetLog('stdout', chunk));
+  proc.stderr.on('data', (chunk) => recordFujiNetLog('stderr', chunk));
+  proc.on('error', (error) => {
+    if (!session?.fujinet) return;
+    session.fujinet.state = 'crashed';
+    recordFujiNetLog('mcp', Buffer.from(`fujinet spawn error: ${error.message}`));
+  });
+  proc.on('exit', (code, signal) => {
+    if (!session?.fujinet) return;
+    session.fujinet.exit_code = code;
+    session.fujinet.signal = signal;
+    session.fujinet.state = code === 0 ? 'exited' : 'crashed';
+  });
+  try {
+    await waitForFujiNetReady(port, args.timeout_ms ?? 5000);
+    session.fujinet.state = 'running';
+    return session.fujinet;
+  } catch (error) {
+    await stopFujiNet({ force: true });
+    throw error;
+  }
+}
+
+function readFujiNetLogs({ since_seq = 0, limit = 100, contains, regex, stream = 'both' } = {}) {
+  if (!session?.fujinet) return { lines: [], next_seq: since_seq, dropped: 0 };
+  const max = Math.max(1, Math.min(Number(limit) || 100, FUJINET_LOG_LIMIT));
+  let matcher = null;
+  if (regex) matcher = new RegExp(regex);
+  let lines = session.fujinet.logs || [];
+  lines = lines.filter((line) => line.seq > since_seq);
+  if (stream !== 'both') lines = lines.filter((line) => line.stream === stream);
+  if (contains) lines = lines.filter((line) => line.text.includes(contains));
+  if (matcher) lines = lines.filter((line) => matcher.test(line.text));
+  lines = lines.slice(-max);
+  return {
+    lines,
+    next_seq: lines.length ? lines[lines.length - 1].seq + 1 : since_seq,
+    dropped: session.fujinet.dropped_logs || 0,
+    limit: FUJINET_LOG_LIMIT,
+  };
+}
+
+function githubJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'atari800-mcp' } }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(makeError('IO_ERROR', 'GitHub request failed', { status: res.statusCode, body: data.slice(0, 500) }));
+          return;
+        }
+        try { resolve(JSON.parse(data)); }
+        catch (error) { reject(error); }
+      });
+    }).on('error', reject);
+  });
+}
+
+async function listRemoteFujiNetAssets() {
+  const releases = await githubJson('https://api.github.com/repos/FujiNetWIFI/fujinet-firmware/releases?per_page=20');
+  const assets = [];
+  for (const release of releases) {
+    for (const asset of release.assets || []) {
+      if (/fujinet-pc-ATARI_.*\.(tar\.gz|tgz)$/i.test(asset.name)) {
+        assets.push({
+          release: release.tag_name,
+          prerelease: release.prerelease,
+          name: asset.name,
+          url: asset.browser_download_url,
+          size: asset.size,
+        });
+      }
+    }
+  }
+  return assets;
+}
+
+async function downloadFile(url, dest) {
+  ensureDir(path.dirname(dest));
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    https.get(url, { headers: { 'User-Agent': 'atari800-mcp' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        file.close();
+        fs.unlinkSync(dest);
+        downloadFile(res.headers.location, dest).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        file.close();
+        fs.unlinkSync(dest);
+        reject(makeError('IO_ERROR', 'download failed', { status: res.statusCode, url }));
+        return;
+      }
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+    }).on('error', (error) => {
+      file.close();
+      try { fs.unlinkSync(dest); } catch {}
+      reject(error);
+    });
+  });
+}
+
+function selectLocalFujiNetByVersion(version) {
+  const archives = findLocalFujiNetArchives();
+  const matches = archives.filter((archive) => path.basename(archive).includes(version));
+  if (matches.length === 0) {
+    throw makeError('CAPABILITY_UNAVAILABLE', 'no local FujiNet-PC archive matches requested version', {
+      version,
+      local_archives: archives.map(describeFujiNetPath),
+      hint: 'Use fujinet_fetch_latest or fujinet_set_local_path.',
+    });
+  }
+  if (matches.length > 1) {
+    throw makeError('BAD_ARGUMENT', 'multiple local FujiNet-PC archives match requested version', {
+      version,
+      matches: matches.map(describeFujiNetPath),
+    });
+  }
+  fujinetSelection = { local_path: matches[0], version, source: 'local_version' };
+  return currentFujiNetSelection();
+}
+
+async function fetchFujiNetAsset(args = {}) {
+  const assets = await listRemoteFujiNetAssets();
+  const pattern = args.asset_pattern || detectFujiNetAssetPattern();
+  if (!pattern) {
+    throw makeError('BAD_ARGUMENT', 'host platform is not auto-detected for FujiNet-PC; pass asset_pattern or use fujinet_set_local_path', {
+      assets,
+    });
+  }
+  let candidates = assets.filter((asset) => asset.name.includes(pattern));
+  if (args.version) candidates = candidates.filter((asset) => asset.name.includes(args.version) || asset.release === args.version);
+  if (args.tag) candidates = candidates.filter((asset) => asset.release === args.tag);
+  if (candidates.length === 0) {
+    throw makeError('CAPABILITY_UNAVAILABLE', 'no FujiNet-PC Atari asset matched host/version selection', {
+      pattern,
+      version: args.version || null,
+      tag: args.tag || null,
+      available_assets: assets,
+    });
+  }
+  const asset = candidates[0];
+  const dest = path.join(FUJINET_CACHE_DIR, asset.name);
+  if (!fs.existsSync(dest) || args.force === true) {
+    await downloadFile(asset.url, dest);
+  }
+  fujinetSelection = { local_path: dest, version: args.version || asset.release || asset.name, source: 'download' };
+  return { asset, path: dest, selection: currentFujiNetSelection() };
+}
+
 function nativeDisplayAvailable() {
   return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY || process.platform === 'darwin');
 }
@@ -243,10 +766,7 @@ async function buildPreflight() {
       root_exists: fs.existsSync(RUNTIME_ROOT),
       temp_dir: os.tmpdir(),
     },
-    fujinet: {
-      configured: false,
-      note: 'FujiNet-PC sidecar selection is planned for later phases.',
-    },
+    fujinet: currentFujiNetSelection(),
     missing_dependencies: missing,
   };
 }
@@ -477,6 +997,18 @@ async function stopSession({ force = false, cleanup_runtime_dir = true } = {}) {
     }
   }
 
+  try {
+    await stopFujiNet({ force });
+  } catch (error) {
+    session.state = 'running';
+    return {
+      status: 'error',
+      code: error.code || 'BUSY',
+      message: error.message,
+      session: sessionSnapshot(),
+    };
+  }
+
   if (session.state !== 'cleanup_failed') {
     session.state = 'exited';
   }
@@ -541,6 +1073,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description: 'Report emulator, display, Xvfb, runtime, and host dependency status.',
       inputSchema: { type: 'object', properties: {} },
     },
+    {
+      name: 'fujinet_list_versions',
+      description: 'List local FujiNet-PC Atari archives and optionally GitHub release assets.',
+      inputSchema: { type: 'object', properties: { include_remote: { type: 'boolean', default: false } } },
+    },
+    {
+      name: 'fujinet_set_local_path',
+      description: 'Select an unpacked FujiNet-PC directory or local .tar.gz archive for offline use.',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    },
+    {
+      name: 'fujinet_select_version',
+      description: 'Select a pinned local FujiNet-PC archive by version/tag/name substring.',
+      inputSchema: { type: 'object', properties: { version: { type: 'string' } }, required: ['version'] },
+    },
+    {
+      name: 'fujinet_fetch_latest',
+      description: 'Fetch and select the latest matching FujiNet-PC Atari release asset for this host.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          version: { type: 'string' },
+          tag: { type: 'string' },
+          asset_pattern: { type: 'string' },
+          force: { type: 'boolean', default: false },
+        },
+      },
+    },
+    {
+      name: 'fujinet_start',
+      description: 'Start FujiNet-PC as an MCP-owned sidecar with a non-default NetSIO UDP port.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          local_path: { type: 'string' },
+          archive_path: { type: 'string' },
+          port: { type: 'number' },
+          netsio_port: { type: 'number' },
+          web_url: { type: 'string' },
+          timeout_ms: { type: 'number', default: 5000 },
+        },
+      },
+    },
+    {
+      name: 'fujinet_stop',
+      description: 'Stop only the MCP-owned FujiNet-PC sidecar process.',
+      inputSchema: { type: 'object', properties: { force: { type: 'boolean', default: false } } },
+    },
+    { name: 'fujinet_status', description: 'Report FujiNet-PC sidecar selection, process, port, paths, and log status.', inputSchema: { type: 'object', properties: {} } },
+    {
+      name: 'fujinet_logs',
+      description: 'Read bounded FujiNet-PC stdout/stderr logs.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          since_seq: { type: 'number' },
+          limit: { type: 'number', default: 100 },
+          contains: { type: 'string' },
+          regex: { type: 'string' },
+          stream: { type: 'string', enum: ['stdout', 'stderr', 'mcp', 'both'], default: 'both' },
+        },
+      },
+    },
+    {
+      name: 'fujinet_debug_read',
+      description: 'Read bounded FujiNet-PC debug output from stdout/stderr.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          since_seq: { type: 'number' },
+          limit: { type: 'number', default: 100 },
+          contains: { type: 'string' },
+          regex: { type: 'string' },
+          stream: { type: 'string', enum: ['stdout', 'stderr', 'mcp', 'both'], default: 'both' },
+        },
+      },
+    },
+    { name: 'fujinet_debug_clear', description: 'Clear the MCP FujiNet-PC debug output buffer.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'fujinet_debug_status', description: 'Report FujiNet-PC debug output buffer counters.', inputSchema: { type: 'object', properties: {} } },
     {
       name: 'atari_start',
       description: 'Start an MCP-owned Atari800 emulator session.',
@@ -948,8 +1559,73 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: formatJson(preflight) }] };
       }
 
+      case 'fujinet_list_versions': {
+        const result = currentFujiNetSelection();
+        if (args.include_remote === true) result.remote_assets = await listRemoteFujiNetAssets();
+        return { content: [{ type: 'text', text: formatJson(result) }] };
+      }
+
+      case 'fujinet_set_local_path': {
+        const selectedPath = path.resolve(args.path);
+        if (!fs.existsSync(selectedPath)) {
+          throw makeError('BAD_ARGUMENT', 'FujiNet-PC local path does not exist', { path: selectedPath });
+        }
+        fujinetSelection = { local_path: selectedPath, version: path.basename(selectedPath), source: 'local_path' };
+        return { content: [{ type: 'text', text: formatJson(currentFujiNetSelection()) }] };
+      }
+
+      case 'fujinet_select_version': {
+        const selected = selectLocalFujiNetByVersion(args.version);
+        return { content: [{ type: 'text', text: formatJson(selected) }] };
+      }
+
+      case 'fujinet_fetch_latest': {
+        const fetched = await fetchFujiNetAsset(args);
+        return { content: [{ type: 'text', text: formatJson(fetched) }] };
+      }
+
+      case 'fujinet_start': {
+        await startFujiNetSidecar(args);
+        return { content: [{ type: 'text', text: formatToolResponse('FujiNet-PC sidecar started.', fujinetStatusSnapshot()) }] };
+      }
+
+      case 'fujinet_stop': {
+        const stopped = await stopFujiNet({ force: args.force === true });
+        return { content: [{ type: 'text', text: formatJson(stopped) }] };
+      }
+
+      case 'fujinet_status': {
+        return { content: [{ type: 'text', text: formatJson(fujinetStatusSnapshot()) }] };
+      }
+
+      case 'fujinet_logs':
+      case 'fujinet_debug_read': {
+        return { content: [{ type: 'text', text: formatJson(readFujiNetLogs(args)) }] };
+      }
+
+      case 'fujinet_debug_clear': {
+        if (session?.fujinet) {
+          session.fujinet.logs = [];
+          session.fujinet.dropped_logs = 0;
+        }
+        return { content: [{ type: 'text', text: formatJson({ status: 'ok', debug: fujinetStatusSnapshot().fujinet }) }] };
+      }
+
+      case 'fujinet_debug_status': {
+        const info = session?.fujinet || null;
+        return { content: [{ type: 'text', text: formatJson({
+          state: info?.state || 'not_started',
+          running: fujinetProcessRunning(),
+          last_seq: info?.log_seq || 0,
+          next_seq: (info?.log_seq || 0) + 1,
+          log_count: info?.logs?.length || 0,
+          dropped: info?.dropped_logs || 0,
+          limit: FUJINET_LOG_LIMIT,
+        }) }] };
+      }
+
       case 'atari_start': {
-        if (session) {
+        if (emulatorProcessRunning()) {
           await stopSession({ force: true, cleanup_runtime_dir: true });
         }
         const preflight = await buildPreflight();
@@ -957,7 +1633,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw makeError('CAPABILITY_UNAVAILABLE', 'Atari800 emulator is not executable', { preflight });
         }
         cleanupStaleRuntimeDirs();
-        session = createSession(args.program, args.artifact_dir || null);
+        if (!session) {
+          session = createSession(args.program, args.artifact_dir || null);
+        } else {
+          if (args.artifact_dir && path.resolve(args.artifact_dir) !== session.artifact_dir) {
+            throw makeError('BAD_ARGUMENT', 'artifact_dir cannot be changed after starting a FujiNet sidecar; start Atari first or stop the session', {
+              requested: path.resolve(args.artifact_dir),
+              current: session.artifact_dir,
+            });
+          }
+          session.state = 'starting';
+          session.emulator.program = args.program || null;
+          session.emulator.started_at = null;
+          session.emulator.exit_code = null;
+          session.emulator.signal = null;
+          session.emulator.netsio_connected = false;
+        }
 
         const requestedMode = args.display_mode || 'auto';
         const displayMode = requestedMode === 'auto' ? 'headless' : requestedMode;
@@ -992,9 +1683,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ];
         if (args.basic === true) argv.push('-basic');
         if (args.basic === false) argv.push('-nobasic');
-        if (args.netsio) {
+        const sidecarNetSioPort = fujinetProcessRunning() ? session.fujinet.udp_port : null;
+        const netsioEnabled = args.netsio !== undefined ? Boolean(args.netsio) : Boolean(sidecarNetSioPort);
+        const netsioPort = args.netsio_port ?? sidecarNetSioPort;
+        if (netsioEnabled) {
           argv.push('-netsio');
-          if (args.netsio_port !== undefined) argv.push(String(args.netsio_port));
+          if (netsioPort !== null && netsioPort !== undefined) argv.push(String(netsioPort));
         }
         if (args.debug_port !== undefined) argv.push('-ai-debug-port', String(args.debug_port));
         if (args.turbo) argv.push('-turbo');
@@ -1022,8 +1716,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         session.emulator.display_mode = displayMode;
         session.emulator.display = displayName;
         session.emulator.sound = sound;
-        session.emulator.netsio = Boolean(args.netsio);
-        session.emulator.netsio_port = args.netsio ? (args.netsio_port ?? 9997) : null;
+        session.emulator.netsio = netsioEnabled;
+        session.emulator.netsio_port = netsioEnabled ? (netsioPort ?? 9997) : null;
         session.display = {
           requested_mode: requestedMode,
           effective_mode: displayMode,
@@ -1045,6 +1739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (!session) return;
           session.emulator.exit_code = code;
           session.emulator.signal = signal;
+          session.emulator.netsio_connected = false;
           if (session.state !== 'cleanup_failed') {
             session.state = code === 0 ? 'exited' : 'crashed';
           }

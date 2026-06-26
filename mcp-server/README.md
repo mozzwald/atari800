@@ -37,7 +37,18 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 
 | Tool | Description |
 |------|-------------|
-| `atari_preflight` | Report emulator, display, Xvfb, runtime, and host dependency status. |
+| `atari_preflight` | Report emulator, display, Xvfb, runtime, FujiNet selection, and host dependency status. |
+| `fujinet_list_versions` | List local FujiNet-PC Atari archives and optionally remote GitHub assets. |
+| `fujinet_set_local_path` | Select an unpacked FujiNet-PC directory or local `.tar.gz` archive. |
+| `fujinet_select_version` | Select a pinned local FujiNet-PC archive by version/tag/name substring. |
+| `fujinet_fetch_latest` | Download and select the latest matching FujiNet-PC Atari asset for this host. |
+| `fujinet_start` | Start an MCP-owned FujiNet-PC sidecar on a non-default NetSIO UDP port. |
+| `fujinet_stop` | Stop only the MCP-owned FujiNet-PC sidecar process. |
+| `fujinet_status` | Report FujiNet-PC version, process, port, config, SD/data paths, and log counters. |
+| `fujinet_logs` | Read bounded FujiNet-PC stdout/stderr logs. |
+| `fujinet_debug_read` | Read bounded FujiNet-PC debug output with sequence/filter support. |
+| `fujinet_debug_clear` | Clear the FujiNet-PC debug output buffer. |
+| `fujinet_debug_status` | Report FujiNet-PC debug output buffer counters. |
 | `atari_start` | Start an MCP-owned emulator session. |
 | `atari_stop` | Stop the tracked session; accepts `force` and `cleanup_runtime_dir`. |
 | `atari_status` | Report session state, launch details, sockets, and bounded logs. |
@@ -107,5 +118,15 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 3. Run frames: `atari_run` with `frames`.
 4. Inspect output: `atari_screen`, `atari_cpu`, `atari_peek`.
 5. Stop session: `atari_stop`.
+
+## FujiNet Workflow
+
+Use `fujinet_list_versions` first. If a matching local archive exists, use `fujinet_select_version`; otherwise use `fujinet_set_local_path` for an unpacked directory or archive, or `fujinet_fetch_latest` to download the matching Atari asset.
+
+`fujinet_start` extracts/copies FujiNet-PC into the managed runtime directory, writes the selected non-default NetSIO UDP port into `fnconfig.ini` under `[BOIP] port=`, and starts FujiNet-PC with stdout/stderr captured. When FujiNet-PC is running, `atari_start` automatically adds `-netsio <port>` unless `netsio` is explicitly set to `false`.
+
+When supplied by the package, `run-fujinet` handles FujiNet-PC's exit-75 reboot requests while remaining under MCP lifecycle control.
+
+Use `fujinet_debug_read` or `fujinet_logs` to inspect FujiNet-PC debug output while testing FujiNet-enabled apps. Use `fujinet_stop` to stop only the MCP-owned FujiNet-PC process; `atari_stop` stops the whole managed session.
 
 MCP wrappers are intentionally narrower than the C socket API. See `AGENT_CONTRACT.md` for the full C command inventory and known gaps.
