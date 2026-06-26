@@ -40,6 +40,9 @@
 #include "pia.h"
 #include "pokey.h"
 #include "util.h"
+#ifdef AI_INTERFACE
+#include "ai_interface.h"
+#endif
 #ifndef BASIC
 #include "statesav.h"
 #endif
@@ -1218,6 +1221,12 @@ void MEMORY_HwPutByte(UWORD addr, UBYTE byte)
 		PBI_D6PutByte(addr, byte);
 		break;
 	case 0xd700:				/* PBI page D7 */
+#ifdef AI_INTERFACE
+		if (AI_debug_port && addr == (UWORD)AI_debug_port) {
+			AI_DebugWrite(byte);
+			break;
+		}
+#endif
 		PBI_D7PutByte(addr, byte);
 		break;
 	default:

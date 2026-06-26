@@ -148,9 +148,10 @@ static int PNG_SaveScreen(FILE *fp, UBYTE *ptr1, UBYTE *ptr2)
 		free(rows[0]);
 
 #ifdef VIDEO_CODEC_PNG
-	return current_png_size;
+	/* When writing to file (fp != NULL), current_png_size is -1, but write succeeded */
+	return (current_png_size >= 0) ? current_png_size : 1;
 #else
-	return -1;
+	return 1;  /* Success when writing to file */
 #endif
 }
 
