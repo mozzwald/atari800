@@ -141,8 +141,12 @@ class Atari800AI:
         """Run emulator for N frames"""
         return self._send({"cmd": "run", "frames": frames})
 
+    def frame_step(self, frames: int = 1) -> dict:
+        """Run N frame-loop ticks, then pause"""
+        return self._send({"cmd": "frame_step", "frames": frames})
+
     def step(self, instructions: int = 1) -> dict:
-        """Single-step N CPU instructions"""
+        """Deprecated compatibility alias for frame-loop stepping, not CPU instruction stepping"""
         return self._send({"cmd": "step", "instructions": instructions})
 
     def pause(self) -> bool:

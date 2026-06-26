@@ -8,7 +8,6 @@
  * - Read screen output (PNG and ASCII)
  * - Access CPU state and memory
  * - Read all chip registers (ANTIC, GTIA, POKEY, PIA)
- * - Control disk drives and other devices
  *
  * Copyright (c) 2026 - AI Interface Extension
  * Licensed under GPL-2.0-or-later
@@ -58,9 +57,13 @@ int AI_IsPaused(void);
  *   Run for N frames (default 1), then pause and respond
  *   -> {"status": "ok", "frames_run": 60}
  *
+ * {"cmd": "frame_step", "frames": 1}
+ *   Run N frame-loop ticks (default 1), then pause. This is not CPU instruction stepping.
+ *   -> {"status": "ok", "steps_run": 1, "pc": 0x1234}
+ *
  * {"cmd": "step", "instructions": 1}
- *   Single-step N CPU instructions (default 1)
- *   -> {"status": "ok", "pc": 0x1234}
+ *   Deprecated compatibility alias for frame-loop stepping, not CPU instruction stepping.
+ *   -> {"status": "ok", "steps_run": 1, "pc": 0x1234}
  *
  * {"cmd": "pause"}
  *   -> {"status": "ok"}
@@ -84,7 +87,7 @@ int AI_IsPaused(void);
  *   -> {"status": "ok"}
  *
  * {"cmd": "paddle", "port": 0, "value": 128}
- *   Set paddle position (0-228)
+ *   Set paddle position (0-255)
  *   -> {"status": "ok"}
  *
  * {"cmd": "consol", "start": false, "select": false, "option": false}
@@ -101,16 +104,16 @@ int AI_IsPaused(void);
  *   -> {"status": "ok", "width": 40, "height": 24, "data": ["line1", ...]}
  *
  * {"cmd": "screen_raw"}
- *   Get raw screen buffer (base64 encoded, 384x240 bytes)
+ *   Get rendered screen buffer (base64 encoded, 384x240 bytes)
  *   -> {"status": "ok", "width": 384, "height": 240, "data": "base64..."}
  *
  * === MEMORY ===
  * {"cmd": "peek", "addr": 0x1234, "len": 16}
- *   Read memory (len defaults to 1)
+ *   Read memory (len defaults to 1, maximum 256)
  *   -> {"status": "ok", "addr": 0x1234, "data": [0x00, 0x01, ...]}
  *
  * {"cmd": "poke", "addr": 0x1234, "data": [0x00, 0x01]}
- *   Write memory
+ *   Write memory directly to MEMORY_mem
  *   -> {"status": "ok"}
  *
  * {"cmd": "dump", "start": 0x0000, "end": 0xFFFF, "path": "/tmp/mem.bin"}
@@ -125,10 +128,6 @@ int AI_IsPaused(void);
  *
  * {"cmd": "cpu_set", "pc": 0x1234, "a": 0x00, ...}
  *   Set CPU registers (only specified ones)
- *   -> {"status": "ok"}
- *
- * {"cmd": "breakpoint", "addr": 0x1234, "enabled": true}
- *   Set/clear breakpoint at address
  *   -> {"status": "ok"}
  *
  * === CHIPS ===
@@ -150,19 +149,6 @@ int AI_IsPaused(void);
  *   Get PIA state
  *   -> {"status": "ok", "porta": 0x00, "portb": 0x00, "pactl": 0x00, "pbctl": 0x00}
  *
- * === DEVICES ===
- * {"cmd": "disk_insert", "drive": 1, "path": "/path/to/disk.atr"}
- *   Insert disk image
- *   -> {"status": "ok"}
- *
- * {"cmd": "disk_eject", "drive": 1}
- *   Eject disk
- *   -> {"status": "ok"}
- *
- * {"cmd": "disk_status"}
- *   Get all drive status
- *   -> {"status": "ok", "drives": [{"drive": 1, "path": "...", "sectors": 720}, ...]}
- *
  * === STATE ===
  * {"cmd": "save_state", "path": "/tmp/state.sav"}
  *   Save emulator state
@@ -181,12 +167,53 @@ int AI_IsPaused(void);
  *   Read and clear debug output buffer
  *   -> {"status": "ok", "data": [0x41, 0x42, ...], "ascii": "AB..."}
  *
+ * === DEBUGGER ===
+ * {"cmd": "debugger.status"}
+ * {"cmd": "debugger.show_state"}
+ *   Report debugger capabilities, stop state, simple breakpoints, and CPU registers.
+ *
+ * {"cmd": "debugger.history"}
+ * {"cmd": "debugger.jumps"}
+ * {"cmd": "debugger.stack", "count": 16}
+ * {"cmd": "debugger.disassemble", "addr": 0x2000, "count": 24}
+ * {"cmd": "debugger.disassemble_loop", "addr": 0x2000}
+ * {"cmd": "debugger.dlist", "addr": 0x9c20, "count": 64}
+ * {"cmd": "debugger.search_memory", "start": 0x0000, "end": 0xffff, "pattern": [0, 1]}
+ * {"cmd": "debugger.search_string", "start": 0x0000, "end": 0xffff, "text": "READY"}
+ * {"cmd": "debugger.search_screencode_string", "start": 0x0000, "end": 0xffff, "text": "READY"}
+ * {"cmd": "debugger.labels", "limit": 256}
+ *   Read-only monitor-aligned debugger views. Labels require MONITOR_HINTS.
+ *
+ * {"cmd": "debugger.step_instruction", "instructions": 1}
+ *   True CPU instruction stepping through MONITOR_BREAK break-step support.
+ *
+ * {"cmd": "debugger.continue"}
+ *   Continue emulation from a debugger stop.
+ *
+ * {"cmd": "breakpoint.pc", "addr": 0x1234, "enabled": true}
+ * {"cmd": "breakpoint.brk", "enabled": true}
+ * {"cmd": "breakpoint.status"}
+ * {"cmd": "breakpoint.clear", "type": "all"}
+ *   Simple AI-owned PC and BRK breakpoints. AI breakpoint hits pause and report JSON
+ *   instead of entering the interactive monitor.
+ *
+ * {"cmd": "breakpoint.list"}
+ * {"cmd": "breakpoint.add", "condition": "PC=2000"}
+ * {"cmd": "breakpoint.add", "condition_type": "MEM", "m_addr": 0x0600, "operator": "=", "value": 0x42}
+ * {"cmd": "breakpoint.delete", "slot": 0}
+ * {"cmd": "breakpoint.enable", "slot": 0}
+ * {"cmd": "breakpoint.disable", "slot": 0}
+ *   Rich monitor breakpoint table commands require MONITOR_BREAKPOINTS.
+ *
  */
 
 /* Exposed for internal use */
 void AI_SendResponse(const char *json);
 void AI_DebugWrite(UBYTE byte);
 void AI_ApplyInput(void);  /* Apply AI input overrides after INPUT_Frame */
+int AI_DebuggerShouldBreakPC(UWORD pc);
+int AI_DebuggerShouldBreakBRK(void);
+int AI_DebuggerBreak(const char *reason, int breakpoint_id);
 void AI_FrameStreamSubmitSurface(const void *pixels, int width, int height, int pitch,
                                  int bits_per_pixel, unsigned int rmask,
                                  unsigned int gmask, unsigned int bmask);

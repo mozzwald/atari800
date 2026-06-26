@@ -8,7 +8,7 @@ This fork adds a **real-time AI interface** that allows external programs to:
 - Control the emulator programmatically (joystick, keyboard, console keys)
 - Read screen output (ASCII text or raw data)
 - Inspect hardware registers (CPU, ANTIC, GTIA, POKEY, PIA)
-- Read/write memory, set breakpoints
+- Read/write memory
 - Save/load emulator state
 - Run frame-by-frame for precise control
 
@@ -147,9 +147,11 @@ for line in resp['data']:
 | Command | Parameters | Description |
 |---------|------------|-------------|
 | `ping` | - | Test connection, returns `{status: "ok"}` |
-| `load` | `path` | Load a program file (.xex, .atr, etc.) |
+| `hello` / `capabilities` | - | Return protocol version, build flags, limits, sockets, commands, and command classes |
+| `load` | `path` | Load an executable-style program through `BINLOAD_Loader()` |
 | `run` | `frames` | Run emulator for N frames (1 frame = 1/60 sec) |
-| `step` | - | Execute single CPU instruction |
+| `frame_step` | `frames` | Run N frame-loop ticks, then pause |
+| `step` | `instructions` | Deprecated compatibility alias for frame-loop stepping; not CPU instruction stepping |
 | `pause` | - | Pause emulation |
 | `reset` | - | Reset the Atari |
 
@@ -158,10 +160,10 @@ for line in resp['data']:
 | Command | Parameters | Description |
 |---------|------------|-------------|
 | `joystick` | `port`, `direction`, `fire` | Set joystick state |
-| `key` | `keycode` | Press a key |
-| `key_release` | `keycode` | Release a key |
-| `paddle` | `port`, `value` | Set paddle position (0-227) |
-| `consol` | `start`, `select`, `option` | Set console keys |
+| `key` | `code`, `shift` | Press an AKEY code |
+| `key_release` | - | Release all AI key state |
+| `paddle` | `port`, `value` | Set paddle position (0-255) |
+| `consol` | `start`, `select`, `option` | Set console keys; active-low behavior needs runtime validation |
 
 **Joystick Directions:** `center`, `up`, `down`, `left`, `right`, `ul`, `ur`, `ll`, `lr`
 
@@ -171,7 +173,7 @@ for line in resp['data']:
 |---------|------------|-------------|
 | `screenshot` | `path` | Save screenshot as PNG |
 | `screen_ascii` | - | Get 40x24 ASCII representation |
-| `screen_raw` | - | Get raw screen memory |
+| `screen_raw` | - | Get rendered framebuffer bytes as base64, not Atari screen RAM |
 
 ### Video Commands
 
@@ -190,29 +192,24 @@ for line in resp['data']:
 
 | Command | Parameters | Description |
 |---------|------------|-------------|
-| `peek` | `addr`, `len` | Read memory bytes |
-| `poke` | `addr`, `value` | Write memory byte |
-| `dump` | `addr`, `len`, `path` | Dump memory to file |
+| `peek` | `addr`, `len` | Read memory bytes; `len` is capped at 256 |
+| `poke` | `addr`, `data` | Write byte array directly to `MEMORY_mem` |
+| `dump` | `start`, `end`, `path` | Dump memory to file |
 
 ### CPU/Chip State Commands
 
 | Command | Parameters | Description |
 |---------|------------|-------------|
 | `cpu` | - | Get CPU registers (A, X, Y, PC, SP, flags) |
-| `cpu_set` | `reg`, `value` | Set CPU register |
+| `cpu_set` | `pc`, `a`, `x`, `y`, `sp` | Set selected CPU registers |
 | `antic` | - | Get ANTIC chip state |
 | `gtia` | - | Get GTIA chip state (colors, triggers, PMG) |
 | `pokey` | - | Get POKEY chip state (audio, keyboard) |
 | `pia` | - | Get PIA chip state (ports, interrupts) |
-| `breakpoint` | `addr`, `enabled` | Set/clear breakpoint |
 
 ### Disk Commands
 
-| Command | Parameters | Description |
-|---------|------------|-------------|
-| `disk_insert` | `drive`, `path` | Insert disk image |
-| `disk_eject` | `drive` | Eject disk |
-| `disk_status` | - | Get disk drive status |
+Native `disk_insert`, `disk_eject`, and `disk_status` commands are not implemented in the current C socket API. Native Atari800 disk commands are planned separately from FujiNet-PC mount workflows.
 
 ### State Commands
 
@@ -225,8 +222,33 @@ for line in resp['data']:
 
 | Command | Parameters | Description |
 |---------|------------|-------------|
-| `debug_enable` | `port` | Enable debug port at $D7xx |
+| `debug_enable` | `addr` | Enable debug capture address, default `$D7FF` |
 | `debug_read` | - | Read data from debug port |
+| `debugger.status` | - | Report debugger capabilities, stop state, and CPU state |
+| `debugger.show_state` | - | Report debugger stop state and CPU state |
+| `debugger.history` | - | Return bounded monitor-formatted recent instruction history |
+| `debugger.jumps` | - | Return bounded recent JMP/JSR history |
+| `debugger.stack` | `count` | Return stack bytes above SP |
+| `debugger.disassemble` | `addr`, `count` | Return monitor-formatted disassembly |
+| `debugger.disassemble_loop` | `addr` | Return loop disassembly when detectable |
+| `debugger.dlist` | `addr`, `count` | Return bounded ANTIC display list entries |
+| `debugger.search_memory` | `start`, `end`, `pattern` | Search memory for a byte pattern |
+| `debugger.search_string` | `start`, `end`, `text` | Search memory for an ATASCII string |
+| `debugger.search_screencode_string` | `start`, `end`, `text` | Search memory for an ANTIC screen-code string |
+| `debugger.labels` | `limit` | List monitor labels when `MONITOR_HINTS` is available |
+| `debugger.step_instruction` | `instructions` | True CPU instruction stepping when `MONITOR_BREAK` is available |
+| `debugger.continue` | - | Continue emulation from a debugger stop |
+| `breakpoint.pc` | `addr`, `enabled` | Enable or disable simple AI-owned break-on-PC |
+| `breakpoint.brk` | `enabled` | Enable or disable simple break-on-BRK |
+| `breakpoint.status` | - | Report AI-owned breakpoint state |
+| `breakpoint.clear` | `type` | Clear simple and/or rich breakpoints |
+| `breakpoint.list` | - | List rich monitor breakpoint table when `MONITOR_BREAKPOINTS` is available |
+| `breakpoint.add` | `condition` or structured fields | Add one rich monitor breakpoint table entry |
+| `breakpoint.delete` | `slot` | Delete a rich monitor breakpoint slot |
+| `breakpoint.enable` | `slot` | Enable a rich monitor breakpoint slot |
+| `breakpoint.disable` | `slot` | Disable a rich monitor breakpoint slot |
+
+Rich breakpoint table commands return `CAPABILITY_UNAVAILABLE` when `MONITOR_BREAKPOINTS` is not compiled in. Unsafe interactive monitor commands are not exposed through the AI socket.
 
 ### Video Usage Examples
 

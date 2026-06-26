@@ -64,6 +64,9 @@
 #include "asap_internal.h"
 #else
 #include "antic.h"
+#ifdef AI_INTERFACE
+#include "ai_interface.h"
+#endif
 #include "atari.h"
 #include "esc.h"
 #include "memory.h"
@@ -413,12 +416,30 @@ void CPU_NMI(void)
 #else
 #define ENTER_MONITOR  if (!Atari800_Exit(TRUE)) exit(0)
 #endif
-#define DO_BREAK \
+#ifdef AI_INTERFACE
+#define DO_BREAK_REASON(reason, breakpoint_id) \
+	UPDATE_GLOBAL_REGS; \
+	CPU_GetStatus(); \
+	if (AI_DebuggerBreak((reason), (breakpoint_id))) { \
+		CPU_PutStatus(); \
+		UPDATE_LOCAL_REGS; \
+		if (AI_IsPaused()) \
+			return; \
+	} \
+	else { \
+		ENTER_MONITOR; \
+		CPU_PutStatus(); \
+		UPDATE_LOCAL_REGS; \
+	}
+#else
+#define DO_BREAK_REASON(reason, breakpoint_id) \
 	UPDATE_GLOBAL_REGS; \
 	CPU_GetStatus(); \
 	ENTER_MONITOR; \
 	CPU_PutStatus(); \
 	UPDATE_LOCAL_REGS;
+#endif
+#define DO_BREAK DO_BREAK_REASON("breakpoint_condition", -1)
 
 
 /*	0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F */
@@ -673,9 +694,14 @@ void CPU_GO(int limit)
 		CPU_remember_PC_curpos = (CPU_remember_PC_curpos + 1) % CPU_REMEMBER_PC_STEPS;
 
 		if (MONITOR_break_addr == GET_PC() || ANTIC_break_ypos == ANTIC_ypos) {
-			DO_BREAK;
+			DO_BREAK_REASON("breakpoint_pc", 0);
 		}
 #endif /* MONITOR_BREAK */
+#ifdef AI_INTERFACE
+		if (AI_DebuggerShouldBreakPC(GET_PC())) {
+			DO_BREAK_REASON("breakpoint_pc", 0);
+		}
+#endif
 
 #if defined(WRAP_64K) && !defined(PC_PTR)
 		MEMORY_mem[0x10000] = MEMORY_mem[0];
@@ -880,10 +906,16 @@ void CPU_GO(int limit)
 #else /* LIBATARI800 */
 #ifdef MONITOR_BREAK
 		if (MONITOR_break_brk) {
-			DO_BREAK;
+			DO_BREAK_REASON("breakpoint_brk", 0);
 		}
 		else
 #endif /* MONITOR_BREAK */
+#ifdef AI_INTERFACE
+		if (AI_DebuggerShouldBreakBRK()) {
+			DO_BREAK_REASON("breakpoint_brk", 0);
+		}
+		else
+#endif
 #endif /* LIBATARI800 */
 		{
 			PC++;
@@ -2437,7 +2469,7 @@ void CPU_GO(int limit)
 
 #ifdef MONITOR_BREAK
 		if (MONITOR_break_step) {
-			DO_BREAK;
+			DO_BREAK_REASON("instruction_limit", -1);
 		}
 #endif
 		/* This "continue" does nothing here.

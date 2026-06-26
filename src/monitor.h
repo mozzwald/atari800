@@ -31,6 +31,17 @@ extern const UBYTE MONITOR_optype6502[256];
 void MONITOR_Exit(void);
 void MONITOR_ShowState(FILE *fp, UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
                 char n, char v, char z, char c);
+UWORD MONITOR_ShowInstruction(FILE *fp, UWORD pc);
+UWORD MONITOR_Disassemble(FILE *fp, UWORD addr, int count);
+UWORD MONITOR_DisassembleLoop(FILE *fp, UWORD addr);
+void MONITOR_ShowHistory(FILE *fp);
+void MONITOR_ShowLastJumps(FILE *fp);
+void MONITOR_ShowStack(FILE *fp, UBYTE sp, int count);
+void MONITOR_ShowDisplayList(FILE *fp, UWORD addr, int count);
+
+#ifdef MONITOR_HINTS
+void MONITOR_ShowLabels(FILE *fp, int include_builtin, int limit);
+#endif
 
 #ifdef MONITOR_BREAKPOINTS
 

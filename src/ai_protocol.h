@@ -29,6 +29,7 @@
 static int AI_JSON_IsValidObject(const char *json)
 {
     const char *p;
+    char stack[64];
     int depth = 0;
     int in_string = 0;
     int escape = 0;
@@ -59,15 +60,28 @@ static int AI_JSON_IsValidObject(const char *json)
             in_string = 1;
         }
         else if (c == '{' || c == '[') {
+            if (depth >= (int)sizeof(stack))
+                return 0;
+            stack[depth] = c;
             depth++;
         }
         else if (c == '}' || c == ']') {
-            depth--;
-            if (depth < 0)
+            char open;
+            if (depth <= 0)
                 return 0;
+            open = stack[depth - 1];
+            if ((c == '}' && open != '{') || (c == ']' && open != '['))
+                return 0;
+            depth--;
+            if (depth == 0) {
+                p++;
+                while (isspace((unsigned char)*p))
+                    p++;
+                return *p == '\0';
+            }
         }
     }
-    return !in_string && depth == 0;
+    return 0;
 }
 
 static const char *AI_JSON_SkipSpace(const char *p)
@@ -272,6 +286,7 @@ static int AI_JSON_GetInt(const char *json, const char *key, int *value, int def
 static int AI_JSON_GetBool(const char *json, const char *key, int *value, int def, int required)
 {
     const char *p = AI_JSON_FindValue(json, key);
+    const char *end;
 
     if (p == NULL) {
         if (value != NULL)
@@ -279,16 +294,43 @@ static int AI_JSON_GetBool(const char *json, const char *key, int *value, int de
         return required ? AI_JSON_MISSING : AI_JSON_OK;
     }
     if (strncmp(p, "true", 4) == 0) {
+        end = AI_JSON_SkipSpace(p + 4);
+        if (*end != '\0' && *end != ',' && *end != '}' && *end != ']')
+            return AI_JSON_BAD_TYPE;
         if (value != NULL)
             *value = 1;
         return AI_JSON_OK;
     }
     if (strncmp(p, "false", 5) == 0) {
+        end = AI_JSON_SkipSpace(p + 5);
+        if (*end != '\0' && *end != ',' && *end != '}' && *end != ']')
+            return AI_JSON_BAD_TYPE;
         if (value != NULL)
             *value = 0;
         return AI_JSON_OK;
     }
     return AI_JSON_BAD_TYPE;
+}
+
+static int AI_CommandLengthIsAllowed(long len, int bufsize)
+{
+    return len > 0 && len < bufsize && len <= AI_DEFAULT_MAX_COMMAND_BYTES;
+}
+
+static int AI_PathHasParentRef(const char *path)
+{
+    const char *p = path;
+
+    if (path == NULL)
+        return 0;
+    while ((p = strstr(p, "..")) != NULL) {
+        int before = (p == path || p[-1] == '/');
+        int after = (p[2] == '\0' || p[2] == '/');
+        if (before && after)
+            return 1;
+        p += 2;
+    }
+    return 0;
 }
 
 static int AI_JSON_GetByteArray(const char *json, const char *key, unsigned char *buf, int bufsize, int *count, int required)

@@ -950,6 +950,22 @@ static UWORD show_instruction(FILE *fp, UWORD pc)
 	return pc;
 }
 
+UWORD MONITOR_ShowInstruction(FILE *fp, UWORD pc)
+{
+	return show_instruction(fp, pc);
+}
+
+UWORD MONITOR_Disassemble(FILE *fp, UWORD addr, int count)
+{
+	if (count < 1)
+		count = 1;
+	if (count > 256)
+		count = 256;
+	while (count-- > 0)
+		addr = show_instruction(fp, addr);
+	return addr;
+}
+
 void MONITOR_Exit(void)
 {
 	if (trainer_memory != NULL) {
@@ -1541,6 +1557,17 @@ static void monitor_break_PC(void)
 /* Displays last 64 executed instructions. */
 static void show_history(void)
 {
+	MONITOR_ShowHistory(stdout);
+}
+
+/* Displays last 16 executed JMP/JSR instructions. */
+static void show_last_jumps(void)
+{
+	MONITOR_ShowLastJumps(stdout);
+}
+
+void MONITOR_ShowHistory(FILE *fp)
+{
 	int i;
 	for (i = 0; i < CPU_REMEMBER_PC_STEPS; i++) {
 		int j;
@@ -1548,24 +1575,35 @@ static void show_history(void)
 		UWORD saved_cpu = CPU_remember_PC[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS];
 		UBYTE save_op[3];
 		j = CPU_remember_xpos[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS];
-		printf("%3d %3d ", j >> 8, j & 0xff);
+		fprintf(fp, "%3d %3d ", j >> 8, j & 0xff);
 		for (k = 0; k < 3; k++) {
 			save_op[k] = MEMORY_SafeGetByte(saved_cpu + k);
 			MEMORY_dPutByte(saved_cpu + k, CPU_remember_op[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS][k]);
 		}
-		show_instruction(stdout, CPU_remember_PC[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS]);
-		for (k = 0; k < 3; k++) {
+		show_instruction(fp, CPU_remember_PC[(CPU_remember_PC_curpos + i) % CPU_REMEMBER_PC_STEPS]);
+		for (k = 0; k < 3; k++)
 			MEMORY_dPutByte(saved_cpu + k, save_op[k]);
-		}
 	}
 }
 
-/* Displays last 16 executed JMP/JSR instructions. */
-static void show_last_jumps(void)
+void MONITOR_ShowLastJumps(FILE *fp)
 {
 	int i;
 	for (i = 0; i < CPU_REMEMBER_JMP_STEPS; i++)
-		show_instruction(stdout, CPU_remember_JMP[(CPU_remember_jmp_curpos + i) % CPU_REMEMBER_JMP_STEPS]);
+		show_instruction(fp, CPU_remember_JMP[(CPU_remember_jmp_curpos + i) % CPU_REMEMBER_JMP_STEPS]);
+}
+
+void MONITOR_ShowStack(FILE *fp, UBYTE sp, int count)
+{
+	int i;
+	if (count < 1)
+		count = 16;
+	if (count > 256)
+		count = 256;
+	for (i = 0; i < count && sp + 1 + i <= 0xff; i++) {
+		UWORD addr = (UWORD) (0x0100 + sp + 1 + i);
+		fprintf(fp, "%04X: %02X\n", addr, MEMORY_SafeGetByte(addr));
+	}
 }
 
 /* Stesp over the current instruction. */
@@ -1598,6 +1636,42 @@ static void monitor_bline(void)
 		printf("BLINE disabled\n");
 }
 #endif
+
+void MONITOR_ShowDisplayList(FILE *fp, UWORD addr, int count)
+{
+	int lines = 0;
+	if (count < 1)
+		count = 64;
+	if (count > 512)
+		count = 512;
+	while (lines < count) {
+		UBYTE ir;
+		fprintf(fp, "%04X: ", addr);
+		ir = ANTIC_GetDLByte(&addr);
+		if (ir & 0x80)
+			fprintf(fp, "DLI ");
+		if ((ir & 0x0f) == 0) {
+			fprintf(fp, "%c BLANK\n", ((ir >> 4) & 0x07) + '1');
+		}
+		else if ((ir & 0x0f) == 1) {
+			UWORD target = ANTIC_GetDLWord(&addr);
+			fprintf(fp, "%s %04X\n", (ir & 0x40) ? "JVB" : "JMP", target);
+			if (ir & 0x40)
+				break;
+			addr = target;
+		}
+		else {
+			if (ir & 0x40)
+				fprintf(fp, "LMS %04X ", ANTIC_GetDLWord(&addr));
+			if (ir & 0x20)
+				fprintf(fp, "VSCROL ");
+			if (ir & 0x10)
+				fprintf(fp, "HSCROL ");
+			fprintf(fp, "MODE %X\n", ir & 0x0f);
+		}
+		lines++;
+	}
+}
 
 /* Displays ANTIC's Display List. */
 static void show_dlist(void)
@@ -2653,7 +2727,48 @@ static UWORD disassemble_loop(UWORD addr)
 	return addr;
 }
 
+UWORD MONITOR_DisassembleLoop(FILE *fp, UWORD addr)
+{
+	int caddr;
+	caddr = addr;
+	for (;;) {
+		UBYTE opcode;
+		if (caddr > (UWORD) (addr + 0x7e)) {
+			fprintf(fp, "Conditional loop containing instruction at %04X not detected\n", addr);
+			break;
+		}
+		opcode = MEMORY_SafeGetByte((UWORD) caddr);
+		if ((opcode & 0x1f) == 0x10) {
+			UWORD target = caddr + 2 + (SBYTE) MEMORY_SafeGetByte((UWORD) (caddr + 1));
+			if (target <= addr) {
+				addr = MONITOR_Disassemble(fp, target, 24);
+				break;
+			}
+		}
+		caddr += MONITOR_optype6502[opcode] & 3;
+	}
+	return addr;
+}
+
 #ifdef MONITOR_HINTS
+void MONITOR_ShowLabels(FILE *fp, int include_builtin, int limit)
+{
+	int i;
+	int emitted = 0;
+	const symtable_rec *p;
+	if (limit < 1)
+		limit = 256;
+	if (limit > 4096)
+		limit = 4096;
+	for (i = 0; i < symtable_user_size && emitted < limit; i++, emitted++)
+		fprintf(fp, "%04X %s user\n", symtable_user[i].addr, symtable_user[i].name);
+	if (!include_builtin || !symtable_builtin_enable)
+		return;
+	for (p = (Atari800_machine_type == Atari800_MACHINE_5200 ? symtable_builtin_5200 : symtable_builtin);
+	     p->name != NULL && emitted < limit; p++, emitted++)
+		fprintf(fp, "%04X %s builtin\n", p->addr, p->name);
+}
+
 static void configure_labels(UWORD *addr)
 {
 	char *cmd = get_token();

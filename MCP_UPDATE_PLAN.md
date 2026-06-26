@@ -112,12 +112,12 @@ Purpose: create a reliable map of what exists before changing behavior.
 
 Progress checklist:
 
-- [ ] Create an authoritative AI command inventory from `src/ai_interface.c`.
-- [ ] Create an authoritative MCP tool inventory from `mcp-server/index.js`.
-- [ ] Compare C, Python, MCP, `README.md`, `src/ai_interface.h`, and `mcp-server/README.md`.
-- [ ] Mark each command/tool as implemented, exposed by Python, exposed by MCP, documented, mismatched, or missing.
-- [ ] Create a minimal `README.AI.md` or `AGENT_CONTRACT.md` describing current behavior and planned contract.
-- [ ] Add a generated or scripted inventory check so docs can be kept in sync.
+- [x] Create an authoritative AI command inventory from `src/ai_interface.c`.
+- [x] Create an authoritative MCP tool inventory from `mcp-server/index.js`.
+- [x] Compare C, Python, MCP, `README.md`, `src/ai_interface.h`, and `mcp-server/README.md`.
+- [x] Mark each command/tool as implemented, exposed by Python, exposed by MCP, documented, mismatched, or missing.
+- [x] Create a minimal `README.AI.md` or `AGENT_CONTRACT.md` describing current behavior and planned contract.
+- [x] Add a generated or scripted inventory check so docs can be kept in sync.
 
 ## 0.1 Inventory Table Requirements
 
@@ -291,17 +291,17 @@ Purpose: make MCP-managed emulator runs deterministic and non-destructive.
 
 Progress checklist:
 
-- [ ] Add MCP session object.
-- [ ] Add managed runtime directory creation.
-- [ ] Derive per-session AI command socket path.
-- [ ] Derive per-session video push/pull socket paths.
-- [ ] Add C CLI options for custom video push/pull socket paths, or another safe mechanism for per-session paths.
-- [ ] Add `atari_status` with session state and effective launch details.
-- [ ] Replace global fixed socket cleanup with MCP-owned cleanup only.
-- [ ] Remove default `pkill -9 atari800` behavior.
-- [ ] Add bounded stdout/stderr capture for Atari800 process.
-- [ ] Add graceful stop, then optional force stop.
-- [ ] Add stale MCP-owned runtime cleanup.
+- [x] Add MCP session object.
+- [x] Add managed runtime directory creation.
+- [x] Derive per-session AI command socket path.
+- [x] Derive per-session video push/pull socket paths.
+- [x] Add C CLI options for custom video push/pull socket paths, or another safe mechanism for per-session paths.
+- [x] Add `atari_status` with session state and effective launch details.
+- [x] Replace global fixed socket cleanup with MCP-owned cleanup only.
+- [x] Remove default `pkill -9 atari800` behavior.
+- [x] Add bounded stdout/stderr capture for Atari800 process.
+- [x] Add graceful stop, then optional force stop.
+- [x] Add stale MCP-owned runtime cleanup.
 
 ## 2.1 Session Object
 
@@ -386,12 +386,12 @@ Purpose: make the current interface honest before adding higher-level tools.
 
 Progress checklist:
 
-- [ ] Correct `README.md` AI command table.
-- [ ] Correct `src/ai_interface.h` command docs.
-- [ ] Correct `mcp-server/README.md` to match actual MCP tools or add missing tools first.
-- [ ] Fix or rename current `step` behavior.
-- [ ] Decide whether to implement or remove documented missing disk and breakpoint commands.
-- [ ] Add tests that compare documented command inventory to C dispatch and MCP tool list.
+- [x] Correct `README.md` AI command table.
+- [x] Correct `src/ai_interface.h` command docs.
+- [x] Correct `mcp-server/README.md` to match actual MCP tools or add missing tools first.
+- [x] Fix or rename current `step` behavior.
+- [x] Decide whether to implement or remove documented missing disk and breakpoint commands.
+- [x] Add tests that compare documented command inventory to C dispatch and MCP tool list.
 
 ## 3.1 Correct Current C API Documentation
 
@@ -460,18 +460,18 @@ Purpose: expose the stable existing socket commands through MCP before implement
 
 Progress checklist:
 
-- [ ] Add `atari_status`.
-- [ ] Add `atari_pause`.
-- [ ] Add `atari_load`.
-- [ ] Add `atari_screenshot`.
-- [ ] Add `atari_screen_raw`.
-- [ ] Add `atari_paddle`.
-- [ ] Add `atari_key_release`.
-- [ ] Add `atari_cpu_set` with safety notes.
-- [ ] Add `atari_debug_enable` and `atari_debug_read`.
-- [ ] Add video push/pull MCP tools.
-- [ ] Return structured JSON and a human-readable summary where useful.
-- [ ] Sync `mcp-server/README.md` with actual tool list.
+- [x] Add `atari_status`.
+- [x] Add `atari_pause`.
+- [x] Add `atari_load`.
+- [x] Add `atari_screenshot`.
+- [x] Add `atari_screen_raw`.
+- [x] Add `atari_paddle`.
+- [x] Add `atari_key_release`.
+- [x] Add `atari_cpu_set` with safety notes.
+- [x] Add `atari_debug_enable` and `atari_debug_read`.
+- [x] Add video push/pull MCP tools.
+- [x] Return structured JSON and a human-readable summary where useful.
+- [x] Sync `mcp-server/README.md` with actual tool list.
 
 ## 4.1 Existing C Commands to Expose
 
@@ -548,14 +548,14 @@ Purpose: make remote SSH/tmux/CI usage reliable while keeping visible mode avail
 
 Progress checklist:
 
-- [ ] Add `atari_preflight`.
-- [ ] Add expanded `atari_start` arguments.
-- [ ] Implement `display_mode`: `auto`, `headless`, `visible`.
-- [ ] Launch Xvfb directly for headless Linux/X11-compatible builds.
-- [ ] Track Xvfb process and cleanup ownership.
-- [ ] Add structured startup errors.
-- [ ] Add stdout/stderr ring buffer and log tools for emulator startup failures.
-- [ ] Return effective argv/display/audio/socket settings in `atari_status`.
+- [x] Add `atari_preflight`.
+- [x] Add expanded `atari_start` arguments.
+- [x] Implement `display_mode`: `auto`, `headless`, `visible`.
+- [x] Launch Xvfb directly for headless Linux/X11-compatible builds.
+- [x] Track Xvfb process and cleanup ownership.
+- [x] Add structured startup errors.
+- [x] Add stdout/stderr ring buffer and log tools for emulator startup failures.
+- [x] Return effective argv/display/audio/socket settings in `atari_status`.
 
 ## 5.1 `atari_preflight`
 
@@ -648,14 +648,14 @@ Purpose: add reliable AI debugger control without entering the interactive monit
 
 Progress checklist:
 
-- [ ] Add debugger capability reporting.
-- [ ] Add `debugger.show_state` / `atari_show_state`.
-- [ ] Identify the exact monitor/CPU execution path to reuse for true instruction stepping before implementing it.
-- [ ] Add true CPU instruction stepping.
-- [ ] Add continue/pause semantics.
-- [ ] Add simple break-on-PC and break-on-BRK.
-- [ ] Ensure AI breakpoint hits pause emulation and return JSON, not interactive monitor.
-- [ ] Add tests proving breakpoint hits do not enter `MONITOR_Run()` in AI mode.
+- [x] Add debugger capability reporting.
+- [x] Add `debugger.show_state` / `atari_show_state`.
+- [x] Identify the exact monitor/CPU execution path to reuse for true instruction stepping before implementing it.
+- [x] Add true CPU instruction stepping.
+- [x] Add continue/pause semantics.
+- [x] Add simple break-on-PC and break-on-BRK.
+- [x] Ensure AI breakpoint hits pause emulation and return JSON, not interactive monitor.
+- [x] Add tests proving breakpoint hits do not enter `MONITOR_Run()` in AI mode.
 
 ## 6.1 Capabilities
 
@@ -740,11 +740,11 @@ Purpose: expose monitor-aligned read-only debugger views and optional rich break
 
 Progress checklist:
 
-- [ ] Add read-only debugger views.
-- [ ] Add label support.
-- [ ] Add rich breakpoint table support when `MONITOR_BREAKPOINTS` is compiled in.
-- [ ] Add trace/profile/coverage tools only behind capability checks.
-- [ ] Keep unsafe monitor commands out of default MCP toolset.
+- [x] Add read-only debugger views.
+- [x] Add label support.
+- [x] Add rich breakpoint table support when `MONITOR_BREAKPOINTS` is compiled in.
+- [x] Add trace/profile/coverage tools only behind capability checks.
+- [x] Keep unsafe monitor commands out of default MCP toolset.
 
 ## 7.1 Read-Only Debugger Views
 
@@ -842,6 +842,15 @@ Do not expose by default:
 - arbitrary monitor file read/write commands
 
 If later exposed, require explicit `unsafe_debug=true` MCP server configuration.
+
+Phase 7 implementation notes:
+
+- Read-only monitor-aligned views are exposed through bounded JSON commands and MCP wrappers.
+- Label listing returns `CAPABILITY_UNAVAILABLE` unless `MONITOR_HINTS` is compiled in.
+- Rich breakpoint table commands return `CAPABILITY_UNAVAILABLE` unless `MONITOR_BREAKPOINTS` is compiled in.
+- Rich breakpoint slots are the monitor table slots; slots may be reused or compacted after delete.
+- Trace/profile/coverage tools remain excluded from the default MCP toolset; current capability flags are reported through debugger status/hello.
+- Unsafe monitor command execution is not exposed.
 
 ---
 

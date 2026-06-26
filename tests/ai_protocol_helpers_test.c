@@ -14,9 +14,13 @@
 static void test_json_object_validation(void)
 {
     assert(AI_JSON_IsValidObject("{\"cmd\":\"ping\"}"));
+    assert(AI_JSON_IsValidObject("  {\"cmd\":\"ping\",\"data\":[1,{\"x\":2}]}  "));
     assert(!AI_JSON_IsValidObject(""));
     assert(!AI_JSON_IsValidObject("[\"cmd\"]"));
     assert(!AI_JSON_IsValidObject("{\"cmd\":\"ping}"));
+    assert(!AI_JSON_IsValidObject("{\"cmd\":\"ping\"}]"));
+    assert(!AI_JSON_IsValidObject("{\"cmd\":\"ping\"} garbage"));
+    assert(!AI_JSON_IsValidObject("{\"cmd\":[1,2}"));
 }
 
 static void test_string_int_bool_fields(void)
@@ -39,6 +43,7 @@ static void test_string_int_bool_fields(void)
     assert(AI_JSON_GetBool(json, "enabled", &boolean, 0, 1) == AI_JSON_OK);
     assert(boolean == 1);
     assert(AI_JSON_GetBool(json, "frames", &boolean, 0, 1) == AI_JSON_BAD_TYPE);
+    assert(AI_JSON_GetBool("{\"enabled\":truex}", "enabled", &boolean, 0, 1) == AI_JSON_BAD_TYPE);
 }
 
 static void test_byte_array(void)
@@ -65,12 +70,35 @@ static void test_json_escaping(void)
     assert(strcmp(out, "\"quote=\\\" slash=\\\\ newline=\\n\"") == 0);
 }
 
+static void test_protocol_limits_and_errors(void)
+{
+    assert(AI_CommandLengthIsAllowed(1, AI_DEFAULT_MAX_COMMAND_BYTES + 1));
+    assert(AI_CommandLengthIsAllowed(AI_DEFAULT_MAX_COMMAND_BYTES, AI_DEFAULT_MAX_COMMAND_BYTES + 1));
+    assert(!AI_CommandLengthIsAllowed(0, AI_DEFAULT_MAX_COMMAND_BYTES + 1));
+    assert(!AI_CommandLengthIsAllowed(AI_DEFAULT_MAX_COMMAND_BYTES + 1, AI_DEFAULT_MAX_COMMAND_BYTES + 2));
+    assert(!AI_CommandLengthIsAllowed(16, 16));
+
+    assert(strcmp(AI_JSON_ErrorCode(AI_JSON_MISSING, 1), "MISSING_FIELD") == 0);
+    assert(strcmp(AI_JSON_ErrorCode(AI_JSON_BAD_TYPE, 1), "BAD_ARGUMENT") == 0);
+}
+
+static void test_safe_path_parent_refs(void)
+{
+    assert(AI_PathHasParentRef("../out.bin"));
+    assert(AI_PathHasParentRef("/tmp/../out.bin"));
+    assert(AI_PathHasParentRef("/tmp/dir/.."));
+    assert(!AI_PathHasParentRef("/tmp/dots..ok/out.bin"));
+    assert(!AI_PathHasParentRef("/tmp/dir/..hidden/out.bin"));
+}
+
 int main(void)
 {
     test_json_object_validation();
     test_string_int_bool_fields();
     test_byte_array();
     test_json_escaping();
+    test_protocol_limits_and_errors();
+    test_safe_path_parent_refs();
     puts("ai_protocol_helpers_test: ok");
     return 0;
 }

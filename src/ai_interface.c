@@ -34,6 +34,7 @@
 #include "binload.h"
 #include "sio.h"
 #include "statesav.h"
+#include "monitor.h"
 #include "log.h"
 #include "crc32.h"
 
@@ -41,8 +42,10 @@
 int AI_enabled = 0;
 int AI_debug_port = 0;
 char AI_socket_path[256] = AI_SOCKET_PATH;
-static char AI_artifact_dir[512] = "/tmp/atari800_ai_artifacts";
-static char AI_artifact_dir_resolved[512] = "/tmp/atari800_ai_artifacts";
+static char AI_video_push_socket_path[256] = "/tmp/atari800-fb-push.sock";
+static char AI_video_pull_socket_path[256] = "/tmp/atari800-fb-pull.sock";
+static char AI_artifact_dir[PATH_MAX] = "/tmp/atari800_ai_artifacts";
+static char AI_artifact_dir_resolved[PATH_MAX] = "/tmp/atari800_ai_artifacts";
 static int AI_unsafe_paths = 0;
 
 /* AI input overrides (-1 = no override) */
@@ -59,6 +62,15 @@ static int ai_steps_to_run = 0;
 static int ai_steps_requested = 0;
 static int AI_command_timeout_ms = 30000;
 static unsigned long long ai_command_deadline_us = 0;
+static int ai_async_response_pending = 0;
+static char ai_stopped_reason[32] = "manual_pause";
+static int ai_instruction_steps_to_run = 0;
+static int ai_instruction_steps_requested = 0;
+static int ai_break_pc_enabled = 0;
+static UWORD ai_break_pc_addr = 0;
+static int ai_break_brk_enabled = 0;
+static int ai_last_breakpoint_id = -1;
+static UWORD ai_last_stop_pc = 0;
 
 /* Debug output buffer */
 #define AI_DEBUG_BUFFER_SIZE 4096
@@ -69,9 +81,6 @@ static int ai_debug_buffer_pos = 0;
 static char ai_response[AI_MAX_RESPONSE];
 
 /* Frame streaming (RGB565 over UNIX sockets) */
-#define AI_FB_PUSH_SOCKET_PATH "/tmp/atari800-fb-push.sock"
-#define AI_FB_PULL_SOCKET_PATH "/tmp/atari800-fb-pull.sock"
-
 #define AI_FB_HEADER_SIZE 36
 #define AI_FB_PULL_REQ_SIZE 16
 
@@ -152,6 +161,9 @@ static void ai_fb_convert_surface_to_rgb565(const void *pixels, int width, int h
                                             unsigned int gmask, unsigned int bmask);
 static int ai_fb_init(void);
 static void ai_fb_shutdown(void);
+static void ai_set_stopped_reason(const char *reason);
+static void ai_send_debugger_break_response(const char *reason);
+static int ai_send_monitor_capture(void (*writer)(FILE *fp, void *ctx), void *ctx);
 
 /* Base64 encoding for binary data */
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -845,20 +857,20 @@ void AI_FrameStreamSubmitSurface(const void *pixels, int width, int height, int 
 
 static int ai_fb_init(void)
 {
-    ai_fb_push_server_fd = create_unix_server_socket(AI_FB_PUSH_SOCKET_PATH);
+    ai_fb_push_server_fd = create_unix_server_socket(AI_video_push_socket_path);
     if (ai_fb_push_server_fd < 0) {
-        Log_print("AI: Failed to create frame push socket %s: %s", AI_FB_PUSH_SOCKET_PATH, strerror(errno));
+        Log_print("AI: Failed to create frame push socket %s: %s", AI_video_push_socket_path, strerror(errno));
     }
     else {
-        Log_print("AI: Frame push socket listening on %s", AI_FB_PUSH_SOCKET_PATH);
+        Log_print("AI: Frame push socket listening on %s", AI_video_push_socket_path);
     }
 
-    ai_fb_pull_server_fd = create_unix_server_socket(AI_FB_PULL_SOCKET_PATH);
+    ai_fb_pull_server_fd = create_unix_server_socket(AI_video_pull_socket_path);
     if (ai_fb_pull_server_fd < 0) {
-        Log_print("AI: Failed to create frame pull socket %s: %s", AI_FB_PULL_SOCKET_PATH, strerror(errno));
+        Log_print("AI: Failed to create frame pull socket %s: %s", AI_video_pull_socket_path, strerror(errno));
     }
     else {
-        Log_print("AI: Frame pull socket listening on %s", AI_FB_PULL_SOCKET_PATH);
+        Log_print("AI: Frame pull socket listening on %s", AI_video_pull_socket_path);
     }
 
     return ai_fb_push_server_fd >= 0 || ai_fb_pull_server_fd >= 0;
@@ -877,8 +889,8 @@ static void ai_fb_shutdown(void)
         close(ai_fb_pull_server_fd);
         ai_fb_pull_server_fd = -1;
     }
-    unlink(AI_FB_PUSH_SOCKET_PATH);
-    unlink(AI_FB_PULL_SOCKET_PATH);
+        unlink(AI_video_push_socket_path);
+        unlink(AI_video_pull_socket_path);
 
     free(ai_fb_buf_a);
     free(ai_fb_buf_b);
@@ -965,6 +977,62 @@ void AI_DebugWrite(UBYTE byte) {
     if (ai_debug_buffer_pos < AI_DEBUG_BUFFER_SIZE) {
         ai_debug_buffer[ai_debug_buffer_pos++] = byte;
     }
+}
+
+int AI_DebuggerShouldBreakPC(UWORD pc)
+{
+    return AI_enabled && ai_break_pc_enabled && pc == ai_break_pc_addr;
+}
+
+int AI_DebuggerShouldBreakBRK(void)
+{
+    return AI_enabled && ai_break_brk_enabled;
+}
+
+int AI_DebuggerBreak(const char *reason, int breakpoint_id)
+{
+    if (!AI_enabled)
+        return FALSE;
+
+    if (strcmp(reason, "instruction_limit") == 0) {
+        if (ai_instruction_steps_to_run > 0)
+            ai_instruction_steps_to_run--;
+        if (ai_instruction_steps_to_run > 0) {
+            return TRUE;
+        }
+#ifdef MONITOR_BREAK
+        MONITOR_break_step = FALSE;
+#endif
+        ai_paused = 1;
+        ai_last_breakpoint_id = breakpoint_id;
+        ai_set_stopped_reason("instruction_limit");
+        ai_command_deadline_us = 0;
+        if (ai_async_response_pending) {
+            ai_async_response_pending = 0;
+            ai_send_debugger_break_response("instruction_limit");
+        }
+        return TRUE;
+    }
+
+    if (strcmp(reason, "breakpoint_pc") == 0 || strcmp(reason, "breakpoint_brk") == 0) {
+#ifdef MONITOR_BREAK
+        MONITOR_break_step = FALSE;
+#endif
+        ai_frames_to_run = 0;
+        ai_steps_to_run = 0;
+        ai_instruction_steps_to_run = 0;
+        ai_command_deadline_us = 0;
+        ai_paused = 1;
+        ai_last_breakpoint_id = breakpoint_id;
+        ai_set_stopped_reason(reason);
+        if (ai_async_response_pending) {
+            ai_async_response_pending = 0;
+            ai_send_debugger_break_response(reason);
+        }
+        return TRUE;
+    }
+
+    return FALSE;
 }
 
 /* Screen to ASCII conversion */
@@ -1081,6 +1149,384 @@ static void ai_send_ok_path(const char *path)
     AI_SendResponse(ai_response);
 }
 
+static void ai_set_stopped_reason(const char *reason)
+{
+    if (reason == NULL || reason[0] == '\0')
+        reason = "manual_pause";
+    strncpy(ai_stopped_reason, reason, sizeof(ai_stopped_reason) - 1);
+    ai_stopped_reason[sizeof(ai_stopped_reason) - 1] = '\0';
+    CPU_GetStatus();
+    ai_last_stop_pc = CPU_regPC;
+}
+
+static void ai_append_cpu_state(char *buf, size_t bufsize, size_t *pos)
+{
+    CPU_GetStatus();
+    ai_append(buf, bufsize, pos,
+        "\"cpu\":{\"pc\":%u,\"a\":%u,\"x\":%u,\"y\":%u,\"sp\":%u,\"p\":%u,"
+        "\"n\":%d,\"v\":%d,\"b\":%d,\"d\":%d,\"i\":%d,\"z\":%d,\"c\":%d}",
+        CPU_regPC, CPU_regA, CPU_regX, CPU_regY, CPU_regS, CPU_regP,
+        (CPU_regP & CPU_N_FLAG) ? 1 : 0,
+        (CPU_regP & CPU_V_FLAG) ? 1 : 0,
+        (CPU_regP & CPU_B_FLAG) ? 1 : 0,
+        (CPU_regP & CPU_D_FLAG) ? 1 : 0,
+        (CPU_regP & CPU_I_FLAG) ? 1 : 0,
+        (CPU_regP & CPU_Z_FLAG) ? 1 : 0,
+        (CPU_regP & CPU_C_FLAG) ? 1 : 0);
+}
+
+static void ai_send_debugger_state(const char *status)
+{
+    size_t pos = 0;
+
+    ai_response[0] = '\0';
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        "{\"status\":\"%s\",\"debugger\":{\"paused\":%s,\"stopped_reason\":",
+        status != NULL ? status : "ok", ai_paused ? "true" : "false");
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, ai_stopped_reason);
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"last_breakpoint_id\":%d,\"last_stop_pc\":%u,"
+        "\"breakpoints\":{\"pc\":{\"enabled\":%s,\"addr\":%u},\"brk\":{\"enabled\":%s}},"
+        "\"instruction_step\":{\"remaining\":%d,\"requested\":%d},"
+        "\"capabilities\":{\"instruction_step\":",
+        ai_last_breakpoint_id, ai_last_stop_pc,
+        ai_break_pc_enabled ? "true" : "false", ai_break_pc_addr,
+        ai_break_brk_enabled ? "true" : "false",
+        ai_instruction_steps_to_run, ai_instruction_steps_requested);
+#ifdef MONITOR_BREAK
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"monitor_break\":");
+#ifdef MONITOR_BREAK
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"monitor_breakpoints\":");
+#ifdef MONITOR_BREAKPOINTS
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"monitor_assembler\":");
+#ifdef MONITOR_ASSEMBLER
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"monitor_hints\":");
+#ifdef MONITOR_HINTS
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"monitor_trace\":");
+#ifdef MONITOR_TRACE
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"monitor_profile\":");
+#ifdef MONITOR_PROFILE
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"history\":");
+#ifdef MONITOR_BREAK
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos, "}},");
+    ai_append_cpu_state(ai_response, sizeof(ai_response), &pos);
+    ai_append(ai_response, sizeof(ai_response), &pos, "}");
+    AI_SendResponse(ai_response);
+}
+
+static void ai_send_debugger_break_response(const char *reason)
+{
+    ai_set_stopped_reason(reason);
+    ai_send_debugger_state("ok");
+}
+
+typedef struct {
+    UWORD addr;
+    int count;
+} ai_monitor_range_ctx;
+
+static char ai_screen_to_asc(char c)
+{
+    char bit7 = c & 0x80;
+    c &= 0x7f;
+    if (c < 32)
+        c += 64;
+    else if (c < 96)
+        c -= 32;
+    return c | bit7;
+}
+
+static void ai_write_history(FILE *fp, void *ctx)
+{
+    (void)ctx;
+    MONITOR_ShowHistory(fp);
+}
+
+static void ai_write_jumps(FILE *fp, void *ctx)
+{
+    (void)ctx;
+    MONITOR_ShowLastJumps(fp);
+}
+
+static void ai_write_stack(FILE *fp, void *ctx)
+{
+    ai_monitor_range_ctx *range = (ai_monitor_range_ctx *)ctx;
+    CPU_GetStatus();
+    MONITOR_ShowStack(fp, CPU_regS, range != NULL ? range->count : 16);
+}
+
+static void ai_write_disassemble(FILE *fp, void *ctx)
+{
+    ai_monitor_range_ctx *range = (ai_monitor_range_ctx *)ctx;
+    MONITOR_Disassemble(fp, range->addr, range->count);
+}
+
+static void ai_write_disassemble_loop(FILE *fp, void *ctx)
+{
+    ai_monitor_range_ctx *range = (ai_monitor_range_ctx *)ctx;
+    MONITOR_DisassembleLoop(fp, range->addr);
+}
+
+static void ai_write_dlist(FILE *fp, void *ctx)
+{
+    ai_monitor_range_ctx *range = (ai_monitor_range_ctx *)ctx;
+    MONITOR_ShowDisplayList(fp, range->addr, range->count);
+}
+
+static void ai_write_labels(FILE *fp, void *ctx)
+{
+    ai_monitor_range_ctx *range = (ai_monitor_range_ctx *)ctx;
+#ifdef MONITOR_HINTS
+    MONITOR_ShowLabels(fp, TRUE, range != NULL ? range->count : 256);
+#else
+    (void)fp;
+    (void)range;
+#endif
+}
+
+static int ai_send_monitor_capture(void (*writer)(FILE *fp, void *ctx), void *ctx)
+{
+    FILE *fp;
+    char line[512];
+    size_t pos = 0;
+    int count = 0;
+
+    fp = tmpfile();
+    if (fp == NULL) {
+        ai_send_error("IO_ERROR", "failed to allocate monitor capture buffer", NULL);
+        return FALSE;
+    }
+    writer(fp, ctx);
+    fflush(fp);
+    rewind(fp);
+
+    ai_response[0] = '\0';
+    if (!ai_append(ai_response, sizeof(ai_response), &pos, "{\"status\":\"ok\",\"lines\":[")) {
+        fclose(fp);
+        return FALSE;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL && pos < sizeof(ai_response) - 256) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (count > 0 && !ai_append(ai_response, sizeof(ai_response), &pos, ",")) {
+            fclose(fp);
+            return FALSE;
+        }
+        if (!AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, line)) {
+            fclose(fp);
+            return FALSE;
+        }
+        count++;
+    }
+    fclose(fp);
+    if (!ai_append(ai_response, sizeof(ai_response), &pos, "],\"count\":%d}", count))
+        return FALSE;
+    AI_SendResponse(ai_response);
+    return TRUE;
+}
+
+static void ai_send_memory_search(int start_addr, int end_addr, const UBYTE *pattern, int pattern_len)
+{
+    size_t pos = 0;
+    int found = 0;
+    int a;
+
+    ai_response[0] = '\0';
+    if (pattern_len <= 0) {
+        ai_send_error("BAD_ARGUMENT", "pattern must not be empty", "pattern");
+        return;
+    }
+    ai_append(ai_response, sizeof(ai_response), &pos, "{\"status\":\"ok\",\"matches\":[");
+    for (a = start_addr; a <= end_addr && found < 1024; a++) {
+        int i;
+        if (a + pattern_len - 1 > end_addr)
+            break;
+        for (i = 0; i < pattern_len; i++) {
+            if (MEMORY_SafeGetByte((UWORD)(a + i)) != pattern[i])
+                break;
+        }
+        if (i == pattern_len) {
+            ai_append(ai_response, sizeof(ai_response), &pos, "%s%d", found ? "," : "", a);
+            found++;
+        }
+    }
+    ai_append(ai_response, sizeof(ai_response), &pos, "],\"count\":%d,\"truncated\":%s}", found, found >= 1024 ? "true" : "false");
+    AI_SendResponse(ai_response);
+}
+
+#ifdef MONITOR_BREAKPOINTS
+static const char *ai_breakpoint_condition_name(UWORD condition)
+{
+    switch (condition & ~(MONITOR_BREAKPOINT_LESS | MONITOR_BREAKPOINT_EQUAL | MONITOR_BREAKPOINT_GREATER)) {
+    case MONITOR_BREAKPOINT_PC: return "PC";
+    case MONITOR_BREAKPOINT_A: return "A";
+    case MONITOR_BREAKPOINT_X: return "X";
+    case MONITOR_BREAKPOINT_Y: return "Y";
+    case MONITOR_BREAKPOINT_S: return "S";
+    case MONITOR_BREAKPOINT_READ: return "READ";
+    case MONITOR_BREAKPOINT_WRITE: return "WRITE";
+    case MONITOR_BREAKPOINT_ACCESS: return "ACCESS";
+    case MONITOR_BREAKPOINT_MEMORY: return "MEM";
+    default: return "UNKNOWN";
+    }
+}
+
+static int ai_breakpoint_operator_bits(const char *op)
+{
+    if (op == NULL || op[0] == '\0' || strcmp(op, "=") == 0 || strcmp(op, "==") == 0)
+        return MONITOR_BREAKPOINT_EQUAL;
+    if (strcmp(op, "<") == 0)
+        return MONITOR_BREAKPOINT_LESS;
+    if (strcmp(op, ">") == 0)
+        return MONITOR_BREAKPOINT_GREATER;
+    if (strcmp(op, "<=") == 0)
+        return MONITOR_BREAKPOINT_LESS | MONITOR_BREAKPOINT_EQUAL;
+    if (strcmp(op, ">=") == 0)
+        return MONITOR_BREAKPOINT_GREATER | MONITOR_BREAKPOINT_EQUAL;
+    if (strcmp(op, "!=") == 0)
+        return MONITOR_BREAKPOINT_LESS | MONITOR_BREAKPOINT_GREATER;
+    return 0;
+}
+
+static int ai_breakpoint_type_bits(const char *type)
+{
+    if (strcmp(type, "PC") == 0) return MONITOR_BREAKPOINT_PC;
+    if (strcmp(type, "A") == 0) return MONITOR_BREAKPOINT_A;
+    if (strcmp(type, "X") == 0) return MONITOR_BREAKPOINT_X;
+    if (strcmp(type, "Y") == 0) return MONITOR_BREAKPOINT_Y;
+    if (strcmp(type, "S") == 0) return MONITOR_BREAKPOINT_S;
+    if (strcmp(type, "READ") == 0) return MONITOR_BREAKPOINT_READ;
+    if (strcmp(type, "WRITE") == 0) return MONITOR_BREAKPOINT_WRITE;
+    if (strcmp(type, "ACCESS") == 0) return MONITOR_BREAKPOINT_ACCESS;
+    if (strcmp(type, "MEM") == 0) return MONITOR_BREAKPOINT_MEMORY;
+    return 0;
+}
+
+static int ai_parse_hex_value(const char *s, int *value)
+{
+    char *endptr;
+    long parsed;
+    if (s == NULL || s[0] == '\0')
+        return FALSE;
+    if (s[0] == '$')
+        s++;
+    parsed = strtol(s, &endptr, 16);
+    if (*endptr != '\0' || parsed < 0 || parsed > 0xffff)
+        return FALSE;
+    *value = (int)parsed;
+    return TRUE;
+}
+
+static int ai_parse_breakpoint_condition_string(const char *text, UWORD *condition, UWORD *value, UWORD *m_addr)
+{
+    char buf[96];
+    char type[16];
+    char op[3] = "=";
+    char *p;
+    char *v;
+    int addr_value = 0;
+    int parsed_value = 0;
+    int type_bits;
+    int op_bits;
+
+    strncpy(buf, text, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    p = buf;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    v = strpbrk(p, "<>!=");
+    if (v == NULL)
+        return FALSE;
+    if (v[0] != '\0' && v[1] == '=') {
+        op[0] = v[0];
+        op[1] = '=';
+        op[2] = '\0';
+        *v++ = '\0';
+        *v++ = '\0';
+    }
+    else {
+        op[0] = *v;
+        op[1] = '\0';
+        *v++ = '\0';
+    }
+    if (strncmp(p, "MEM:", 4) == 0) {
+        strcpy(type, "MEM");
+        if (!ai_parse_hex_value(p + 4, &addr_value))
+            return FALSE;
+    }
+    else {
+        snprintf(type, sizeof(type), "%s", p);
+    }
+    type_bits = ai_breakpoint_type_bits(type);
+    op_bits = ai_breakpoint_operator_bits(op);
+    if (type_bits == 0 || op_bits == 0 || !ai_parse_hex_value(v, &parsed_value))
+        return FALSE;
+    *condition = (UWORD)(type_bits | op_bits);
+    *value = (UWORD)parsed_value;
+    *m_addr = (UWORD)addr_value;
+    return TRUE;
+}
+
+static void ai_send_breakpoint_table(void)
+{
+    size_t pos = 0;
+    int i;
+    ai_response[0] = '\0';
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        "{\"status\":\"ok\",\"enabled\":%s,\"size\":%d,\"max\":%d,\"breakpoints\":[",
+        MONITOR_breakpoints_enabled ? "true" : "false", MONITOR_breakpoint_table_size, MONITOR_BREAKPOINT_TABLE_MAX);
+    for (i = 0; i < MONITOR_breakpoint_table_size; i++) {
+        MONITOR_breakpoint_cond *bp = &MONITOR_breakpoint_table[i];
+        ai_append(ai_response, sizeof(ai_response), &pos,
+            "%s{\"id\":%d,\"slot\":%d,\"enabled\":%s,\"condition\":\"%s\",\"raw_condition\":%u,\"value\":%u,\"m_addr\":%u}",
+            i ? "," : "", i, i, bp->enabled ? "true" : "false",
+            ai_breakpoint_condition_name(bp->condition), bp->condition, bp->value, bp->m_addr);
+    }
+    ai_append(ai_response, sizeof(ai_response), &pos, "]}");
+    AI_SendResponse(ai_response);
+}
+#endif
+
 static int ai_ensure_dir(const char *path)
 {
     if (mkdir(path, 0700) == 0 || errno == EEXIST)
@@ -1090,7 +1536,7 @@ static int ai_ensure_dir(const char *path)
 
 static int ai_refresh_artifact_dir(void)
 {
-    char resolved[sizeof(AI_artifact_dir_resolved)];
+    char resolved[PATH_MAX];
 
     if (!ai_ensure_dir(AI_artifact_dir)) {
         Log_print("AI: failed to create artifact dir %s: %s", AI_artifact_dir, strerror(errno));
@@ -1107,22 +1553,14 @@ static int ai_refresh_artifact_dir(void)
 
 static int ai_path_has_parent_ref(const char *path)
 {
-    const char *p = path;
-    while ((p = strstr(p, "..")) != NULL) {
-        int before = (p == path || p[-1] == '/');
-        int after = (p[2] == '\0' || p[2] == '/');
-        if (before && after)
-            return TRUE;
-        p += 2;
-    }
-    return FALSE;
+    return AI_PathHasParentRef(path) ? TRUE : FALSE;
 }
 
 static int ai_validate_output_path(const char *path, const char *field)
 {
-    char parent[512];
+    char parent[PATH_MAX];
     char *slash;
-    char resolved_parent[512];
+    char resolved_parent[PATH_MAX];
     size_t root_len;
 
     if (path == NULL || path[0] == '\0') {
@@ -1199,6 +1637,12 @@ static void ai_send_hello(void)
 #else
     ai_append(ai_response, sizeof(ai_response), &pos, "false");
 #endif
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"monitor_hints\":");
+#ifdef MONITOR_HINTS
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
     ai_append(ai_response, sizeof(ai_response), &pos, ",\"monitor_trace\":");
 #ifdef MONITOR_TRACE
     ai_append(ai_response, sizeof(ai_response), &pos, "true");
@@ -1219,21 +1663,33 @@ static void ai_send_hello(void)
     ai_append(ai_response, sizeof(ai_response), &pos, ",\"unsafe_paths\":%s},\"sockets\":{\"command\":", AI_unsafe_paths ? "true" : "false");
     AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_socket_path);
     ai_append(ai_response, sizeof(ai_response), &pos, ",\"video_push\":");
-    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_FB_PUSH_SOCKET_PATH);
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_video_push_socket_path);
     ai_append(ai_response, sizeof(ai_response), &pos, ",\"video_pull\":");
-    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_FB_PULL_SOCKET_PATH);
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_video_pull_socket_path);
     ai_append(ai_response, sizeof(ai_response), &pos,
-        "},\"commands\":[\"ping\",\"hello\",\"capabilities\",\"load\",\"run\",\"step\","
+        "},\"commands\":[\"ping\",\"hello\",\"capabilities\",\"load\",\"run\",\"frame_step\",\"step\","
         "\"pause\",\"reset\",\"key\",\"key_release\",\"joystick\",\"paddle\",\"consol\","
-        "\"screenshot\",\"screen_ascii\",\"screen_raw\",\"video.status\",\"peek\",\"poke\","
+        "\"screenshot\",\"screen_ascii\",\"screen_raw\",\"video.enable_push\",\"video.disable_push\","
+        "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\","
+        "\"video.push.set_frameskip\",\"video.push.enable_change_triggered\",\"video.status\",\"peek\",\"poke\","
         "\"dump\",\"cpu\",\"cpu_set\",\"antic\",\"gtia\",\"pokey\",\"pia\","
-        "\"debug_enable\",\"debug_read\",\"save_state\",\"load_state\"],"
+        "\"debug_enable\",\"debug_read\",\"debugger.status\",\"debugger.show_state\",\"debugger.step_instruction\","
+        "\"debugger.history\",\"debugger.jumps\",\"debugger.stack\",\"debugger.disassemble\",\"debugger.disassemble_loop\","
+        "\"debugger.dlist\",\"debugger.search_memory\",\"debugger.search_string\",\"debugger.search_screencode_string\",\"debugger.labels\","
+        "\"debugger.continue\",\"breakpoint.pc\",\"breakpoint.brk\",\"breakpoint.status\",\"breakpoint.clear\","
+        "\"breakpoint.list\",\"breakpoint.add\",\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\","
+        "\"save_state\",\"load_state\"],"
         "\"command_classes\":{\"read_only\":[\"ping\",\"hello\",\"capabilities\",\"screen_ascii\",\"screen_raw\","
-        "\"video.status\",\"peek\",\"cpu\",\"antic\",\"gtia\",\"pokey\",\"pia\",\"debug_read\"],"
-        "\"mutating\":[\"load\",\"run\",\"step\",\"pause\",\"reset\",\"key\",\"key_release\","
+        "\"video.status\",\"peek\",\"cpu\",\"antic\",\"gtia\",\"pokey\",\"pia\",\"debug_read\","
+        "\"debugger.status\",\"debugger.show_state\",\"debugger.history\",\"debugger.jumps\",\"debugger.stack\","
+        "\"debugger.disassemble\",\"debugger.disassemble_loop\",\"debugger.dlist\",\"debugger.search_memory\","
+        "\"debugger.search_string\",\"debugger.search_screencode_string\",\"debugger.labels\",\"breakpoint.status\",\"breakpoint.list\"],"
+        "\"mutating\":[\"load\",\"run\",\"frame_step\",\"step\",\"pause\",\"reset\",\"key\",\"key_release\","
         "\"joystick\",\"paddle\",\"consol\",\"screenshot\",\"video.enable_push\",\"video.disable_push\","
         "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\",\"video.push.set_frameskip\","
-        "\"video.push.enable_change_triggered\",\"dump\",\"debug_enable\",\"save_state\",\"load_state\"],"
+        "\"video.push.enable_change_triggered\",\"dump\",\"debug_enable\",\"debugger.step_instruction\","
+        "\"debugger.continue\",\"breakpoint.pc\",\"breakpoint.brk\",\"breakpoint.clear\",\"breakpoint.add\","
+        "\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\",\"save_state\",\"load_state\"],"
         "\"unsafe\":[\"poke\",\"cpu_set\"]}}");
     AI_SendResponse(ai_response);
 }
@@ -1241,7 +1697,7 @@ static void ai_send_hello(void)
 /* Process a command */
 static void process_command(const char *cmd) {
     char cmd_type[64] = "";
-    char path[512] = "";
+    char path[PATH_MAX] = "";
     int rc;
 
     if (!AI_JSON_IsValidObject(cmd)) {
@@ -1281,23 +1737,29 @@ static void process_command(const char *cmd) {
             return;
         }
         ai_frames_requested = ai_frames_to_run;
+        ai_async_response_pending = 1;
         ai_command_deadline_us = AI_command_timeout_ms > 0 ? monotonic_us() + (unsigned long long)AI_command_timeout_ms * 1000ULL : 0;
         ai_paused = 0;
         /* Response sent after frames complete */
     }
-    else if (strcmp(cmd_type, "step") == 0) {
-        rc = AI_JSON_GetInt(cmd, "instructions", &ai_steps_to_run, 1, FALSE, 1, 1000000);
+    else if (strcmp(cmd_type, "frame_step") == 0 || strcmp(cmd_type, "step") == 0) {
+        int deprecated_step = strcmp(cmd_type, "step") == 0;
+        const char *count_field = deprecated_step ? "instructions" : "frames";
+        rc = AI_JSON_GetInt(cmd, count_field, &ai_steps_to_run, 1, FALSE, 1, 1000000);
         if (rc != AI_JSON_OK) {
-            ai_send_validation_error(rc, "instructions", FALSE);
+            ai_send_validation_error(rc, count_field, FALSE);
             return;
         }
         ai_steps_requested = ai_steps_to_run;
+        ai_async_response_pending = 1;
         ai_command_deadline_us = AI_command_timeout_ms > 0 ? monotonic_us() + (unsigned long long)AI_command_timeout_ms * 1000ULL : 0;
         ai_paused = 0;
         /* Response sent after steps complete */
     }
     else if (strcmp(cmd_type, "pause") == 0) {
         ai_paused = 1;
+        ai_async_response_pending = 0;
+        ai_set_stopped_reason("manual_pause");
         ai_send_ok();
     }
     else if (strcmp(cmd_type, "reset") == 0) {
@@ -1487,7 +1949,7 @@ static void process_command(const char *cmd) {
             "\"fps_cap\":%d,\"send_every_n_frames\":%d,"
             "\"change_triggered\":%s,"
             "\"width\":%d,\"height\":%d,\"stride\":%u,\"frame_no\":%u}",
-            AI_FB_PUSH_SOCKET_PATH, AI_FB_PULL_SOCKET_PATH,
+            AI_video_push_socket_path, AI_video_pull_socket_path,
             ai_fb_push_enabled ? "true" : "false",
             ai_fb_pull_enabled ? "true" : "false",
             ai_fb_fps_cap, ai_fb_send_every_n_frames,
@@ -1681,6 +2143,252 @@ static void process_command(const char *cmd) {
         ai_debug_buffer_pos = 0;
         AI_SendResponse(ai_response);
     }
+    else if (strcmp(cmd_type, "debugger.status") == 0 || strcmp(cmd_type, "debugger.show_state") == 0) {
+        ai_send_debugger_state("ok");
+    }
+    else if (strcmp(cmd_type, "debugger.history") == 0) {
+        ai_send_monitor_capture(ai_write_history, NULL);
+    }
+    else if (strcmp(cmd_type, "debugger.jumps") == 0) {
+        ai_send_monitor_capture(ai_write_jumps, NULL);
+    }
+    else if (strcmp(cmd_type, "debugger.stack") == 0) {
+        ai_monitor_range_ctx range;
+        rc = AI_JSON_GetInt(cmd, "count", &range.count, 16, FALSE, 1, 256);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "count", FALSE); return; }
+        range.addr = 0;
+        ai_send_monitor_capture(ai_write_stack, &range);
+    }
+    else if (strcmp(cmd_type, "debugger.disassemble") == 0) {
+        ai_monitor_range_ctx range;
+        int addr_default;
+        CPU_GetStatus();
+        addr_default = CPU_regPC;
+        rc = AI_JSON_GetInt(cmd, "addr", &addr_default, addr_default, FALSE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "addr", FALSE); return; }
+        rc = AI_JSON_GetInt(cmd, "count", &range.count, 24, FALSE, 1, 256);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "count", FALSE); return; }
+        range.addr = (UWORD)addr_default;
+        ai_send_monitor_capture(ai_write_disassemble, &range);
+    }
+    else if (strcmp(cmd_type, "debugger.disassemble_loop") == 0) {
+        ai_monitor_range_ctx range;
+        int addr_default;
+        CPU_GetStatus();
+        addr_default = CPU_regPC;
+        rc = AI_JSON_GetInt(cmd, "addr", &addr_default, addr_default, FALSE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "addr", FALSE); return; }
+        range.addr = (UWORD)addr_default;
+        range.count = 24;
+        ai_send_monitor_capture(ai_write_disassemble_loop, &range);
+    }
+    else if (strcmp(cmd_type, "debugger.dlist") == 0) {
+        ai_monitor_range_ctx range;
+        int addr = ANTIC_dlist;
+        rc = AI_JSON_GetInt(cmd, "addr", &addr, addr, FALSE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "addr", FALSE); return; }
+        rc = AI_JSON_GetInt(cmd, "count", &range.count, 64, FALSE, 1, 512);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "count", FALSE); return; }
+        range.addr = (UWORD)addr;
+        ai_send_monitor_capture(ai_write_dlist, &range);
+    }
+    else if (strcmp(cmd_type, "debugger.search_memory") == 0) {
+        int start_addr;
+        int end_addr;
+        int count;
+        UBYTE pattern[64];
+        rc = AI_JSON_GetInt(cmd, "start", &start_addr, 0, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "start", TRUE); return; }
+        rc = AI_JSON_GetInt(cmd, "end", &end_addr, 0xFFFF, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "end", TRUE); return; }
+        if (end_addr < start_addr) { ai_send_error("BAD_ARGUMENT", "end must be greater than or equal to start", "end"); return; }
+        rc = AI_JSON_GetByteArray(cmd, "pattern", pattern, sizeof(pattern), &count, TRUE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "pattern", TRUE); return; }
+        ai_send_memory_search(start_addr, end_addr, pattern, count);
+    }
+    else if (strcmp(cmd_type, "debugger.search_string") == 0 || strcmp(cmd_type, "debugger.search_screencode_string") == 0) {
+        int start_addr;
+        int end_addr;
+        char needle[256];
+        UBYTE pattern[256];
+        int i;
+        int screencode = strcmp(cmd_type, "debugger.search_screencode_string") == 0;
+        rc = AI_JSON_GetInt(cmd, "start", &start_addr, 0, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "start", TRUE); return; }
+        rc = AI_JSON_GetInt(cmd, "end", &end_addr, 0xFFFF, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "end", TRUE); return; }
+        if (end_addr < start_addr) { ai_send_error("BAD_ARGUMENT", "end must be greater than or equal to start", "end"); return; }
+        rc = AI_JSON_GetString(cmd, "text", needle, sizeof(needle), TRUE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "text", TRUE); return; }
+        if (needle[0] == '\0') { ai_send_error("BAD_ARGUMENT", "text must not be empty", "text"); return; }
+        for (i = 0; needle[i] != '\0'; i++)
+            pattern[i] = screencode ? (UBYTE)ai_screen_to_asc(needle[i]) : (UBYTE)needle[i];
+        ai_send_memory_search(start_addr, end_addr, pattern, i);
+    }
+    else if (strcmp(cmd_type, "debugger.labels") == 0) {
+        ai_monitor_range_ctx range;
+        rc = AI_JSON_GetInt(cmd, "limit", &range.count, 256, FALSE, 1, 4096);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "limit", FALSE); return; }
+        range.addr = 0;
+#ifdef MONITOR_HINTS
+        ai_send_monitor_capture(ai_write_labels, &range);
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "labels require MONITOR_HINTS", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "debugger.step_instruction") == 0) {
+        int instructions;
+        rc = AI_JSON_GetInt(cmd, "instructions", &instructions, 1, FALSE, 1, 1000000);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "instructions", FALSE); return; }
+#ifdef MONITOR_BREAK
+        ai_instruction_steps_to_run = instructions;
+        ai_instruction_steps_requested = instructions;
+        ai_async_response_pending = 1;
+        ai_command_deadline_us = AI_command_timeout_ms > 0 ? monotonic_us() + (unsigned long long)AI_command_timeout_ms * 1000ULL : 0;
+        MONITOR_break_step = TRUE;
+        ai_paused = 0;
+        /* Response sent after the requested instruction count completes. */
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "instruction stepping requires MONITOR_BREAK", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "debugger.continue") == 0) {
+        ai_async_response_pending = 0;
+        ai_set_stopped_reason("running");
+        ai_paused = 0;
+        ai_send_debugger_state("ok");
+    }
+    else if (strcmp(cmd_type, "breakpoint.pc") == 0) {
+        int addr;
+        int enabled;
+        rc = AI_JSON_GetBool(cmd, "enabled", &enabled, 1, FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "enabled", FALSE); return; }
+        rc = AI_JSON_GetInt(cmd, "addr", &addr, ai_break_pc_addr, enabled ? TRUE : FALSE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "addr", enabled ? TRUE : FALSE); return; }
+        ai_break_pc_enabled = enabled;
+        if (enabled)
+            ai_break_pc_addr = (UWORD)addr;
+        ai_send_debugger_state("ok");
+    }
+    else if (strcmp(cmd_type, "breakpoint.brk") == 0) {
+        int enabled;
+        rc = AI_JSON_GetBool(cmd, "enabled", &enabled, 1, FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "enabled", FALSE); return; }
+        ai_break_brk_enabled = enabled;
+        ai_send_debugger_state("ok");
+    }
+    else if (strcmp(cmd_type, "breakpoint.status") == 0) {
+        ai_send_debugger_state("ok");
+    }
+    else if (strcmp(cmd_type, "breakpoint.list") == 0) {
+#ifdef MONITOR_BREAKPOINTS
+        ai_send_breakpoint_table();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "rich breakpoint table requires MONITOR_BREAKPOINTS", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "breakpoint.add") == 0) {
+#ifdef MONITOR_BREAKPOINTS
+        int slot;
+        int value = 0;
+        int m_addr = 0;
+        char condition_text[96] = "";
+        char condition_type[16] = "";
+        char op[3] = "=";
+        UWORD condition;
+        UWORD bp_value;
+        UWORD bp_m_addr;
+        if (MONITOR_breakpoint_table_size >= MONITOR_BREAKPOINT_TABLE_MAX) {
+            ai_send_error("LIMIT_EXCEEDED", "breakpoint table is full", NULL);
+            return;
+        }
+        rc = AI_JSON_GetString(cmd, "condition", condition_text, sizeof(condition_text), FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "condition", FALSE); return; }
+        if (condition_text[0] != '\0') {
+            if (!ai_parse_breakpoint_condition_string(condition_text, &condition, &bp_value, &bp_m_addr)) {
+                ai_send_error("BAD_ARGUMENT", "condition string is invalid", "condition");
+                return;
+            }
+        }
+        else {
+            int type_bits;
+            int op_bits;
+            rc = AI_JSON_GetString(cmd, "condition_type", condition_type, sizeof(condition_type), TRUE);
+            if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "condition_type", TRUE); return; }
+            rc = AI_JSON_GetString(cmd, "operator", op, sizeof(op), FALSE);
+            if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "operator", FALSE); return; }
+            rc = AI_JSON_GetInt(cmd, "value", &value, 0, TRUE, 0, 0xFFFF);
+            if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "value", TRUE); return; }
+            rc = AI_JSON_GetInt(cmd, "m_addr", &m_addr, 0, FALSE, 0, 0xFFFF);
+            if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "m_addr", FALSE); return; }
+            type_bits = ai_breakpoint_type_bits(condition_type);
+            op_bits = ai_breakpoint_operator_bits(op);
+            if (type_bits == 0) { ai_send_error("BAD_ARGUMENT", "condition_type is invalid", "condition_type"); return; }
+            if (op_bits == 0) { ai_send_error("BAD_ARGUMENT", "operator is invalid", "operator"); return; }
+            condition = (UWORD)(type_bits | op_bits);
+            bp_value = (UWORD)value;
+            bp_m_addr = (UWORD)m_addr;
+        }
+        slot = MONITOR_breakpoint_table_size++;
+        MONITOR_breakpoint_table[slot].enabled = TRUE;
+        MONITOR_breakpoint_table[slot].condition = condition;
+        MONITOR_breakpoint_table[slot].value = bp_value;
+        MONITOR_breakpoint_table[slot].m_addr = bp_m_addr;
+        ai_send_breakpoint_table();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "rich breakpoint table requires MONITOR_BREAKPOINTS", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "breakpoint.delete") == 0) {
+#ifdef MONITOR_BREAKPOINTS
+        int slot;
+        int i;
+        rc = AI_JSON_GetInt(cmd, "slot", &slot, -1, TRUE, 0, MONITOR_BREAKPOINT_TABLE_MAX - 1);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "slot", TRUE); return; }
+        if (slot >= MONITOR_breakpoint_table_size) { ai_send_error("BAD_ARGUMENT", "slot does not exist", "slot"); return; }
+        for (i = slot; i < MONITOR_breakpoint_table_size - 1; i++)
+            MONITOR_breakpoint_table[i] = MONITOR_breakpoint_table[i + 1];
+        MONITOR_breakpoint_table_size--;
+        ai_send_breakpoint_table();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "rich breakpoint table requires MONITOR_BREAKPOINTS", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "breakpoint.enable") == 0 || strcmp(cmd_type, "breakpoint.disable") == 0) {
+#ifdef MONITOR_BREAKPOINTS
+        int slot;
+        int enabled = strcmp(cmd_type, "breakpoint.enable") == 0;
+        rc = AI_JSON_GetInt(cmd, "slot", &slot, -1, TRUE, 0, MONITOR_BREAKPOINT_TABLE_MAX - 1);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "slot", TRUE); return; }
+        if (slot >= MONITOR_breakpoint_table_size) { ai_send_error("BAD_ARGUMENT", "slot does not exist", "slot"); return; }
+        MONITOR_breakpoint_table[slot].enabled = (UBYTE)enabled;
+        ai_send_breakpoint_table();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "rich breakpoint table requires MONITOR_BREAKPOINTS", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "breakpoint.clear") == 0) {
+        char type[16] = "";
+        rc = AI_JSON_GetString(cmd, "type", type, sizeof(type), FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "type", FALSE); return; }
+        if (type[0] == '\0' || strcmp(type, "all") == 0 || strcmp(type, "pc") == 0)
+            ai_break_pc_enabled = 0;
+        if (type[0] == '\0' || strcmp(type, "all") == 0 || strcmp(type, "brk") == 0)
+            ai_break_brk_enabled = 0;
+        if (type[0] == '\0' || strcmp(type, "all") == 0 || strcmp(type, "table") == 0 || strcmp(type, "rich") == 0) {
+#ifdef MONITOR_BREAKPOINTS
+            MONITOR_breakpoint_table_size = 0;
+#elif 0
+            ;
+#endif
+        }
+        if (type[0] != '\0' && strcmp(type, "all") != 0 && strcmp(type, "pc") != 0 && strcmp(type, "brk") != 0
+            && strcmp(type, "table") != 0 && strcmp(type, "rich") != 0) {
+            ai_send_error("BAD_ARGUMENT", "type must be all, pc, brk, table, or rich", "type");
+            return;
+        }
+        ai_send_debugger_state("ok");
+    }
 
     /* === STATE === */
     else if (strcmp(cmd_type, "save_state") == 0) {
@@ -1750,7 +2458,7 @@ static int read_command(char *buf, int bufsize) {
         ai_send_error("BAD_ARGUMENT", "length prefix must be a positive integer", NULL);
         return -1;
     }
-    if (len >= bufsize || len > AI_DEFAULT_MAX_COMMAND_BYTES) {
+    if (!AI_CommandLengthIsAllowed(len, bufsize)) {
         ai_send_error("BAD_ARGUMENT", "command exceeds maximum size", NULL);
         close(ai_client_fd);
         ai_client_fd = -1;
@@ -1807,6 +2515,16 @@ int AI_Initialise(int *argc, char *argv[]) {
         else if (strcmp(argv[i], "-ai-socket") == 0 && i + 1 < *argc) {
             strncpy(AI_socket_path, argv[++i], sizeof(AI_socket_path) - 1);
             AI_socket_path[sizeof(AI_socket_path) - 1] = '\0';
+            match = TRUE;
+        }
+        else if (strcmp(argv[i], "-ai-video-push-socket") == 0 && i + 1 < *argc) {
+            strncpy(AI_video_push_socket_path, argv[++i], sizeof(AI_video_push_socket_path) - 1);
+            AI_video_push_socket_path[sizeof(AI_video_push_socket_path) - 1] = '\0';
+            match = TRUE;
+        }
+        else if (strcmp(argv[i], "-ai-video-pull-socket") == 0 && i + 1 < *argc) {
+            strncpy(AI_video_pull_socket_path, argv[++i], sizeof(AI_video_pull_socket_path) - 1);
+            AI_video_pull_socket_path[sizeof(AI_video_pull_socket_path) - 1] = '\0';
             match = TRUE;
         }
         else if (strcmp(argv[i], "-ai-artifact-dir") == 0 && i + 1 < *argc) {
@@ -1885,8 +2603,15 @@ void AI_Frame(void) {
         ai_steps_to_run = 0;
         ai_frames_requested = 0;
         ai_steps_requested = 0;
+        ai_instruction_steps_to_run = 0;
+        ai_instruction_steps_requested = 0;
+        ai_async_response_pending = 0;
         ai_command_deadline_us = 0;
         ai_paused = 1;
+        ai_set_stopped_reason("timeout");
+#ifdef MONITOR_BREAK
+        MONITOR_break_step = FALSE;
+#endif
         ai_send_error("TIMEOUT", "command timed out while waiting for emulator progress", NULL);
     }
 
@@ -1895,6 +2620,8 @@ void AI_Frame(void) {
         ai_frames_to_run--;
         if (ai_frames_to_run == 0) {
             ai_paused = 1;
+            ai_async_response_pending = 0;
+            ai_set_stopped_reason("frame_limit");
             snprintf(ai_response, sizeof(ai_response),
                 "{\"status\":\"ok\",\"frames_run\":%d}", ai_frames_requested);
             ai_frames_requested = 0;
@@ -1906,6 +2633,8 @@ void AI_Frame(void) {
         ai_steps_to_run--;
         if (ai_steps_to_run == 0) {
             ai_paused = 1;
+            ai_async_response_pending = 0;
+            ai_set_stopped_reason("frame_limit");
             CPU_GetStatus();
             snprintf(ai_response, sizeof(ai_response),
                 "{\"status\":\"ok\",\"steps_run\":%d,\"pc\":%d}", ai_steps_requested, CPU_regPC);
