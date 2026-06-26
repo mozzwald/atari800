@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -15,9 +16,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <time.h>
 
 #include "ai_interface.h"
+#include "ai_protocol.h"
 #include "atari.h"
 #include "cpu.h"
 #include "memory.h"
@@ -38,6 +41,9 @@
 int AI_enabled = 0;
 int AI_debug_port = 0;
 char AI_socket_path[256] = AI_SOCKET_PATH;
+static char AI_artifact_dir[512] = "/tmp/atari800_ai_artifacts";
+static char AI_artifact_dir_resolved[512] = "/tmp/atari800_ai_artifacts";
+static int AI_unsafe_paths = 0;
 
 /* AI input overrides (-1 = no override) */
 int AI_joy_override[4] = {-1, -1, -1, -1};
@@ -51,6 +57,8 @@ static int ai_frames_to_run = 0;
 static int ai_frames_requested = 0;
 static int ai_steps_to_run = 0;
 static int ai_steps_requested = 0;
+static int AI_command_timeout_ms = 30000;
+static unsigned long long ai_command_deadline_us = 0;
 
 /* Debug output buffer */
 #define AI_DEBUG_BUFFER_SIZE 4096
@@ -144,49 +152,6 @@ static void ai_fb_convert_surface_to_rgb565(const void *pixels, int width, int h
                                             unsigned int gmask, unsigned int bmask);
 static int ai_fb_init(void);
 static void ai_fb_shutdown(void);
-
-/* Simple JSON helpers - minimal implementation */
-
-static const char* json_get_string(const char *json, const char *key, char *buf, int bufsize) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *p = strstr(json, search);
-    if (!p) return NULL;
-    p += strlen(search);
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '"') return NULL;
-    p++;
-    int i = 0;
-    while (*p && *p != '"' && i < bufsize - 1) {
-        if (*p == '\\' && *(p+1)) { p++; }
-        buf[i++] = *p++;
-    }
-    buf[i] = '\0';
-    return buf;
-}
-
-static int json_get_int(const char *json, const char *key, int def) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *p = strstr(json, search);
-    if (!p) return def;
-    p += strlen(search);
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p == '"') return def;  /* It's a string, not int */
-    return atoi(p);
-}
-
-static int json_get_bool(const char *json, const char *key, int def) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\":", key);
-    const char *p = strstr(json, search);
-    if (!p) return def;
-    p += strlen(search);
-    while (*p == ' ' || *p == '\t') p++;
-    if (strncmp(p, "true", 4) == 0) return 1;
-    if (strncmp(p, "false", 5) == 0) return 0;
-    return def;
-}
 
 /* Base64 encoding for binary data */
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -980,13 +945,19 @@ static int setup_server_socket(void) {
 
 /* Send response to client */
 void AI_SendResponse(const char *json) {
+    int len;
+    char header[32];
+
     if (ai_client_fd < 0) return;
 
-    int len = strlen(json);
-    char header[32];
+    len = strlen(json);
     snprintf(header, sizeof(header), "%d\n", len);
-    write(ai_client_fd, header, strlen(header));
-    write(ai_client_fd, json, len);
+    if (!send_all_blocking(ai_client_fd, (const UBYTE *)header, strlen(header)) ||
+        !send_all_blocking(ai_client_fd, (const UBYTE *)json, len)) {
+        close(ai_client_fd);
+        ai_client_fd = -1;
+        Log_print("AI: Client disconnected during response");
+    }
 }
 
 /* Debug write hook - called when program writes to debug port */
@@ -1032,71 +1003,353 @@ static void screen_to_ascii(char *out, int outsize) {
     out[pos] = '\0';
 }
 
+static int ai_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
+{
+    va_list ap;
+    int written;
+
+    if (*pos >= bufsize)
+        return FALSE;
+    va_start(ap, fmt);
+    written = vsnprintf(buf + *pos, bufsize - *pos, fmt, ap);
+    va_end(ap);
+    if (written < 0 || (size_t)written >= bufsize - *pos)
+        return FALSE;
+    *pos += (size_t)written;
+    return TRUE;
+}
+
+static void ai_send_error(const char *code, const char *message, const char *field)
+{
+    size_t pos = 0;
+
+    ai_response[0] = '\0';
+    if (!ai_append(ai_response, sizeof(ai_response), &pos, "{\"status\":\"error\",\"code\":"))
+        return;
+    if (!AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, code != NULL ? code : "INTERNAL_ERROR"))
+        return;
+    if (!ai_append(ai_response, sizeof(ai_response), &pos, ",\"message\":"))
+        return;
+    if (!AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, message != NULL ? message : "internal error"))
+        return;
+    if (field != NULL && field[0] != '\0') {
+        if (!ai_append(ai_response, sizeof(ai_response), &pos, ",\"details\":{\"field\":"))
+            return;
+        if (!AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, field))
+            return;
+        if (!ai_append(ai_response, sizeof(ai_response), &pos, "}"))
+            return;
+    }
+    if (!ai_append(ai_response, sizeof(ai_response), &pos, "}"))
+        return;
+    AI_SendResponse(ai_response);
+}
+
+static void ai_send_validation_error(int rc, const char *field, int required)
+{
+    char msg[128];
+    const char *reason = "is invalid";
+
+    if (rc == AI_JSON_MISSING)
+        reason = "is required";
+    else if (rc == AI_JSON_BAD_TYPE)
+        reason = "has the wrong type";
+    else if (rc == AI_JSON_BAD_VALUE)
+        reason = "is out of range";
+    else if (rc == AI_JSON_NO_SPACE)
+        reason = "is too large";
+    snprintf(msg, sizeof(msg), "%s %s", field != NULL ? field : "field", reason);
+    ai_send_error(AI_JSON_ErrorCode(rc, required), msg, field);
+}
+
+static void ai_send_ok(void)
+{
+    AI_SendResponse("{\"status\":\"ok\"}");
+}
+
+static void ai_send_ok_path(const char *path)
+{
+    size_t pos = 0;
+
+    ai_response[0] = '\0';
+    if (!ai_append(ai_response, sizeof(ai_response), &pos, "{\"status\":\"ok\",\"path\":"))
+        return;
+    if (!AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, path))
+        return;
+    if (!ai_append(ai_response, sizeof(ai_response), &pos, "}"))
+        return;
+    AI_SendResponse(ai_response);
+}
+
+static int ai_ensure_dir(const char *path)
+{
+    if (mkdir(path, 0700) == 0 || errno == EEXIST)
+        return TRUE;
+    return FALSE;
+}
+
+static int ai_refresh_artifact_dir(void)
+{
+    char resolved[sizeof(AI_artifact_dir_resolved)];
+
+    if (!ai_ensure_dir(AI_artifact_dir)) {
+        Log_print("AI: failed to create artifact dir %s: %s", AI_artifact_dir, strerror(errno));
+        return FALSE;
+    }
+    if (realpath(AI_artifact_dir, resolved) == NULL) {
+        Log_print("AI: failed to resolve artifact dir %s: %s", AI_artifact_dir, strerror(errno));
+        return FALSE;
+    }
+    strncpy(AI_artifact_dir_resolved, resolved, sizeof(AI_artifact_dir_resolved) - 1);
+    AI_artifact_dir_resolved[sizeof(AI_artifact_dir_resolved) - 1] = '\0';
+    return TRUE;
+}
+
+static int ai_path_has_parent_ref(const char *path)
+{
+    const char *p = path;
+    while ((p = strstr(p, "..")) != NULL) {
+        int before = (p == path || p[-1] == '/');
+        int after = (p[2] == '\0' || p[2] == '/');
+        if (before && after)
+            return TRUE;
+        p += 2;
+    }
+    return FALSE;
+}
+
+static int ai_validate_output_path(const char *path, const char *field)
+{
+    char parent[512];
+    char *slash;
+    char resolved_parent[512];
+    size_t root_len;
+
+    if (path == NULL || path[0] == '\0') {
+        ai_send_error("MISSING_FIELD", "output path is required", field);
+        return FALSE;
+    }
+    if (AI_unsafe_paths)
+        return TRUE;
+    if (path[0] != '/') {
+        ai_send_error("PATH_DENIED", "output path must be absolute", field);
+        return FALSE;
+    }
+    if (ai_path_has_parent_ref(path)) {
+        ai_send_error("PATH_DENIED", "output path may not contain .. components", field);
+        return FALSE;
+    }
+    strncpy(parent, path, sizeof(parent) - 1);
+    parent[sizeof(parent) - 1] = '\0';
+    slash = strrchr(parent, '/');
+    if (slash == NULL || slash == parent) {
+        strcpy(parent, "/");
+    }
+    else {
+        *slash = '\0';
+    }
+    if (realpath(parent, resolved_parent) == NULL) {
+        ai_send_error("PATH_DENIED", "output path parent directory is not available", field);
+        return FALSE;
+    }
+    root_len = strlen(AI_artifact_dir_resolved);
+    if (strncmp(resolved_parent, AI_artifact_dir_resolved, root_len) != 0 ||
+        (resolved_parent[root_len] != '\0' && resolved_parent[root_len] != '/')) {
+        ai_send_error("PATH_DENIED", "output path is outside the AI artifact directory", field);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void ai_default_artifact_path(char *path, size_t path_size, const char *prefix, const char *ext)
+{
+    char suffix[64];
+
+    if (path_size == 0)
+        return;
+    snprintf(suffix, sizeof(suffix), "/%s_%ld.%s", prefix, (long)time(NULL), ext);
+    path[0] = '\0';
+    strncat(path, AI_artifact_dir_resolved, path_size - 1);
+    strncat(path, suffix, path_size - strlen(path) - 1);
+}
+
+static void ai_send_hello(void)
+{
+    size_t pos = 0;
+
+    ai_response[0] = '\0';
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        "{\"status\":\"ok\",\"protocol_version\":%d,\"emulator\":\"atari800\","
+        "\"ai_interface\":true,\"build\":{\"ai_interface\":true,\"netsio\":",
+        AI_PROTOCOL_VERSION);
+#ifdef NETSIO
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"monitor_break\":");
+#ifdef MONITOR_BREAK
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"monitor_breakpoints\":");
+#ifdef MONITOR_BREAKPOINTS
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"monitor_trace\":");
+#ifdef MONITOR_TRACE
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"monitor_profile\":");
+#ifdef MONITOR_PROFILE
+    ai_append(ai_response, sizeof(ai_response), &pos, "true");
+#else
+    ai_append(ai_response, sizeof(ai_response), &pos, "false");
+#endif
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        "},\"limits\":{\"max_command_bytes\":%d,\"max_response_bytes\":%d,\"peek_max_len\":%d},"
+        "\"paths\":{\"artifact_dir\":",
+        AI_BUFFER_SIZE - 1, AI_MAX_RESPONSE, AI_PEEK_MAX_LEN);
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_artifact_dir_resolved);
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"unsafe_paths\":%s},\"sockets\":{\"command\":", AI_unsafe_paths ? "true" : "false");
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_socket_path);
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"video_push\":");
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_FB_PUSH_SOCKET_PATH);
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"video_pull\":");
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_FB_PULL_SOCKET_PATH);
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        "},\"commands\":[\"ping\",\"hello\",\"capabilities\",\"load\",\"run\",\"step\","
+        "\"pause\",\"reset\",\"key\",\"key_release\",\"joystick\",\"paddle\",\"consol\","
+        "\"screenshot\",\"screen_ascii\",\"screen_raw\",\"video.status\",\"peek\",\"poke\","
+        "\"dump\",\"cpu\",\"cpu_set\",\"antic\",\"gtia\",\"pokey\",\"pia\","
+        "\"debug_enable\",\"debug_read\",\"save_state\",\"load_state\"],"
+        "\"command_classes\":{\"read_only\":[\"ping\",\"hello\",\"capabilities\",\"screen_ascii\",\"screen_raw\","
+        "\"video.status\",\"peek\",\"cpu\",\"antic\",\"gtia\",\"pokey\",\"pia\",\"debug_read\"],"
+        "\"mutating\":[\"load\",\"run\",\"step\",\"pause\",\"reset\",\"key\",\"key_release\","
+        "\"joystick\",\"paddle\",\"consol\",\"screenshot\",\"video.enable_push\",\"video.disable_push\","
+        "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\",\"video.push.set_frameskip\","
+        "\"video.push.enable_change_triggered\",\"dump\",\"debug_enable\",\"save_state\",\"load_state\"],"
+        "\"unsafe\":[\"poke\",\"cpu_set\"]}}");
+    AI_SendResponse(ai_response);
+}
+
 /* Process a command */
 static void process_command(const char *cmd) {
     char cmd_type[64] = "";
     char path[512] = "";
+    int rc;
 
-    json_get_string(cmd, "cmd", cmd_type, sizeof(cmd_type));
+    if (!AI_JSON_IsValidObject(cmd)) {
+        ai_send_error("BAD_JSON", "request must be a valid JSON object", NULL);
+        return;
+    }
+
+    rc = AI_JSON_GetString(cmd, "cmd", cmd_type, sizeof(cmd_type), TRUE);
+    if (rc != AI_JSON_OK) {
+        ai_send_validation_error(rc, "cmd", TRUE);
+        return;
+    }
 
     /* === CONTROL === */
     if (strcmp(cmd_type, "ping") == 0) {
         AI_SendResponse("{\"status\":\"ok\",\"msg\":\"pong\"}");
     }
+    else if (strcmp(cmd_type, "hello") == 0 || strcmp(cmd_type, "capabilities") == 0) {
+        ai_send_hello();
+    }
     else if (strcmp(cmd_type, "load") == 0) {
-        json_get_string(cmd, "path", path, sizeof(path));
-        if (path[0] && BINLOAD_Loader(path)) {
-            AI_SendResponse("{\"status\":\"ok\"}");
+        rc = AI_JSON_GetString(cmd, "path", path, sizeof(path), TRUE);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "path", TRUE);
+            return;
+        }
+        if (BINLOAD_Loader(path)) {
+            ai_send_ok();
         } else {
-            snprintf(ai_response, sizeof(ai_response),
-                "{\"status\":\"error\",\"msg\":\"Failed to load %s\"}", path);
-            AI_SendResponse(ai_response);
+            ai_send_error("IO_ERROR", "Failed to load path", "path");
         }
     }
     else if (strcmp(cmd_type, "run") == 0) {
-        ai_frames_to_run = json_get_int(cmd, "frames", 1);
-        if (ai_frames_to_run < 1)
-            ai_frames_to_run = 1;
+        rc = AI_JSON_GetInt(cmd, "frames", &ai_frames_to_run, 1, FALSE, 1, 1000000);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "frames", FALSE);
+            return;
+        }
         ai_frames_requested = ai_frames_to_run;
+        ai_command_deadline_us = AI_command_timeout_ms > 0 ? monotonic_us() + (unsigned long long)AI_command_timeout_ms * 1000ULL : 0;
         ai_paused = 0;
         /* Response sent after frames complete */
     }
     else if (strcmp(cmd_type, "step") == 0) {
-        ai_steps_to_run = json_get_int(cmd, "instructions", 1);
-        if (ai_steps_to_run < 1)
-            ai_steps_to_run = 1;
+        rc = AI_JSON_GetInt(cmd, "instructions", &ai_steps_to_run, 1, FALSE, 1, 1000000);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "instructions", FALSE);
+            return;
+        }
         ai_steps_requested = ai_steps_to_run;
+        ai_command_deadline_us = AI_command_timeout_ms > 0 ? monotonic_us() + (unsigned long long)AI_command_timeout_ms * 1000ULL : 0;
         ai_paused = 0;
         /* Response sent after steps complete */
     }
     else if (strcmp(cmd_type, "pause") == 0) {
         ai_paused = 1;
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "reset") == 0) {
         Atari800_Coldstart();
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
 
     /* === INPUT === */
     else if (strcmp(cmd_type, "key") == 0) {
-        INPUT_key_code = json_get_int(cmd, "code", AKEY_NONE);
-        INPUT_key_shift = json_get_bool(cmd, "shift", 0);
-        AI_SendResponse("{\"status\":\"ok\"}");
+        int shift;
+        rc = AI_JSON_GetInt(cmd, "code", &INPUT_key_code, AKEY_NONE, TRUE, 0, 65535);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "code", TRUE);
+            return;
+        }
+        rc = AI_JSON_GetBool(cmd, "shift", &shift, 0, FALSE);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "shift", FALSE);
+            return;
+        }
+        INPUT_key_shift = shift;
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "key_release") == 0) {
         INPUT_key_code = AKEY_NONE;
         INPUT_key_shift = 0;
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "joystick") == 0) {
-        int port = json_get_int(cmd, "port", 0);
+        int port;
         char dir[16] = "";
-        json_get_string(cmd, "direction", dir, sizeof(dir));
-        int fire = json_get_bool(cmd, "fire", 0);
-
+        int fire;
         int stick = INPUT_STICK_CENTRE;
-        if (strcmp(dir, "up") == 0) stick = INPUT_STICK_FORWARD;
+
+        rc = AI_JSON_GetInt(cmd, "port", &port, 0, FALSE, 0, 3);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "port", FALSE);
+            return;
+        }
+        rc = AI_JSON_GetString(cmd, "direction", dir, sizeof(dir), FALSE);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "direction", FALSE);
+            return;
+        }
+        rc = AI_JSON_GetBool(cmd, "fire", &fire, 0, FALSE);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "fire", FALSE);
+            return;
+        }
+
+        if (dir[0] == '\0' || strcmp(dir, "center") == 0) stick = INPUT_STICK_CENTRE;
+        else if (strcmp(dir, "up") == 0) stick = INPUT_STICK_FORWARD;
         else if (strcmp(dir, "down") == 0) stick = INPUT_STICK_BACK;
         else if (strcmp(dir, "left") == 0) stick = INPUT_STICK_LEFT;
         else if (strcmp(dir, "right") == 0) stick = INPUT_STICK_RIGHT;
@@ -1104,50 +1357,65 @@ static void process_command(const char *cmd) {
         else if (strcmp(dir, "ur") == 0) stick = INPUT_STICK_UR;
         else if (strcmp(dir, "ll") == 0) stick = INPUT_STICK_LL;
         else if (strcmp(dir, "lr") == 0) stick = INPUT_STICK_LR;
-
-        if (port >= 0 && port < 4) {
-            /* Set joystick override - will be applied after INPUT_Frame */
-            /* Use -1 (no override) for center to allow keyboard input */
-            AI_joy_override[port] = (stick == INPUT_STICK_CENTRE) ? -1 : stick;
-            /* Set fire button override: 0 = pressed, -1 = no override (allows keyboard) */
-            AI_trig_override[port] = fire ? 0 : -1;
+        else {
+            ai_send_error("BAD_ARGUMENT", "direction is invalid", "direction");
+            return;
         }
-        AI_SendResponse("{\"status\":\"ok\"}");
+
+        AI_joy_override[port] = (stick == INPUT_STICK_CENTRE) ? -1 : stick;
+        AI_trig_override[port] = fire ? 0 : -1;
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "paddle") == 0) {
-        int port = json_get_int(cmd, "port", 0);
-        int value = json_get_int(cmd, "value", 128);
-        if (port >= 0 && port < 8) {
-            POKEY_POT_input[port] = value;
+        int port;
+        int value;
+        rc = AI_JSON_GetInt(cmd, "port", &port, 0, FALSE, 0, 7);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "port", FALSE);
+            return;
         }
-        AI_SendResponse("{\"status\":\"ok\"}");
+        rc = AI_JSON_GetInt(cmd, "value", &value, 128, FALSE, 0, 255);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "value", FALSE);
+            return;
+        }
+        POKEY_POT_input[port] = value;
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "consol") == 0) {
+        int start, select, option;
+        rc = AI_JSON_GetBool(cmd, "start", &start, 1, FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "start", FALSE); return; }
+        rc = AI_JSON_GetBool(cmd, "select", &select, 1, FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "select", FALSE); return; }
+        rc = AI_JSON_GetBool(cmd, "option", &option, 1, FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "option", FALSE); return; }
         INPUT_key_consol = INPUT_CONSOL_NONE;
-        if (!json_get_bool(cmd, "start", 1)) INPUT_key_consol &= ~INPUT_CONSOL_START;
-        if (!json_get_bool(cmd, "select", 1)) INPUT_key_consol &= ~INPUT_CONSOL_SELECT;
-        if (!json_get_bool(cmd, "option", 1)) INPUT_key_consol &= ~INPUT_CONSOL_OPTION;
-        AI_SendResponse("{\"status\":\"ok\"}");
+        if (!start) INPUT_key_consol &= ~INPUT_CONSOL_START;
+        if (!select) INPUT_key_consol &= ~INPUT_CONSOL_SELECT;
+        if (!option) INPUT_key_consol &= ~INPUT_CONSOL_OPTION;
+        ai_send_ok();
     }
 
     /* === SCREEN === */
     else if (strcmp(cmd_type, "screenshot") == 0) {
-        json_get_string(cmd, "path", path, sizeof(path));
-        if (!path[0]) {
-            snprintf(path, sizeof(path), "/tmp/atari800_ai_%ld.png", (long)time(NULL));
+        rc = AI_JSON_GetString(cmd, "path", path, sizeof(path), FALSE);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "path", FALSE);
+            return;
         }
-        /* Debug: log screen dimensions */
+        if (!path[0]) {
+            ai_default_artifact_path(path, sizeof(path), "screenshot", "png");
+        }
+        if (!ai_validate_output_path(path, "path"))
+            return;
         Log_print("AI screenshot: path=%s vis=%d,%d-%d,%d", path,
             Screen_visible_x1, Screen_visible_y1, Screen_visible_x2, Screen_visible_y2);
         if (Screen_SaveScreenshot(path, 0)) {
-            snprintf(ai_response, sizeof(ai_response),
-                "{\"status\":\"ok\",\"path\":\"%s\"}", path);
+            ai_send_ok_path(path);
         } else {
-            snprintf(ai_response, sizeof(ai_response),
-                "{\"status\":\"error\",\"msg\":\"Failed to save screenshot vis=%d,%d-%d,%d\"}",
-                Screen_visible_x1, Screen_visible_y1, Screen_visible_x2, Screen_visible_y2);
+            ai_send_error("IO_ERROR", "Failed to save screenshot", "path");
         }
-        AI_SendResponse(ai_response);
     }
     else if (strcmp(cmd_type, "screen_ascii") == 0) {
         char ascii_data[2048];
@@ -1157,7 +1425,6 @@ static void process_command(const char *cmd) {
         AI_SendResponse(ai_response);
     }
     else if (strcmp(cmd_type, "screen_raw") == 0) {
-        /* Base64 encode screen buffer */
         static char b64_buf[Screen_WIDTH * Screen_HEIGHT * 2];
         base64_encode((UBYTE*)Screen_atari, Screen_WIDTH * Screen_HEIGHT,
                       b64_buf, sizeof(b64_buf));
@@ -1168,45 +1435,49 @@ static void process_command(const char *cmd) {
     }
     else if (strcmp(cmd_type, "video.enable_push") == 0) {
         ai_fb_push_enabled = TRUE;
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "video.disable_push") == 0) {
         ai_fb_push_enabled = FALSE;
         ai_fb_close_push_client();
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "video.enable_pull") == 0) {
         ai_fb_pull_enabled = TRUE;
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "video.disable_pull") == 0) {
         ai_fb_pull_enabled = FALSE;
         ai_fb_close_pull_client();
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "video.push.set_fps_cap") == 0) {
-        int fps_cap = json_get_int(cmd, "value", 0);
-        if (fps_cap < 0) {
-            fps_cap = 0;
+        rc = AI_JSON_GetInt(cmd, "value", &ai_fb_fps_cap, 0, TRUE, 0, 1000);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "value", TRUE);
+            return;
         }
-        ai_fb_fps_cap = fps_cap;
         snprintf(ai_response, sizeof(ai_response),
             "{\"status\":\"ok\",\"fps_cap\":%d}", ai_fb_fps_cap);
         AI_SendResponse(ai_response);
     }
     else if (strcmp(cmd_type, "video.push.set_frameskip") == 0) {
-        int frame_skip = json_get_int(cmd, "n", 1);
-        if (frame_skip < 1) {
-            frame_skip = 1;
+        rc = AI_JSON_GetInt(cmd, "n", &ai_fb_send_every_n_frames, 1, TRUE, 1, 1000000);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "n", TRUE);
+            return;
         }
-        ai_fb_send_every_n_frames = frame_skip;
         snprintf(ai_response, sizeof(ai_response),
             "{\"status\":\"ok\",\"send_every_n_frames\":%d}", ai_fb_send_every_n_frames);
         AI_SendResponse(ai_response);
     }
     else if (strcmp(cmd_type, "video.push.enable_change_triggered") == 0) {
-        ai_fb_change_triggered = json_get_bool(cmd, "enabled", TRUE);
-        AI_SendResponse("{\"status\":\"ok\"}");
+        rc = AI_JSON_GetBool(cmd, "enabled", &ai_fb_change_triggered, TRUE, TRUE);
+        if (rc != AI_JSON_OK) {
+            ai_send_validation_error(rc, "enabled", TRUE);
+            return;
+        }
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "video.status") == 0) {
         snprintf(ai_response, sizeof(ai_response),
@@ -1227,13 +1498,18 @@ static void process_command(const char *cmd) {
 
     /* === MEMORY === */
     else if (strcmp(cmd_type, "peek") == 0) {
-        int addr = json_get_int(cmd, "addr", 0);
-        int len = json_get_int(cmd, "len", 1);
-        if (len > 256) len = 256;  /* Limit */
+        int addr;
+        int len;
+        int pos;
+        int i;
+        rc = AI_JSON_GetInt(cmd, "addr", &addr, 0, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "addr", TRUE); return; }
+        rc = AI_JSON_GetInt(cmd, "len", &len, 1, FALSE, 1, AI_PEEK_MAX_LEN);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "len", FALSE); return; }
 
-        int pos = snprintf(ai_response, sizeof(ai_response),
+        pos = snprintf(ai_response, sizeof(ai_response),
             "{\"status\":\"ok\",\"addr\":%d,\"data\":[", addr);
-        for (int i = 0; i < len && pos < sizeof(ai_response) - 20; i++) {
+        for (i = 0; i < len && pos < (int)sizeof(ai_response) - 20; i++) {
             pos += snprintf(ai_response + pos, sizeof(ai_response) - pos,
                 "%s%d", i ? "," : "", MEMORY_SafeGetByte((UWORD)(addr + i)));
         }
@@ -1241,50 +1517,49 @@ static void process_command(const char *cmd) {
         AI_SendResponse(ai_response);
     }
     else if (strcmp(cmd_type, "poke") == 0) {
-        int addr = json_get_int(cmd, "addr", 0);
-        /* Parse data array - simple extraction */
-        const char *data = strstr(cmd, "\"data\":");
-        if (data) {
-            data = strchr(data, '[');
-            if (data) {
-                data++;
-                while (*data && *data != ']') {
-                    while (*data == ' ' || *data == ',') data++;
-                    if (*data >= '0' && *data <= '9') {
-                        int val = atoi(data);
-                        MEMORY_mem[(UWORD)addr++] = (UBYTE)val;  /* Direct write - bypasses attribute check */
-                        while (*data >= '0' && *data <= '9') data++;
-                    } else {
-                        break;
-                    }
-                }
-            }
+        int addr;
+        int count;
+        int i;
+        UBYTE data_buf[AI_BUFFER_SIZE];
+        rc = AI_JSON_GetInt(cmd, "addr", &addr, 0, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "addr", TRUE); return; }
+        rc = AI_JSON_GetByteArray(cmd, "data", data_buf, sizeof(data_buf), &count, TRUE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "data", TRUE); return; }
+        for (i = 0; i < count; i++) {
+            MEMORY_mem[(UWORD)(addr + i)] = data_buf[i];
         }
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "dump") == 0) {
-        int start = json_get_int(cmd, "start", 0);
-        int end = json_get_int(cmd, "end", 0xFFFF);
-        json_get_string(cmd, "path", path, sizeof(path));
-        if (path[0]) {
-            FILE *f = fopen(path, "wb");
-            if (f) {
-                for (int i = start; i <= end; i++) {
-                    UBYTE b = MEMORY_SafeGetByte((UWORD)i);
-                    fwrite(&b, 1, 1, f);
-                }
-                fclose(f);
-                snprintf(ai_response, sizeof(ai_response),
-                    "{\"status\":\"ok\",\"bytes\":%d}", end - start + 1);
-            } else {
-                snprintf(ai_response, sizeof(ai_response),
-                    "{\"status\":\"error\",\"msg\":\"Failed to open file\"}");
-            }
-        } else {
-            snprintf(ai_response, sizeof(ai_response),
-                "{\"status\":\"error\",\"msg\":\"No path specified\"}");
+        int start_addr;
+        int end_addr;
+        FILE *f;
+        int i;
+        rc = AI_JSON_GetInt(cmd, "start", &start_addr, 0, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "start", TRUE); return; }
+        rc = AI_JSON_GetInt(cmd, "end", &end_addr, 0xFFFF, TRUE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "end", TRUE); return; }
+        if (end_addr < start_addr) {
+            ai_send_error("BAD_ARGUMENT", "end must be greater than or equal to start", "end");
+            return;
         }
-        AI_SendResponse(ai_response);
+        rc = AI_JSON_GetString(cmd, "path", path, sizeof(path), TRUE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "path", TRUE); return; }
+        if (!ai_validate_output_path(path, "path"))
+            return;
+        f = fopen(path, "wb");
+        if (f) {
+            for (i = start_addr; i <= end_addr; i++) {
+                UBYTE b = MEMORY_SafeGetByte((UWORD)i);
+                fwrite(&b, 1, 1, f);
+            }
+            fclose(f);
+            snprintf(ai_response, sizeof(ai_response),
+                "{\"status\":\"ok\",\"bytes\":%d}", end_addr - start_addr + 1);
+            AI_SendResponse(ai_response);
+        } else {
+            ai_send_error("IO_ERROR", "Failed to open output file", "path");
+        }
     }
 
     /* === CPU === */
@@ -1305,15 +1580,19 @@ static void process_command(const char *cmd) {
         AI_SendResponse(ai_response);
     }
     else if (strcmp(cmd_type, "cpu_set") == 0) {
-        /* Only set values that are specified */
-        const char *p;
-        if ((p = strstr(cmd, "\"pc\":"))) CPU_regPC = atoi(p + 5);
-        if ((p = strstr(cmd, "\"a\":"))) CPU_regA = atoi(p + 4);
-        if ((p = strstr(cmd, "\"x\":"))) CPU_regX = atoi(p + 4);
-        if ((p = strstr(cmd, "\"y\":"))) CPU_regY = atoi(p + 4);
-        if ((p = strstr(cmd, "\"sp\":"))) CPU_regS = atoi(p + 5);
+        int value;
+        if ((rc = AI_JSON_GetInt(cmd, "pc", &value, CPU_regPC, FALSE, 0, 0xFFFF)) != AI_JSON_OK) { ai_send_validation_error(rc, "pc", FALSE); return; }
+        CPU_regPC = value;
+        if ((rc = AI_JSON_GetInt(cmd, "a", &value, CPU_regA, FALSE, 0, 0xFF)) != AI_JSON_OK) { ai_send_validation_error(rc, "a", FALSE); return; }
+        CPU_regA = value;
+        if ((rc = AI_JSON_GetInt(cmd, "x", &value, CPU_regX, FALSE, 0, 0xFF)) != AI_JSON_OK) { ai_send_validation_error(rc, "x", FALSE); return; }
+        CPU_regX = value;
+        if ((rc = AI_JSON_GetInt(cmd, "y", &value, CPU_regY, FALSE, 0, 0xFF)) != AI_JSON_OK) { ai_send_validation_error(rc, "y", FALSE); return; }
+        CPU_regY = value;
+        if ((rc = AI_JSON_GetInt(cmd, "sp", &value, CPU_regS, FALSE, 0, 0xFF)) != AI_JSON_OK) { ai_send_validation_error(rc, "sp", FALSE); return; }
+        CPU_regS = value;
         CPU_PutStatus();
-        AI_SendResponse("{\"status\":\"ok\"}");
+        ai_send_ok();
     }
 
     /* === CHIPS === */
@@ -1377,18 +1656,20 @@ static void process_command(const char *cmd) {
 
     /* === DEBUG === */
     else if (strcmp(cmd_type, "debug_enable") == 0) {
-        AI_debug_port = json_get_int(cmd, "addr", 0xD7FF);
-        AI_SendResponse("{\"status\":\"ok\"}");
+        rc = AI_JSON_GetInt(cmd, "addr", &AI_debug_port, 0xD7FF, FALSE, 0, 0xFFFF);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "addr", FALSE); return; }
+        ai_send_ok();
     }
     else if (strcmp(cmd_type, "debug_read") == 0) {
         int pos = snprintf(ai_response, sizeof(ai_response),
             "{\"status\":\"ok\",\"data\":[");
-        for (int i = 0; i < ai_debug_buffer_pos && pos < sizeof(ai_response) - 100; i++) {
+        int i;
+        for (i = 0; i < ai_debug_buffer_pos && pos < (int)sizeof(ai_response) - 100; i++) {
             pos += snprintf(ai_response + pos, sizeof(ai_response) - pos,
                 "%s%d", i ? "," : "", ai_debug_buffer[i]);
         }
         pos += snprintf(ai_response + pos, sizeof(ai_response) - pos, "],\"ascii\":\"");
-        for (int i = 0; i < ai_debug_buffer_pos && pos < sizeof(ai_response) - 10; i++) {
+        for (i = 0; i < ai_debug_buffer_pos && pos < (int)sizeof(ai_response) - 10; i++) {
             UBYTE c = ai_debug_buffer[i];
             if (c >= 32 && c < 127 && c != '"' && c != '\\') {
                 ai_response[pos++] = c;
@@ -1397,48 +1678,52 @@ static void process_command(const char *cmd) {
             }
         }
         snprintf(ai_response + pos, sizeof(ai_response) - pos, "\"}");
-        ai_debug_buffer_pos = 0;  /* Clear buffer */
+        ai_debug_buffer_pos = 0;
         AI_SendResponse(ai_response);
     }
 
     /* === STATE === */
     else if (strcmp(cmd_type, "save_state") == 0) {
-        json_get_string(cmd, "path", path, sizeof(path));
-        if (path[0] && StateSav_SaveAtariState(path, "wb", TRUE)) {
-            AI_SendResponse("{\"status\":\"ok\"}");
+        rc = AI_JSON_GetString(cmd, "path", path, sizeof(path), TRUE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "path", TRUE); return; }
+        if (!ai_validate_output_path(path, "path"))
+            return;
+        if (StateSav_SaveAtariState(path, "wb", TRUE)) {
+            ai_send_ok();
         } else {
-            AI_SendResponse("{\"status\":\"error\",\"msg\":\"Failed to save state\"}");
+            ai_send_error("IO_ERROR", "Failed to save state", "path");
         }
     }
     else if (strcmp(cmd_type, "load_state") == 0) {
-        json_get_string(cmd, "path", path, sizeof(path));
-        if (path[0] && StateSav_ReadAtariState(path, "rb")) {
-            AI_SendResponse("{\"status\":\"ok\"}");
+        rc = AI_JSON_GetString(cmd, "path", path, sizeof(path), TRUE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "path", TRUE); return; }
+        if (StateSav_ReadAtariState(path, "rb")) {
+            ai_send_ok();
         } else {
-            AI_SendResponse("{\"status\":\"error\",\"msg\":\"Failed to load state\"}");
+            ai_send_error("IO_ERROR", "Failed to load state", "path");
         }
     }
 
     /* Unknown command */
     else {
-        snprintf(ai_response, sizeof(ai_response),
-            "{\"status\":\"error\",\"msg\":\"Unknown command: %s\"}", cmd_type);
-        AI_SendResponse(ai_response);
+        ai_send_error("UNKNOWN_COMMAND", "Unknown command", "cmd");
     }
 }
 
 /* Read command from client */
 static int read_command(char *buf, int bufsize) {
-    if (ai_client_fd < 0) return 0;
-
-    /* Read length prefix */
     char header[32];
     int hpos = 0;
-    while (hpos < sizeof(header) - 1) {
+    char *endptr;
+    long len;
+    int total;
+
+    if (ai_client_fd < 0) return 0;
+
+    while (hpos < (int)sizeof(header) - 1) {
         int r = read(ai_client_fd, header + hpos, 1);
         if (r <= 0) {
             if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                /* Client disconnected */
                 close(ai_client_fd);
                 ai_client_fd = -1;
                 Log_print("AI: Client disconnected");
@@ -1452,18 +1737,34 @@ static int read_command(char *buf, int bufsize) {
         hpos++;
     }
 
-    int len = atoi(header);
-    if (len <= 0 || len >= bufsize) return 0;
+    if (hpos >= (int)sizeof(header) - 1) {
+        ai_send_error("BAD_ARGUMENT", "length prefix is too long", NULL);
+        close(ai_client_fd);
+        ai_client_fd = -1;
+        return -1;
+    }
 
-    /* Read JSON body */
-    int total = 0;
+    errno = 0;
+    len = strtol(header, &endptr, 10);
+    if (header == endptr || errno != 0 || *endptr != '\0' || len <= 0) {
+        ai_send_error("BAD_ARGUMENT", "length prefix must be a positive integer", NULL);
+        return -1;
+    }
+    if (len >= bufsize || len > AI_DEFAULT_MAX_COMMAND_BYTES) {
+        ai_send_error("BAD_ARGUMENT", "command exceeds maximum size", NULL);
+        close(ai_client_fd);
+        ai_client_fd = -1;
+        return -1;
+    }
+
+    total = 0;
     while (total < len) {
         int r = read(ai_client_fd, buf + total, len - total);
         if (r <= 0) return 0;
         total += r;
     }
     buf[len] = '\0';
-    return len;
+    return (int)len;
 }
 
 /* Check for and accept new connections */
@@ -1505,10 +1806,26 @@ int AI_Initialise(int *argc, char *argv[]) {
         }
         else if (strcmp(argv[i], "-ai-socket") == 0 && i + 1 < *argc) {
             strncpy(AI_socket_path, argv[++i], sizeof(AI_socket_path) - 1);
+            AI_socket_path[sizeof(AI_socket_path) - 1] = '\0';
+            match = TRUE;
+        }
+        else if (strcmp(argv[i], "-ai-artifact-dir") == 0 && i + 1 < *argc) {
+            strncpy(AI_artifact_dir, argv[++i], sizeof(AI_artifact_dir) - 1);
+            AI_artifact_dir[sizeof(AI_artifact_dir) - 1] = '\0';
+            match = TRUE;
+        }
+        else if (strcmp(argv[i], "-ai-unsafe-paths") == 0) {
+            AI_unsafe_paths = TRUE;
             match = TRUE;
         }
         else if (strcmp(argv[i], "-ai-debug-port") == 0 && i + 1 < *argc) {
             AI_debug_port = strtol(argv[++i], NULL, 0);
+            match = TRUE;
+        }
+        else if (strcmp(argv[i], "-ai-command-timeout-ms") == 0 && i + 1 < *argc) {
+            AI_command_timeout_ms = strtol(argv[++i], NULL, 0);
+            if (AI_command_timeout_ms < 0)
+                AI_command_timeout_ms = 0;
             match = TRUE;
         }
         else if (strcmp(argv[i], "-ai-run") == 0) {
@@ -1524,6 +1841,10 @@ int AI_Initialise(int *argc, char *argv[]) {
     *argc = j;
 
     if (AI_enabled) {
+        if (!ai_refresh_artifact_dir()) {
+            AI_enabled = FALSE;
+            return FALSE;
+        }
         if (!setup_server_socket()) {
             AI_enabled = FALSE;
             return FALSE;
@@ -1559,6 +1880,16 @@ void AI_Frame(void) {
     ai_fb_poll_sockets();
     check_connections();
 
+    if ((ai_frames_to_run > 0 || ai_steps_to_run > 0) && ai_command_deadline_us > 0 && monotonic_us() > ai_command_deadline_us) {
+        ai_frames_to_run = 0;
+        ai_steps_to_run = 0;
+        ai_frames_requested = 0;
+        ai_steps_requested = 0;
+        ai_command_deadline_us = 0;
+        ai_paused = 1;
+        ai_send_error("TIMEOUT", "command timed out while waiting for emulator progress", NULL);
+    }
+
     /* If we were running frames, decrement and check */
     if (ai_frames_to_run > 0) {
         ai_frames_to_run--;
@@ -1567,6 +1898,7 @@ void AI_Frame(void) {
             snprintf(ai_response, sizeof(ai_response),
                 "{\"status\":\"ok\",\"frames_run\":%d}", ai_frames_requested);
             ai_frames_requested = 0;
+            ai_command_deadline_us = 0;
             AI_SendResponse(ai_response);
         }
     }
@@ -1578,6 +1910,7 @@ void AI_Frame(void) {
             snprintf(ai_response, sizeof(ai_response),
                 "{\"status\":\"ok\",\"steps_run\":%d,\"pc\":%d}", ai_steps_requested, CPU_regPC);
             ai_steps_requested = 0;
+            ai_command_deadline_us = 0;
             AI_SendResponse(ai_response);
         }
     }

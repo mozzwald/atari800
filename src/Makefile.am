@@ -89,7 +89,7 @@ atari800_SOURCES = \
 atari800_LDADD =
 
 if AI_INTERFACE
-atari800_SOURCES += ai_interface.c ai_interface.h
+atari800_SOURCES += ai_interface.c ai_interface.h ai_protocol.h
 endif
 
 if A8_USE_SDL2

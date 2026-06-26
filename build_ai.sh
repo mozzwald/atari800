@@ -13,6 +13,7 @@ echo "Configuring with SDL 1.2..."
     --with-video=sdl \
     --with-sound=sdl \
     --enable-ai-interface \
+    --enable-netsio \
     SDL_CONFIG=/usr/bin/sdl-config \
     CFLAGS="-O2 -g"
 
@@ -25,7 +26,7 @@ echo "Build complete!"
 echo "Binary: src/atari800"
 echo ""
 echo "Usage:"
-echo "  ./src/atari800 -ai -xl -run your_program.xex"
+echo "  ./src/atari800 -netsio -ai -xl -run your_program.xex"
 echo ""
 echo "Then connect to socket: /tmp/atari800_ai.sock"
 echo "Send JSON commands with length prefix (e.g., '14\\n{\"cmd\":\"ping\"}')"

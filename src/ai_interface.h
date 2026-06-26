@@ -39,7 +39,13 @@ int AI_IsPaused(void);
 /* JSON API Commands:
  *
  * All commands are JSON objects with a "cmd" field.
- * Responses are JSON objects with "status" ("ok" or "error") and data.
+ * Successful responses are JSON objects with "status":"ok" and data.
+ * Error responses use {"status":"error","code":"...","message":"...","details":{...}}.
+ *
+ * === PROTOCOL ===
+ * {"cmd": "hello"}
+ * {"cmd": "capabilities"}
+ *   -> protocol version, build flags, limits, sockets, command list, and command classes
  *
  * === CONTROL ===
  * {"cmd": "ping"}
