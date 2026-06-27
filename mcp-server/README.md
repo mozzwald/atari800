@@ -40,7 +40,7 @@ Add the server to MCP client settings:
 }
 ```
 
-The server uses `../src/atari800` relative to `mcp-server/index.js` by default. Override it with `ATARI800_PATH`.
+In a source checkout, the server resolves the emulator from `ATARI800_PATH`, then a bundled `../bin/atari800` if present, then `../src/atari800`. Override it with `ATARI800_PATH` when testing a specific build.
 
 Supported host environment for the full test matrix is Linux with Node.js 18+, SDL 1.2 runtime libraries, Xvfb for headless sessions, and a real FujiNet-PC archive or unpacked directory for FujiNet/NetSIO workflows.
 
@@ -64,7 +64,9 @@ The bundle is written under `dist/` with a platform-specific name such as `atari
 
 - `bin/atari800`
 - `mcp-server/`
+- `mcp-server/node_modules/`
 - `start-mcp.sh`
+- `skills/atari800-mcp/`
 - `README.AI.md`
 - `AGENT_CONTRACT.md`
 - `manifest.json`
@@ -80,6 +82,19 @@ Use the bundle launcher in MCP client settings:
   }
 }
 ```
+
+For Codex TOML config, use the launcher as the command:
+
+```toml
+[mcp_servers.atari800]
+command = "/path/to/atari800-mcp-linux-x86_64/start-mcp.sh"
+args = []
+cwd = "/path/to/atari800-mcp-linux-x86_64"
+```
+
+Do not configure bundled installs as `command=node` unless you also set `ATARI800_PATH`; the launcher sets the correct bundled emulator path automatically. The bundle also includes a `src/atari800` compatibility symlink and server-side bundle path fallback for clients that still launch `mcp-server/index.js` directly.
+
+The bundled `skills/atari800-mcp` directory can be copied or symlinked into Codex or Claude Code's skill directory. It is a generic Atari app/game development and validation guide for this MCP server.
 
 ## Available Tools
 

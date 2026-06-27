@@ -4,12 +4,14 @@ This branch exposes Atari800 through the MCP server in `mcp-server/index.js`. Us
 
 ## Start Here
 
-1. Run the MCP server with `node mcp-server/index.js`.
+1. Run the MCP server:
+   - Source checkout: `node mcp-server/index.js` from this repository, optionally with `ATARI800_PATH=/path/to/src/atari800`.
+   - Runtime bundle: configure the MCP client to run the bundle `start-mcp.sh`, not `node mcp-server/index.js` directly.
 2. Call `atari_preflight` before starting a session.
 3. Use headless mode unless the user explicitly requests a visible window.
 4. Call `atari_stop` when finished; it stops only processes owned by the current MCP session.
 
-The complete low-level AI command inventory and capability notes are in `AGENT_CONTRACT.md`. MCP tool summaries are in `mcp-server/README.md`.
+The complete low-level AI command inventory and capability notes are in `AGENT_CONTRACT.md`. MCP tool summaries are in `mcp-server/README.md`. The repo and runtime bundle include `skills/atari800-mcp`, a Codex/Claude Code compatible skill for Atari app/game development and validation with this MCP server.
 
 ## Build Flags
 

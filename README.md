@@ -248,7 +248,7 @@ Create a standalone MCP runtime bundle outside the normal Atari800 Makefile/auto
 python3 tools/package_mcp_bundle.py
 ```
 
-The output under `dist/` contains `bin/atari800`, `mcp-server/`, `start-mcp.sh`, documentation, and `manifest.json`, with a platform-named `.tar.gz`.
+The output under `dist/` contains `bin/atari800`, `mcp-server/` with production `node_modules`, `start-mcp.sh`, `skills/atari800-mcp`, documentation, and `manifest.json`, with a platform-named `.tar.gz`. Configure MCP clients to run the bundle `start-mcp.sh`; it sets `ATARI800_PATH` to the bundled emulator.
 
 ### State Commands
 

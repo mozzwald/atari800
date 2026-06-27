@@ -794,6 +794,17 @@ int Atari800_Initialise(int *argc, char *argv[])
 #ifdef NETSIO
 					Log_print("\t-netsio [port]   Enable NetSIO emulation (for FujiNet-PC support). Optional UDP port, default 9997");
 #endif
+#ifdef AI_INTERFACE
+					Log_print("\t-ai              Enable the AI socket interface");
+					Log_print("\t-ai-run          Enable AI interface without starting paused");
+					Log_print("\t-ai-socket <p>   Set AI command socket path");
+					Log_print("\t-ai-video-push-socket <p>  Set AI frame push socket path");
+					Log_print("\t-ai-video-pull-socket <p>  Set AI frame pull socket path");
+					Log_print("\t-ai-artifact-dir <p>       Set AI managed artifact directory");
+					Log_print("\t-ai-debug-port <n>         Set AI debug output port");
+					Log_print("\t-ai-command-timeout-ms <n> Set AI command timeout");
+					Log_print("\t-ai-unsafe-paths           Allow unsafe AI host paths");
+#endif
 #ifdef STEREO_SOUND
 					Log_print("\t-stereo          Turn on emulation of two POKEYs");
 					Log_print("\t-nostereo        Turn off emulation of two POKEYs");

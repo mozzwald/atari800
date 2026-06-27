@@ -6,6 +6,7 @@ import os
 import platform
 import shutil
 import stat
+import subprocess
 import tarfile
 import time
 from pathlib import Path
@@ -34,6 +35,15 @@ def copy_tree(src, dst, ignore_names=()):
         shutil.rmtree(dst)
     ignore = shutil.ignore_patterns(*ignore_names) if ignore_names else None
     shutil.copytree(src, dst, ignore=ignore)
+
+
+def run_checked(cmd, cwd):
+    try:
+        subprocess.run(cmd, cwd=cwd, check=True)
+    except FileNotFoundError:
+        raise SystemExit(f"required command not found: {cmd[0]}")
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"command failed in {cwd}: {' '.join(cmd)} (exit {error.returncode})")
 
 
 def manifest_for(bundle_dir, bundle_name):
@@ -77,6 +87,10 @@ def main():
 
     copy_file(emulator, bundle_dir / "bin" / "atari800", 0o755)
     copy_tree(ROOT / "mcp-server", bundle_dir / "mcp-server", ignore_names=("node_modules",))
+    run_checked(["npm", "ci", "--omit=dev", "--ignore-scripts"], bundle_dir / "mcp-server")
+    (bundle_dir / "src").mkdir()
+    os.symlink("../bin/atari800", bundle_dir / "src" / "atari800")
+    copy_tree(ROOT / "skills" / "atari800-mcp", bundle_dir / "skills" / "atari800-mcp")
     copy_file(ROOT / "README.AI.md", bundle_dir / "README.AI.md")
     copy_file(ROOT / "AGENT_CONTRACT.md", bundle_dir / "AGENT_CONTRACT.md")
     copy_file(ROOT / "tools" / "templates" / "start-mcp.sh", bundle_dir / "start-mcp.sh", 0o755)

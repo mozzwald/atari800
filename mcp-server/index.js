@@ -33,7 +33,15 @@ const __dirname = path.dirname(__filename);
 
 const DEFAULT_SOCKET_PATH = '/tmp/atari800_ai.sock';
 const RUNTIME_ROOT = process.env.ATARI800_MCP_RUNTIME_DIR || path.join(os.tmpdir(), 'atari800-mcp');
-const EMULATOR_PATH = process.env.ATARI800_PATH || path.join(__dirname, '..', 'src', 'atari800');
+function resolveEmulatorPath() {
+  if (process.env.ATARI800_PATH) return process.env.ATARI800_PATH;
+  const candidates = [
+    path.join(__dirname, '..', 'bin', 'atari800'),
+    path.join(__dirname, '..', 'src', 'atari800'),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}
+const EMULATOR_PATH = resolveEmulatorPath();
 const LOG_LIMIT = 200;
 const FUJINET_LOG_LIMIT = 1000;
 const FUJINET_PORT_START = Number(process.env.FUJINET_PORT_START || 19997);
@@ -1220,15 +1228,106 @@ function nativeDisplayAvailable() {
   return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY || process.platform === 'darwin');
 }
 
+let aiMcpProbeCache = null;
+
+async function probeAiMcpCapabilities(emulatorPath) {
+  if (aiMcpProbeCache?.path === emulatorPath) return aiMcpProbeCache.result;
+  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'atari800-mcp-probe-'));
+  const socketPath = path.join(probeRoot, 'ai.sock');
+  const artifactDir = path.join(probeRoot, 'artifacts');
+  ensureDir(artifactDir);
+  const argv = [
+    '-ai',
+    '-ai-socket', socketPath,
+    '-ai-video-push-socket', path.join(probeRoot, 'video-push.sock'),
+    '-ai-video-pull-socket', path.join(probeRoot, 'video-pull.sock'),
+    '-ai-artifact-dir', artifactDir,
+    '-xl',
+    '-nosound',
+    '-no-video-accel',
+  ];
+  const env = {
+    ...process.env,
+    SDL_VIDEODRIVER: process.env.SDL_VIDEODRIVER || 'dummy',
+    SDL_AUDIODRIVER: process.env.SDL_AUDIODRIVER || 'dummy',
+  };
+  const logs = [];
+  const startedAt = Date.now();
+  let proc = null;
+  try {
+    proc = spawn(emulatorPath, argv, { stdio: ['ignore', 'pipe', 'pipe'], env });
+    proc.stdout.on('data', (chunk) => logs.push(...chunk.toString('utf8').split(/\r?\n/).filter(Boolean).map((text) => ({ stream: 'stdout', text }))));
+    proc.stderr.on('data', (chunk) => logs.push(...chunk.toString('utf8').split(/\r?\n/).filter(Boolean).map((text) => ({ stream: 'stderr', text }))));
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      if (proc.exitCode !== null || proc.signalCode !== null) break;
+      if (fs.existsSync(socketPath)) {
+        try {
+          const hello = await sendCommand({ cmd: 'hello' }, socketPath);
+          const result = {
+            compatible: hello.status === 'ok',
+            elapsed_ms: Date.now() - startedAt,
+            hello: hello.status === 'ok' ? hello : null,
+            argv: [emulatorPath, ...argv],
+            logs: logs.slice(-40),
+          };
+          aiMcpProbeCache = { path: emulatorPath, result };
+          return result;
+        } catch {
+          // Socket can exist before the command server accepts requests.
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const result = {
+      compatible: false,
+      elapsed_ms: Date.now() - startedAt,
+      exit_code: proc.exitCode,
+      signal: proc.signalCode,
+      argv: [emulatorPath, ...argv],
+      logs: logs.slice(-40),
+      hint: 'Emulator did not accept an MCP hello command with per-session AI socket/video/artifact flags.',
+    };
+    aiMcpProbeCache = { path: emulatorPath, result };
+    return result;
+  } catch (error) {
+    const result = {
+      compatible: false,
+      elapsed_ms: Date.now() - startedAt,
+      error: error.message,
+      argv: [emulatorPath, ...argv],
+      logs: logs.slice(-40),
+    };
+    aiMcpProbeCache = { path: emulatorPath, result };
+    return result;
+  } finally {
+    if (proc && proc.exitCode === null && proc.signalCode === null) {
+      try { proc.kill('SIGTERM'); } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (proc.exitCode === null && proc.signalCode === null) {
+        try { proc.kill('SIGKILL'); } catch {}
+      }
+    }
+    fs.rmSync(probeRoot, { recursive: true, force: true });
+  }
+}
+
 async function buildPreflight() {
   const xvfbPath = executablePath('Xvfb');
   const emulatorExists = fs.existsSync(EMULATOR_PATH);
   const emulatorExecutable = emulatorExists && fileExecutable(EMULATOR_PATH);
   const help = emulatorExecutable ? await runCapture(EMULATOR_PATH, ['-help'], 2500) : null;
   const helpText = help ? `${help.stdout}\n${help.stderr}` : '';
+  const aiMcpProbe = emulatorExecutable ? await probeAiMcpCapabilities(EMULATOR_PATH) : null;
   const missing = [];
   if (!emulatorExists) missing.push({ dependency: 'atari800', hint: `Set ATARI800_PATH or build ${EMULATOR_PATH}` });
   else if (!emulatorExecutable) missing.push({ dependency: 'atari800', hint: `Make ${EMULATOR_PATH} executable` });
+  else if (!aiMcpProbe?.compatible) {
+    missing.push({
+      dependency: 'atari800-ai-mcp',
+      hint: 'Use the bundled atari800 binary or set ATARI800_PATH to a current build with per-session MCP AI flags.',
+    });
+  }
   if (!xvfbPath && process.platform === 'linux') {
     missing.push({ dependency: 'Xvfb', hint: 'Install xvfb / xorg-x11-server-Xvfb / xorg-server-xvfb for headless mode' });
   }
@@ -1243,6 +1342,8 @@ async function buildPreflight() {
       help_excerpt: helpText.split(/\r?\n/).filter(Boolean).slice(0, 20),
       ai_interface_hint: helpText.includes('-ai') || helpText.includes('AI'),
       netsio_hint: helpText.includes('-netsio'),
+      ai_mcp_compatible: Boolean(aiMcpProbe?.compatible),
+      ai_mcp_probe: aiMcpProbe,
     },
     host: {
       platform: process.platform,
@@ -1426,7 +1527,10 @@ async function waitForReady(timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (session?.emulator?.exit_code !== null || session?.emulator?.signal !== null) {
-      throw new Error('Emulator exited during startup');
+      throw makeError('EMULATOR_EXITED', 'Emulator exited during startup', {
+        emulator: session?.emulator || null,
+        logs: session?.logs?.lines?.slice(-80) || [],
+      });
     }
     if (fs.existsSync(session.emulator.socket)) {
       try {
@@ -1441,7 +1545,10 @@ async function waitForReady(timeoutMs = 10000) {
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error('Emulator socket was not ready before timeout');
+  throw makeError('TIMEOUT', 'Emulator socket was not ready before timeout', {
+    emulator: session?.emulator || null,
+    logs: session?.logs?.lines?.slice(-80) || [],
+  });
 }
 
 function cleanupRuntime(cleanupRuntimeDir) {
@@ -2681,6 +2788,13 @@ async function startAtariSession(args = {}) {
   const preflight = await buildPreflight();
   if (!preflight.emulator.executable) {
     throw makeError('CAPABILITY_UNAVAILABLE', 'Atari800 emulator is not executable', { preflight });
+  }
+  if (!preflight.emulator.ai_mcp_compatible) {
+    throw makeError('CAPABILITY_UNAVAILABLE', 'Atari800 emulator does not support the MCP-required AI startup flags', {
+      preflight,
+      required_flags: ['-ai-socket', '-ai-video-push-socket', '-ai-video-pull-socket', '-ai-artifact-dir'],
+      hint: 'Use the bundled atari800 binary or set ATARI800_PATH to a current Atari800 AI/MCP build.',
+    });
   }
   cleanupStaleRuntimeDirs();
   if (!session) {

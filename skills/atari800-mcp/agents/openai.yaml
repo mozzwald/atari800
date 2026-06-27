@@ -1,0 +1,11 @@
+interface:
+  display_name: "Atari800 MCP"
+  short_description: "Develop and test Atari 8-bit software"
+  default_prompt: "Use $atari800-mcp to build, run, and validate this Atari 8-bit app or game through the MCP emulator harness."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "atari800"
+      description: "Local Atari800 emulator MCP server"
+policy:
+  allow_implicit_invocation: true
