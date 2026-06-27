@@ -1396,12 +1396,12 @@ Purpose: provide reproducible tests for the new MCP and NetSIO tools.
 
 Progress checklist:
 
-- [ ] Add a basic XEX/COM smoke test program.
-- [ ] Add a debug-port test program.
-- [ ] Add a native disk boot smoke test.
-- [ ] Add FujiNet boot smoke test.
-- [ ] Add NETStream speed/pacing test app integration.
-- [ ] Add automated MCP tests that run these programs.
+- [x] Add a basic XEX/COM smoke test program.
+- [x] Add a debug-port test program.
+- [x] Add a native disk boot smoke test.
+- [x] Add FujiNet boot smoke test.
+- [x] Add NETStream speed/pacing test app integration.
+- [x] Add automated MCP tests that run these programs.
 
 Recommended test programs:
 
@@ -1428,13 +1428,13 @@ Purpose: prevent regressions and give Codex a concrete finish line.
 
 Progress checklist:
 
-- [ ] Add unit tests for JS MCP helper functions.
-- [ ] Add C-level or integration tests for AI JSON responses where practical.
-- [ ] Add end-to-end MCP tests for headless startup, run, screen, memory, and cleanup.
-- [ ] Add tests for no destructive process handling.
-- [ ] Add FujiNet-PC sidecar tests where available.
-- [ ] Add NetSIO trace/status tests.
-- [ ] Add debugger tests.
+- [x] Add unit tests for JS MCP helper functions.
+- [x] Add C-level or integration tests for AI JSON responses where practical.
+- [x] Add end-to-end MCP tests for headless startup, run, screen, memory, and cleanup.
+- [x] Add tests for no destructive process handling.
+- [x] Add FujiNet-PC sidecar tests where available.
+- [x] Add NetSIO trace/status tests.
+- [x] Add debugger tests.
 
 ## 15.1 Minimum Test Matrix
 
@@ -1472,16 +1472,16 @@ Purpose: make the interface usable by Codex, Claude Code, and humans.
 
 Progress checklist:
 
-- [ ] Update main README.
-- [ ] Update MCP README.
-- [ ] Add `README.AI.md` / `AGENT_CONTRACT.md`.
-- [ ] Add examples for agent workflows.
-- [ ] Document build flags for AI/debug builds.
-- [ ] Document supported host environments.
-- [ ] Add separate manual bundle packaging script outside Atari800 Makefile/autotools flow.
-- [ ] Add `start-mcp.sh` and bundle README templates.
-- [ ] Package MCP server with clear setup instructions.
-- [ ] Generate bundle manifest and platform-specific tarball names.
+- [x] Update main README.
+- [x] Update MCP README.
+- [x] Add `README.AI.md` / `AGENT_CONTRACT.md`.
+- [x] Add examples for agent workflows.
+- [x] Document build flags for AI/debug builds.
+- [x] Document supported host environments.
+- [x] Add separate manual bundle packaging script outside Atari800 Makefile/autotools flow.
+- [x] Add `start-mcp.sh` and bundle README templates.
+- [x] Package MCP server with clear setup instructions.
+- [x] Generate bundle manifest and platform-specific tarball names.
 
 ## 16.1 AI Build Recommendations
 

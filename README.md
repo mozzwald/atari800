@@ -4,13 +4,15 @@ A fork of the [atari800](https://github.com/atari800/atari800) emulator with a b
 
 ## What's New
 
-This fork adds a **real-time AI interface** that allows external programs to:
+This fork adds a **real-time AI/MCP interface** that allows external programs and agents to:
 - Control the emulator programmatically (joystick, keyboard, console keys)
 - Read screen output (ASCII text or raw data)
 - Inspect hardware registers (CPU, ANTIC, GTIA, POKEY, PIA)
 - Read/write memory
 - Save/load emulator state
 - Run frame-by-frame for precise control
+- Manage headless sessions through `mcp-server/index.js`
+- Boot native disk images and FujiNet-PC/NetSIO workflows through managed MCP tools
 
 Useful for automated testing, debugging tools, and programmatic emulator control.
 
@@ -36,6 +38,17 @@ Or use the included build script:
 ./build_ai.sh
 ```
 
+Recommended AI/debug configure flags for manual builds:
+
+```bash
+./configure --with-video=sdl --with-sound=sdl \
+    --enable-ai-interface --enable-netsio \
+    --enable-monitorbreak --enable-monitorbreakpoints \
+    --enable-monitortrace --enable-monitorprofile
+```
+
+`--enable-netsio` is required for the supported FujiNet-PC workflows. `build_ai.sh` uses SDL 1.2 and enables the AI interface plus NetSIO for the MCP-targeted build.
+
 ## Running with AI Interface
 
 ```bash
@@ -43,6 +56,16 @@ Or use the included build script:
 ```
 
 The `-ai` flag enables the AI interface, which creates a Unix socket at `/tmp/atari800_ai.sock`.
+
+For agent workflows, prefer the MCP server:
+
+```bash
+cd mcp-server
+npm install
+npm start
+```
+
+The MCP server starts per-session Atari800 processes, uses headless Xvfb by default on Linux, owns runtime/artifact directories, manages native disk image copies, and integrates with real FujiNet-PC sidecars for NetSIO tests. See `README.AI.md`, `AGENT_CONTRACT.md`, and `mcp-server/README.md`.
 
 Frame streaming is only active when both are true:
 - Build was configured with `--enable-ai-interface`
@@ -209,7 +232,23 @@ for line in resp['data']:
 
 ### Disk Commands
 
-Native `disk_insert`, `disk_eject`, and `disk_status` commands are not implemented in the current C socket API. Native Atari800 disk commands are planned separately from FujiNet-PC mount workflows.
+| Command | Parameters | Description |
+|---------|------------|-------------|
+| `disk.insert` | `drive`, `path`, `read_only` | Mount a native disk image in D1-D8 |
+| `disk.eject` | `drive` | Dismount a native disk drive |
+| `disk.status` | `drive` | Report SIO drive state and mounted image metadata |
+
+For MCP users, prefer `atari_disk_insert`; it copies source images into a managed session workspace and mounts the copy read-only by default.
+
+### Packaging
+
+Create a standalone MCP runtime bundle outside the normal Atari800 Makefile/autotools flow:
+
+```bash
+python3 tools/package_mcp_bundle.py
+```
+
+The output under `dist/` contains `bin/atari800`, `mcp-server/`, `start-mcp.sh`, documentation, and `manifest.json`, with a platform-named `.tar.gz`.
 
 ### State Commands
 

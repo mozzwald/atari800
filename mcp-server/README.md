@@ -10,6 +10,23 @@ Build the emulator with the AI interface enabled:
 ./build_ai.sh
 ```
 
+For a manual AI/debug build, use SDL 1.2 and enable AI, NetSIO, and monitor debugger features:
+
+```sh
+./configure --with-video=sdl --with-sound=sdl \
+  --enable-ai-interface --enable-netsio \
+  --enable-monitorbreak --enable-monitorbreakpoints \
+  --enable-monitortrace --enable-monitorprofile
+make -j4
+```
+
+Install the MCP server dependencies:
+
+```sh
+cd mcp-server
+npm install
+```
+
 Add the server to MCP client settings:
 
 ```json
@@ -25,6 +42,8 @@ Add the server to MCP client settings:
 
 The server uses `../src/atari800` relative to `mcp-server/index.js` by default. Override it with `ATARI800_PATH`.
 
+Supported host environment for the full test matrix is Linux with Node.js 18+, SDL 1.2 runtime libraries, Xvfb for headless sessions, and a real FujiNet-PC archive or unpacked directory for FujiNet/NetSIO workflows.
+
 ## Runtime Model
 
 `atari_start` creates one managed session under `/tmp/atari800-mcp` by default. The session has its own runtime directory, artifact directory, command socket, video push socket, and video pull socket.
@@ -32,6 +51,35 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 `display_mode` can be `auto`, `headless`, or `visible`. `auto` currently behaves like `headless`; on Linux this launches an MCP-owned `Xvfb` process directly and cleans it up with the session. Use `atari_preflight` to check whether Xvfb and a native display are available.
 
 `atari_stop` stops only the tracked MCP-owned emulator process. It does not use global `pkill` cleanup.
+
+## Runtime Bundle
+
+To create a standalone MCP bundle after building Atari800:
+
+```sh
+python3 tools/package_mcp_bundle.py
+```
+
+The bundle is written under `dist/` with a platform-specific name such as `atari800-mcp-linux-x86_64.tar.gz`. It includes:
+
+- `bin/atari800`
+- `mcp-server/`
+- `start-mcp.sh`
+- `README.AI.md`
+- `AGENT_CONTRACT.md`
+- `manifest.json`
+
+Use the bundle launcher in MCP client settings:
+
+```json
+{
+  "mcpServers": {
+    "atari800": {
+      "command": "/path/to/atari800-mcp-linux-x86_64/start-mcp.sh"
+    }
+  }
+}
+```
 
 ## Available Tools
 
@@ -153,6 +201,10 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 Use `atari_disk_insert` for native Atari800 disk images. The MCP copies the source image into the session `native-disks` workspace and mounts that copy read-only unless `write_enabled=true` is requested. Writable mounts report the managed `output_path`; source images are not modified automatically.
 
 Use `atari_artifact_list`, `atari_artifact_info`, `atari_artifact_read_text`, and `atari_artifact_delete` for files under the session artifact root and managed native disk workspace. Log files are listable but not deletable through the artifact delete tool.
+
+## Test Fixtures
+
+`tests/fixtures/mcp_test_programs/generate.py` creates deterministic XEX and ATR fixtures used by `tests/mcp_phase14_smoke.mjs`. The smoke test covers debug-port output, `atari_screen_text`, joystick state, the NETStream probe marker, and native disk boot. Set `FUJINET_PATH` or pass a FujiNet-PC path to include the FujiNet boot fixture.
 
 ## FujiNet Workflow
 
