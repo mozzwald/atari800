@@ -97,13 +97,18 @@ Legend: `Y` means present, `N` means absent, `bad` means documented but currentl
 | `pause` | Y | Y | Y | Y | Y | Y | mutating | Pauses emulation. |
 | `reset` | Y | Y | Y | Y | Y | N | mutating | Cold reset. |
 | `key` | Y | Y | Y | Y | Y | Y | mutating | C uses `code`; MCP accepts key names. |
+| `key.down` | Y | N | Y | N | Y | Y | mutating | Alias for holding a key by AKEY code. |
+| `key.up` | Y | N | Y | N | Y | Y | mutating | Alias for releasing all AI key state. |
 | `key_release` | Y | Y | Y | Y | Y | Y | mutating | Releases all AI key state; no keycode argument. |
 | `joystick` | Y | Y | Y | Y | Y | Y | mutating | Overrides stick and trigger state. |
 | `paddle` | Y | Y | Y | Y | Y | Y | mutating | Value accepted as 0..255. |
-| `consol` | Y | Y | Y | needs-test | needs-test | N | mutating | Active-low semantics need runtime documentation. |
+| `consol` | Y | Y | Y | needs-test | Y | N | mutating | C booleans are active-low: false means pressed. MCP exposes natural pressed booleans. |
+| `input.status` | Y | N | Y | N | Y | Y | read-only | Reports key, console active-low state, joystick overrides, trigger overrides, and paddles. |
 | `screenshot` | Y | Y | Y | Y | Y | Y | mutating | Writes under artifact dir unless unsafe paths are enabled. |
 | `screen_ascii` | Y | Y | Y | Y | Y | Y | read-only | Approximate 40x24 rendered screen text. |
+| `screen.text` | Y | N | Y | N | Y | Y | read-only | Display-list-aware simple text memory read with confidence and unsupported reasons. |
 | `screen_raw` | Y | Y | Y | bad | Y | Y | read-only | Base64 rendered framebuffer bytes, not Atari screen RAM. |
+| `framebuffer.raw` | Y | N | Y | N | Y | Y | read-only | Explicit alias for rendered framebuffer base64 bytes. |
 | `video.enable_push` | Y | N | Y | Y | N | Y | mutating | Enables push frame socket. |
 | `video.disable_push` | Y | N | Y | Y | N | Y | mutating | Disables push frame socket. |
 | `video.enable_pull` | Y | N | Y | Y | N | Y | mutating | Enables pull frame socket. |
@@ -112,6 +117,9 @@ Legend: `Y` means present, `N` means absent, `bad` means documented but currentl
 | `video.push.set_frameskip` | Y | N | Y | Y | N | Y | mutating | Sends one frame every N frames. |
 | `video.push.enable_change_triggered` | Y | N | Y | Y | N | Y | mutating | Pushes only changed frames when enabled. |
 | `video.status` | Y | N | Y | Y | N | Y | read-only | Reports effective video socket paths and stream state. |
+| `disk.insert` | Y | N | Y | N | Y | Y | mutating | Mounts a native disk image in D1..D8; MCP passes managed workspace copies. |
+| `disk.eject` | Y | N | Y | N | Y | Y | mutating | Dismounts a native disk drive. |
+| `disk.status` | Y | N | Y | N | Y | Y | read-only | Reports native SIO drive state, image path, sector size/count, and last disk op. |
 | `peek` | Y | Y | Y | Y | Y | Y | read-only | `len` is capped at 256. |
 | `poke` | Y | Y | Y | bad | Y | Y | unsafe | Uses `data:[byte,...]`; direct `MEMORY_mem` mutation. |
 | `dump` | Y | Y | Y | bad | Y | Y | mutating | Uses `start`, `end`, and `path`; output path is protected. |
@@ -148,6 +156,12 @@ Legend: `Y` means present, `N` means absent, `bad` means documented but currentl
 | `breakpoint.disable` | Y | N | Y | N | N | Y | mutating | Disables a rich monitor breakpoint slot when available. |
 | `save_state` | Y | Y | Y | Y | Y | Y | mutating | Output path is protected. |
 | `load_state` | Y | Y | Y | Y | Y | Y | mutating | Reads caller-provided path. |
+| `netsio.status` | Y | N | Y | N | N | Y | read-only | Emulator-side NetSIO/SIO/NETStream status; handler-only fields reported as `null`. |
+| `netsio.trace.status` | Y | N | Y | N | N | Y | read-only | NetSIO trace ring enabled/count/drop status. |
+| `netsio.trace.read` | Y | N | Y | N | N | Y | read-only | Bounded decoded NetSIO/SIO trace entries. |
+| `netsio.trace.clear` | Y | N | Y | N | N | Y | mutating | Clears NetSIO trace ring. |
+| `netsio.trace.enable` | Y | N | Y | N | N | Y | mutating | Enables NetSIO trace capture. |
+| `netsio.trace.disable` | Y | N | Y | N | N | Y | mutating | Disables NetSIO trace capture. |
 <!-- END AI_COMMAND_INVENTORY -->
 
 Documented but not implemented in C: `breakpoint`, `disk_insert`, `disk_eject`, and `disk_status`.
@@ -163,17 +177,33 @@ Documented but not implemented in C: `breakpoint`, `disk_insert`, `disk_eject`, 
 | `atari_status` | `hello`, process status | Reports active session, paths, process state, sockets, and bounded logs. |
 | `atari_logs` | process log ring | Reads bounded emulator/Xvfb startup logs. |
 | `atari_load` | `load` | Executable-style load through `BINLOAD_Loader(path)`. |
+| `atari_disk_insert` | `disk.insert` | Copies source image into the session native disk workspace and mounts the copy read-only by default. |
+| `atari_disk_eject` | `disk.eject` | Ejects a native Atari disk drive. |
+| `atari_disk_status` | `disk.status` | Reports C SIO drive state and MCP managed native disk copies. |
+| `atari_artifact_list` | filesystem | Lists session artifact, log, and native disk workspace files. |
+| `atari_artifact_info` | filesystem | Reports metadata for one session artifact. |
+| `atari_artifact_read_text` | filesystem | Reads a bounded UTF-8 text artifact. |
+| `atari_artifact_delete` | filesystem | Deletes files from deletable session roots. |
 | `atari_run` | `run` | Text response only. |
+| `atari_run_until` | MCP loop over multiple C commands | Runs bounded frame batches until predicates match; returns diagnostics on timeout. |
 | `atari_frame_step` | `frame_step` | Frame-loop stepping, not CPU instruction stepping. |
 | `atari_pause` | `pause` | Pauses emulation. |
 | `atari_screen` | `screen_ascii` | Text formatted 40x24 view. |
+| `atari_screen_text` | `screen.text` | Simple ANTIC text memory with confidence and unsupported reasons. |
 | `atari_screen_raw` | `screen_raw` | Rendered framebuffer base64 response. |
+| `atari_framebuffer_raw` | `framebuffer.raw` | Explicit rendered framebuffer base64 alias. |
 | `atari_screenshot` | `screenshot` | Optional path; C defaults into artifact dir. |
 | `atari_joystick` | `joystick` | Direction/fire/port. |
 | `atari_key` | `key` | Maps key names to AKEY codes. |
+| `atari_key_down` | `key.down` | Holds a supported key down. |
+| `atari_key_up` | `key.up` | Releases all AI key state. |
+| `atari_press_key` | `key.down`, `run`, `key.up` | Presses one supported key for a bounded frame duration. |
+| `atari_type_text` | `key.down`, `run`, `key.up` | Types supported text one key press at a time. |
 | `atari_key_release` | `key_release` | Releases all AI key state. |
 | `atari_paddle` | `paddle` | Sets paddle input value. |
-| `atari_consol` | `consol` | Boolean console key wrapper. |
+| `atari_consol` | `consol` | Natural pressed booleans translated to C active-low console state. |
+| `atari_press_console` | `consol`, `run`, `consol` | Presses one console key for a bounded frame duration. |
+| `atari_input_status` | `input.status` | Reads current AI input overrides and active-low console state. |
 | `atari_peek` | `peek` | Uses `address`/`length` wrapper fields. |
 | `atari_poke` | `poke` | Uses `address`/`values` wrapper fields. |
 | `atari_dump_memory` | `dump` | Dumps memory to artifact-safe path. |
@@ -219,6 +249,12 @@ Documented but not implemented in C: `breakpoint`, `disk_insert`, `disk_eject`, 
 | `atari_video_set_fps_cap` | `video.push.set_fps_cap` | Sets push FPS cap. |
 | `atari_video_set_frameskip` | `video.push.set_frameskip` | Sets push frame skip. |
 | `atari_video_set_change_triggered` | `video.push.enable_change_triggered` | Sets changed-frame-only push mode. |
+| `atari_netsio_status` | `netsio.status` | Emulator-side NetSIO/SIO/NETStream status. |
+| `atari_netsio_trace_status` | `netsio.trace.status` | NetSIO trace ring status. |
+| `atari_netsio_trace_read` | `netsio.trace.read` | Bounded decoded NetSIO/SIO trace entries. |
+| `atari_netsio_trace_clear` | `netsio.trace.clear` | Clears NetSIO trace ring. |
+| `atari_netsio_trace_enable` | `netsio.trace.enable` | Enables NetSIO trace capture. |
+| `atari_netsio_trace_disable` | `netsio.trace.disable` | Disables NetSIO trace capture. |
 <!-- END MCP_TOOL_INVENTORY -->
 
 `mcp-server/README.md` now matches the actual MCP tool list in `mcp-server/index.js`.

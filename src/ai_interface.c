@@ -142,6 +142,7 @@ static void put_u32le(UBYTE *dst, ULONG value);
 static void put_u64le(UBYTE *dst, unsigned long long value);
 static UWORD get_u16le(const UBYTE *src);
 static ULONG get_u32le(const UBYTE *src);
+static int ai_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...);
 static int set_nonblocking(int fd);
 static int create_unix_server_socket(const char *path);
 static int send_all_blocking(int fd, const UBYTE *data, ULONG len);
@@ -1074,6 +1075,125 @@ static void screen_to_ascii(char *out, int outsize) {
     out[pos] = '\0';
 }
 
+static char ai_screen_code_to_ascii(UBYTE code)
+{
+    code &= 0x7f;
+    if (code < 64)
+        return (char)(code + 32);
+    if (code < 96)
+        return (char)(code - 64);
+    return '.';
+}
+
+static int ai_find_text_screen(UWORD *screen_addr, int *width, int *height, char *mode, size_t mode_size)
+{
+    UWORD p = ANTIC_dlist;
+    int lines = 0;
+    int i;
+    UBYTE first_mode = 0;
+
+    *screen_addr = MEMORY_dGetWord(88);
+    *width = 40;
+    *height = 24;
+    snprintf(mode, mode_size, "os_savmsc_text_40");
+
+    for (i = 0; i < 256; i++) {
+        UBYTE ir = ANTIC_GetDLByte(&p);
+        UBYTE antic_mode = ir & 0x0f;
+        if (antic_mode == 1) {
+            if (ir & 0x40)
+                break;
+            p = ANTIC_GetDLWord(&p);
+            continue;
+        }
+        if (antic_mode == 2 || antic_mode == 3) {
+            if (ir & 0x40) {
+                *screen_addr = ANTIC_GetDLWord(&p);
+                first_mode = antic_mode;
+                lines = 1;
+                break;
+            }
+            if (lines == 0) {
+                first_mode = antic_mode;
+                lines = 1;
+            }
+        }
+    }
+
+    if (lines > 0) {
+        UWORD p2 = p;
+        for (i = 0; i < 64 && lines < 24; i++) {
+            UBYTE ir = ANTIC_GetDLByte(&p2);
+            UBYTE antic_mode = ir & 0x0f;
+            if (antic_mode != first_mode)
+                break;
+            if (ir & 0x40)
+                (void)ANTIC_GetDLWord(&p2);
+            lines++;
+        }
+        *height = lines > 0 ? lines : 24;
+        snprintf(mode, mode_size, "antic_%u_text_40", (unsigned)first_mode);
+        return TRUE;
+    }
+    return TRUE;
+}
+
+static void ai_send_screen_text(void)
+{
+    UWORD screen_addr;
+    int width;
+    int height;
+    int row;
+    int col;
+    int custom_charset;
+    UWORD charset_addr;
+    char mode[32];
+    size_t pos = 0;
+
+    if (!ai_find_text_screen(&screen_addr, &width, &height, mode, sizeof(mode))) {
+        AI_SendResponse("{\"status\":\"ok\",\"supported\":false,\"confidence\":0,\"unsupported_reason\":\"no_text_display_list_entry\"}");
+        return;
+    }
+
+    charset_addr = (UWORD)ANTIC_CHBASE << 8;
+    custom_charset = charset_addr != 0xe000;
+    ai_response[0] = '\0';
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        "{\"status\":\"ok\",\"supported\":%s,\"confidence\":%s,\"mode\":",
+        custom_charset ? "false" : "true", custom_charset ? "0.25" : "0.85");
+    AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, mode);
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        ",\"width\":%d,\"height\":%d,\"screen_addr\":%u,\"charset_addr\":%u,"
+        "\"custom_charset\":%s",
+        width, height, screen_addr, charset_addr, custom_charset ? "true" : "false");
+    if (custom_charset) {
+        ai_append(ai_response, sizeof(ai_response), &pos,
+            ",\"unsupported_reason\":\"custom_charset\"");
+    }
+    ai_append(ai_response, sizeof(ai_response), &pos, ",\"raw\":[");
+    for (row = 0; row < height; row++) {
+        ai_append(ai_response, sizeof(ai_response), &pos, "%s[", row ? "," : "");
+        for (col = 0; col < width; col++) {
+            UBYTE code = MEMORY_SafeGetByte((UWORD)(screen_addr + row * width + col));
+            ai_append(ai_response, sizeof(ai_response), &pos, "%s%u", col ? "," : "", (unsigned)code);
+        }
+        ai_append(ai_response, sizeof(ai_response), &pos, "]");
+    }
+    ai_append(ai_response, sizeof(ai_response), &pos, "],\"lines\":[");
+    for (row = 0; row < height; row++) {
+        char line[64];
+        for (col = 0; col < width && col < (int)sizeof(line) - 1; col++) {
+            UBYTE code = MEMORY_SafeGetByte((UWORD)(screen_addr + row * width + col));
+            line[col] = ai_screen_code_to_ascii(code);
+        }
+        line[col] = '\0';
+        ai_append(ai_response, sizeof(ai_response), &pos, "%s", row ? "," : "");
+        AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, line);
+    }
+    ai_append(ai_response, sizeof(ai_response), &pos, "]}");
+    AI_SendResponse(ai_response);
+}
+
 static int ai_append(char *buf, size_t bufsize, size_t *pos, const char *fmt, ...)
 {
     va_list ap;
@@ -1530,6 +1650,54 @@ static void ai_send_breakpoint_table(void)
 }
 #endif
 
+static const char *ai_sio_status_name(SIO_UnitStatus status)
+{
+    switch (status) {
+    case SIO_OFF:
+        return "off";
+    case SIO_NO_DISK:
+        return "empty";
+    case SIO_READ_ONLY:
+        return "read_only";
+    case SIO_READ_WRITE:
+        return "read_write";
+    default:
+        return "unknown";
+    }
+}
+
+static void ai_send_disk_status(int selected_drive)
+{
+    size_t pos = 0;
+    int drive;
+    int emitted = 0;
+
+    ai_response[0] = '\0';
+    ai_append(ai_response, sizeof(ai_response), &pos,
+        "{\"status\":\"ok\",\"last\":{\"drive\":%d,\"op\":%d,\"sector\":%d,\"op_time\":%d},\"drives\":[",
+        SIO_last_drive, SIO_last_op, SIO_last_sector, SIO_last_op_time);
+    for (drive = 1; drive <= SIO_MAX_DRIVES; drive++) {
+        int index = drive - 1;
+        if (selected_drive != 0 && drive != selected_drive)
+            continue;
+        ai_append(ai_response, sizeof(ai_response), &pos,
+            "%s{\"drive\":%d,\"state\":",
+            emitted ? "," : "", drive);
+        emitted = 1;
+        AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, ai_sio_status_name(SIO_drive_status[index]));
+        ai_append(ai_response, sizeof(ai_response), &pos,
+            ",\"read_only\":%s,\"mounted\":%s,\"path\":",
+            SIO_drive_status[index] == SIO_READ_ONLY ? "true" : "false",
+            (SIO_drive_status[index] == SIO_READ_ONLY || SIO_drive_status[index] == SIO_READ_WRITE) ? "true" : "false");
+        AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, SIO_filename[index]);
+        ai_append(ai_response, sizeof(ai_response), &pos,
+            ",\"sector_size\":%d,\"sector_count\":%d}",
+            SIO_format_sectorsize[index], SIO_format_sectorcount[index]);
+    }
+    ai_append(ai_response, sizeof(ai_response), &pos, "]}");
+    AI_SendResponse(ai_response);
+}
+
 static int ai_ensure_dir(const char *path)
 {
     if (mkdir(path, 0700) == 0 || errno == EEXIST)
@@ -1673,10 +1841,10 @@ static void ai_send_hello(void)
     AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, AI_video_pull_socket_path);
     ai_append(ai_response, sizeof(ai_response), &pos,
         "},\"commands\":[\"ping\",\"hello\",\"capabilities\",\"load\",\"run\",\"frame_step\",\"step\","
-        "\"pause\",\"reset\",\"key\",\"key_release\",\"joystick\",\"paddle\",\"consol\","
-        "\"screenshot\",\"screen_ascii\",\"screen_raw\",\"video.enable_push\",\"video.disable_push\","
+        "\"pause\",\"reset\",\"key\",\"key.down\",\"key.up\",\"key_release\",\"joystick\",\"paddle\",\"consol\",\"input.status\","
+        "\"screenshot\",\"screen_ascii\",\"screen.text\",\"screen_raw\",\"framebuffer.raw\",\"video.enable_push\",\"video.disable_push\","
         "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\","
-        "\"video.push.set_frameskip\",\"video.push.enable_change_triggered\",\"video.status\",\"peek\",\"poke\","
+        "\"video.push.set_frameskip\",\"video.push.enable_change_triggered\",\"video.status\",\"disk.insert\",\"disk.eject\",\"disk.status\",\"peek\",\"poke\","
         "\"dump\",\"cpu\",\"cpu_set\",\"antic\",\"gtia\",\"pokey\",\"pia\","
         "\"debug_enable\",\"debug_read\",\"debugger.status\",\"debugger.show_state\",\"debugger.step_instruction\","
         "\"debugger.history\",\"debugger.jumps\",\"debugger.stack\",\"debugger.disassemble\",\"debugger.disassemble_loop\","
@@ -1685,15 +1853,15 @@ static void ai_send_hello(void)
         "\"breakpoint.list\",\"breakpoint.add\",\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\","
         "\"save_state\",\"load_state\",\"netsio.status\",\"netsio.trace.status\",\"netsio.trace.read\","
         "\"netsio.trace.clear\",\"netsio.trace.enable\",\"netsio.trace.disable\"],"
-        "\"command_classes\":{\"read_only\":[\"ping\",\"hello\",\"capabilities\",\"screen_ascii\",\"screen_raw\","
-        "\"video.status\",\"peek\",\"cpu\",\"antic\",\"gtia\",\"pokey\",\"pia\",\"debug_read\","
+        "\"command_classes\":{\"read_only\":[\"ping\",\"hello\",\"capabilities\",\"screen_ascii\",\"screen.text\",\"screen_raw\",\"framebuffer.raw\",\"input.status\","
+        "\"video.status\",\"disk.status\",\"peek\",\"cpu\",\"antic\",\"gtia\",\"pokey\",\"pia\",\"debug_read\","
         "\"debugger.status\",\"debugger.show_state\",\"debugger.history\",\"debugger.jumps\",\"debugger.stack\","
         "\"debugger.disassemble\",\"debugger.disassemble_loop\",\"debugger.dlist\",\"debugger.search_memory\","
         "\"debugger.search_string\",\"debugger.search_screencode_string\",\"debugger.labels\",\"breakpoint.status\",\"breakpoint.list\","
         "\"netsio.status\",\"netsio.trace.status\",\"netsio.trace.read\"],"
-        "\"mutating\":[\"load\",\"run\",\"frame_step\",\"step\",\"pause\",\"reset\",\"key\",\"key_release\","
+        "\"mutating\":[\"load\",\"run\",\"frame_step\",\"step\",\"pause\",\"reset\",\"key\",\"key.down\",\"key.up\",\"key_release\","
         "\"joystick\",\"paddle\",\"consol\",\"screenshot\",\"video.enable_push\",\"video.disable_push\","
-        "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\",\"video.push.set_frameskip\","
+        "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\",\"video.push.set_frameskip\",\"disk.insert\",\"disk.eject\","
         "\"video.push.enable_change_triggered\",\"dump\",\"debug_enable\",\"debugger.step_instruction\","
         "\"debugger.continue\",\"breakpoint.pc\",\"breakpoint.brk\",\"breakpoint.clear\",\"breakpoint.add\","
         "\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\",\"save_state\",\"load_state\","
@@ -1776,7 +1944,7 @@ static void process_command(const char *cmd) {
     }
 
     /* === INPUT === */
-    else if (strcmp(cmd_type, "key") == 0) {
+    else if (strcmp(cmd_type, "key") == 0 || strcmp(cmd_type, "key.down") == 0) {
         int shift;
         rc = AI_JSON_GetInt(cmd, "code", &INPUT_key_code, AKEY_NONE, TRUE, 0, 65535);
         if (rc != AI_JSON_OK) {
@@ -1792,6 +1960,11 @@ static void process_command(const char *cmd) {
         ai_send_ok();
     }
     else if (strcmp(cmd_type, "key_release") == 0) {
+        INPUT_key_code = AKEY_NONE;
+        INPUT_key_shift = 0;
+        ai_send_ok();
+    }
+    else if (strcmp(cmd_type, "key.up") == 0) {
         INPUT_key_code = AKEY_NONE;
         INPUT_key_shift = 0;
         ai_send_ok();
@@ -1866,6 +2039,31 @@ static void process_command(const char *cmd) {
         if (!option) INPUT_key_consol &= ~INPUT_CONSOL_OPTION;
         ai_send_ok();
     }
+    else if (strcmp(cmd_type, "input.status") == 0) {
+        size_t pos = 0;
+        int i;
+        ai_response[0] = '\0';
+        ai_append(ai_response, sizeof(ai_response), &pos,
+            "{\"status\":\"ok\",\"key\":{\"code\":%d,\"shift\":%s},"
+            "\"console\":{\"raw\":%d,\"active_low\":true,\"start\":%s,\"select\":%s,\"option\":%s},"
+            "\"joystick\":[",
+            INPUT_key_code, INPUT_key_shift ? "true" : "false",
+            INPUT_key_consol,
+            (INPUT_key_consol & INPUT_CONSOL_START) ? "false" : "true",
+            (INPUT_key_consol & INPUT_CONSOL_SELECT) ? "false" : "true",
+            (INPUT_key_consol & INPUT_CONSOL_OPTION) ? "false" : "true");
+        for (i = 0; i < 4; i++) {
+            ai_append(ai_response, sizeof(ai_response), &pos,
+                "%s{\"port\":%d,\"override\":%d,\"trigger_override\":%d,\"trigger_active_low\":true}",
+                i ? "," : "", i, AI_joy_override[i], AI_trig_override[i]);
+        }
+        ai_append(ai_response, sizeof(ai_response), &pos, "],\"paddles\":[");
+        for (i = 0; i < 8; i++) {
+            ai_append(ai_response, sizeof(ai_response), &pos, "%s%d", i ? "," : "", POKEY_POT_input[i]);
+        }
+        ai_append(ai_response, sizeof(ai_response), &pos, "]}");
+        AI_SendResponse(ai_response);
+    }
 
     /* === SCREEN === */
     else if (strcmp(cmd_type, "screenshot") == 0) {
@@ -1894,7 +2092,10 @@ static void process_command(const char *cmd) {
             "{\"status\":\"ok\",\"width\":40,\"height\":24,\"data\":%s}", ascii_data);
         AI_SendResponse(ai_response);
     }
-    else if (strcmp(cmd_type, "screen_raw") == 0) {
+    else if (strcmp(cmd_type, "screen.text") == 0) {
+        ai_send_screen_text();
+    }
+    else if (strcmp(cmd_type, "screen_raw") == 0 || strcmp(cmd_type, "framebuffer.raw") == 0) {
         static char b64_buf[Screen_WIDTH * Screen_HEIGHT * 2];
         base64_encode((UBYTE*)Screen_atari, Screen_WIDTH * Screen_HEIGHT,
                       b64_buf, sizeof(b64_buf));
@@ -1964,6 +2165,37 @@ static void process_command(const char *cmd) {
             ai_fb_change_triggered ? "true" : "false",
             ai_fb_width, ai_fb_height, ai_fb_stride, ai_fb_frame_no);
         AI_SendResponse(ai_response);
+    }
+
+    /* === DISK === */
+    else if (strcmp(cmd_type, "disk.insert") == 0) {
+        int drive;
+        int read_only;
+        rc = AI_JSON_GetInt(cmd, "drive", &drive, 1, FALSE, 1, SIO_MAX_DRIVES);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "drive", FALSE); return; }
+        rc = AI_JSON_GetString(cmd, "path", path, sizeof(path), TRUE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "path", TRUE); return; }
+        rc = AI_JSON_GetBool(cmd, "read_only", &read_only, 1, FALSE);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "read_only", FALSE); return; }
+        if (SIO_Mount(drive, path, read_only)) {
+            ai_send_disk_status(drive);
+        }
+        else {
+            ai_send_error("IO_ERROR", "Failed to mount disk image", "path");
+        }
+    }
+    else if (strcmp(cmd_type, "disk.eject") == 0) {
+        int drive;
+        rc = AI_JSON_GetInt(cmd, "drive", &drive, 1, FALSE, 1, SIO_MAX_DRIVES);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "drive", FALSE); return; }
+        SIO_Dismount(drive);
+        ai_send_disk_status(drive);
+    }
+    else if (strcmp(cmd_type, "disk.status") == 0) {
+        int drive;
+        rc = AI_JSON_GetInt(cmd, "drive", &drive, 0, FALSE, 0, SIO_MAX_DRIVES);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "drive", FALSE); return; }
+        ai_send_disk_status(drive);
     }
 
     /* === MEMORY === */

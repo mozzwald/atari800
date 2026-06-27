@@ -76,6 +76,7 @@ function createSession(program, artifactDirOverride = null) {
     runtime_dir: runtimeDir,
     artifact_dir: artifactDir,
     log_dir: logDir,
+    disk_workspace: path.join(runtimeDir, 'native-disks'),
     owned_paths: artifactDirOverride
       ? [runtimeDir, logDir, aiSocket, videoPushSocket, videoPullSocket]
       : [runtimeDir, artifactDir, logDir, aiSocket, videoPushSocket, videoPullSocket],
@@ -103,6 +104,7 @@ function createSession(program, artifactDirOverride = null) {
     display: null,
     xvfb: null,
     fujinet: null,
+    native_disks: [],
   };
 }
 
@@ -137,8 +139,10 @@ function sessionSnapshot(includeLogs = true) {
     state: session.state,
     runtime_dir: session.runtime_dir,
     artifact_dir: session.artifact_dir,
+    disk_workspace: session.disk_workspace,
     emulator: session.emulator,
     xvfb: session.xvfb,
+    native_disks: session.native_disks || [],
     fujinet: session.fujinet ? {
       ...session.fujinet,
       logs: undefined,
@@ -353,6 +357,22 @@ function findFujiNetExecutable(root) {
   return null;
 }
 
+function findFujiNetLauncher(root) {
+  const candidates = [
+    path.join(root, 'run-fujinet'),
+    path.join(root, 'fujinet-pc-ATARI', 'run-fujinet'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const nested = path.join(root, entry.name, 'run-fujinet');
+    if (fs.existsSync(nested)) return nested;
+  }
+  return null;
+}
+
 function copyOrExtractFujiNet(sourcePath, targetRoot) {
   ensureDir(targetRoot);
   const stat = fs.statSync(sourcePath);
@@ -383,6 +403,7 @@ function preparedFujiNetInstall(sourcePath = null) {
   return {
     sourcePath: info.source_path,
     workDir: info.working_dir,
+    processCwd: path.basename(info.launcher_path) === 'run-fujinet' ? path.dirname(info.launcher_path) : info.working_dir,
     executable: info.executable_path,
     launcher: info.launcher_path,
     sdPath: info.sd_path,
@@ -412,8 +433,7 @@ function prepareFujiNetInstall(sourcePath) {
     throw makeError('BAD_ARGUMENT', 'FujiNet-PC executable not found after preparation', { workDir });
   }
   fs.chmodSync(executable, 0o755);
-  const packagedLauncher = path.join(workDir, 'run-fujinet');
-  const launcher = fs.existsSync(packagedLauncher) ? packagedLauncher : executable;
+  const launcher = findFujiNetLauncher(workDir) || executable;
   fs.chmodSync(launcher, 0o755);
   const sdPath = path.join(workDir, 'SD');
   ensureDir(sdPath);
@@ -451,7 +471,15 @@ function prepareFujiNetInstall(sourcePath) {
     log_seq: 0,
   };
   if (!session.owned_paths.includes(installRoot)) session.owned_paths.push(installRoot);
-  return { sourcePath: resolvedSource, workDir, executable, launcher, sdPath, configPath };
+  return {
+    sourcePath: resolvedSource,
+    workDir,
+    processCwd: path.basename(launcher) === 'run-fujinet' ? path.dirname(launcher) : workDir,
+    executable,
+    launcher,
+    sdPath,
+    configPath,
+  };
 }
 
 function readFujiNetConfig(configPath) {
@@ -628,6 +656,160 @@ function mountFujiNetDisk(args = {}) {
     status: 'ok', mount, replaced_preserved_path: preservedPath, config_write: written,
     pending_remount: Boolean(session.fujinet.pending_remount),
   };
+}
+
+function validateDrive(drive) {
+  const value = Number(drive);
+  if (!Number.isInteger(value) || value < 1 || value > 8) {
+    throw makeError('BAD_ARGUMENT', 'drive must be an integer from 1 to 8', { drive });
+  }
+  return value;
+}
+
+function currentNativeDisk(drive) {
+  return session?.native_disks?.find((disk) => disk.drive === drive) || null;
+}
+
+async function mountNativeDisk(args = {}) {
+  if (!emulatorProcessRunning()) throw makeError('NOT_RUNNING', 'Atari800 must be running before mounting a native disk');
+  if (!args.source_path) throw makeError('MISSING_FIELD', 'source_path is required');
+  const sourcePath = path.resolve(args.source_path);
+  if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+    throw makeError('BAD_ARGUMENT', 'source disk image does not exist or is not a file', { source_path: sourcePath });
+  }
+  const drive = validateDrive(args.drive ?? 1);
+  const writeEnabled = args.write_enabled === true;
+  const readOnly = !writeEnabled;
+  ensureDir(session.disk_workspace);
+  const targetDir = path.join(session.disk_workspace, `drive${drive}`);
+  ensureDir(targetDir);
+  const targetPath = path.join(targetDir, safeDiskName(sourcePath));
+  copyFileAtomic(sourcePath, targetPath);
+  if (readOnly) fs.chmodSync(targetPath, 0o400);
+  else fs.chmodSync(targetPath, 0o600);
+
+  const resp = await sendCommand({ cmd: 'disk.insert', drive, path: targetPath, read_only: readOnly });
+  const disk = {
+    drive,
+    source_path: sourcePath,
+    managed_path: targetPath,
+    read_only: readOnly,
+    write_enabled: writeEnabled,
+    output_path: writeEnabled ? targetPath : null,
+    copy_to_workspace: true,
+    mounted_at: nowIso(),
+    policy: 'source copied to session workspace; source is never modified automatically',
+    c_status: resp.drives?.[0] || null,
+  };
+  session.native_disks = (session.native_disks || []).filter((item) => item.drive !== drive);
+  session.native_disks.push(disk);
+  session.native_disks.sort((a, b) => a.drive - b.drive);
+  return { status: 'ok', disk, c_status: resp };
+}
+
+async function ejectNativeDisk(args = {}) {
+  if (!emulatorProcessRunning()) throw makeError('NOT_RUNNING', 'Atari800 must be running before ejecting a native disk');
+  const drive = validateDrive(args.drive);
+  const disk = currentNativeDisk(drive);
+  const resp = await sendCommand({ cmd: 'disk.eject', drive });
+  session.native_disks = (session.native_disks || []).filter((item) => item.drive !== drive);
+  return { status: 'ok', drive, was_mounted: Boolean(disk), disk, c_status: resp };
+}
+
+async function nativeDiskStatus(args = {}) {
+  if (!emulatorProcessRunning()) {
+    return { status: 'ok', state: 'not_running', disks: session?.native_disks || [] };
+  }
+  const drive = args.drive === undefined ? 0 : Number(args.drive);
+  if (!Number.isInteger(drive) || drive < 0 || drive > 8) {
+    throw makeError('BAD_ARGUMENT', 'drive must be 0 or an integer from 1 to 8', { drive: args.drive });
+  }
+  const resp = await sendCommand({ cmd: 'disk.status', drive });
+  return { status: 'ok', disks: session.native_disks || [], c_status: resp };
+}
+
+function artifactRoots() {
+  if (!session) throw makeError('NOT_RUNNING', 'no active MCP session');
+  const roots = [
+    { name: 'artifacts', root: session.artifact_dir, deletable: true },
+    { name: 'logs', root: session.log_dir, deletable: false },
+    { name: 'native_disks', root: session.disk_workspace, deletable: true },
+  ];
+  return roots.filter((item) => fs.existsSync(item.root));
+}
+
+function walkArtifacts(rootInfo, limit, out, base = rootInfo.root) {
+  if (out.length >= limit) return;
+  for (const entry of fs.readdirSync(base, { withFileTypes: true })) {
+    if (out.length >= limit) return;
+    const full = path.join(base, entry.name);
+    const stat = fs.statSync(full);
+    const rel = path.relative(rootInfo.root, full).split(path.sep).join('/');
+    if (entry.isDirectory()) {
+      walkArtifacts(rootInfo, limit, out, full);
+    } else {
+      out.push({
+        root: rootInfo.name,
+        path: rel,
+        absolute_path: full,
+        size: stat.size,
+        mtime: stat.mtime.toISOString(),
+        deletable: rootInfo.deletable,
+      });
+    }
+  }
+}
+
+function listArtifacts(args = {}) {
+  const limit = Math.max(1, Math.min(Number(args.limit || 200), 1000));
+  const files = [];
+  for (const rootInfo of artifactRoots()) walkArtifacts(rootInfo, limit, files);
+  return { status: 'ok', session_id: session.session_id, roots: artifactRoots().map(({ name, root, deletable }) => ({ name, root, deletable })), files };
+}
+
+function resolveArtifact(rootName, artifactPath) {
+  if (!artifactPath) throw makeError('MISSING_FIELD', 'path is required');
+  const rootInfo = artifactRoots().find((item) => item.name === (rootName || 'artifacts'));
+  if (!rootInfo) throw makeError('BAD_ARGUMENT', 'artifact root is not available', { root: rootName || 'artifacts' });
+  const full = path.resolve(rootInfo.root, artifactPath);
+  if (!pathIsInside(full, rootInfo.root)) {
+    throw makeError('PATH_DENIED', 'artifact path is outside the selected root', { root: rootInfo.root, path: artifactPath });
+  }
+  return { rootInfo, full };
+}
+
+function artifactInfo(args = {}) {
+  const { rootInfo, full } = resolveArtifact(args.root, args.path);
+  if (!fs.existsSync(full)) throw makeError('BAD_ARGUMENT', 'artifact does not exist', { path: args.path });
+  const stat = fs.statSync(full);
+  return {
+    status: 'ok',
+    root: rootInfo.name,
+    path: path.relative(rootInfo.root, full).split(path.sep).join('/'),
+    absolute_path: full,
+    size: stat.size,
+    mtime: stat.mtime.toISOString(),
+    is_file: stat.isFile(),
+    is_directory: stat.isDirectory(),
+    deletable: rootInfo.deletable,
+  };
+}
+
+function readArtifactText(args = {}) {
+  const info = artifactInfo(args);
+  if (!info.is_file) throw makeError('BAD_ARGUMENT', 'artifact is not a file', { path: args.path });
+  const maxBytes = Math.max(1, Math.min(Number(args.max_bytes || 65536), 1024 * 1024));
+  const data = fs.readFileSync(info.absolute_path);
+  return { ...info, content: data.subarray(0, maxBytes).toString('utf8'), truncated: data.length > maxBytes };
+}
+
+function deleteArtifact(args = {}) {
+  const info = artifactInfo(args);
+  const rootInfo = artifactRoots().find((item) => item.name === info.root);
+  if (!rootInfo?.deletable) throw makeError('PATH_DENIED', 'selected artifact root is not deletable', { root: info.root });
+  if (info.is_directory) fs.rmSync(info.absolute_path, { recursive: true, force: true });
+  else fs.unlinkSync(info.absolute_path);
+  return { status: 'ok', deleted: { root: info.root, path: info.path, absolute_path: info.absolute_path } };
 }
 
 function unmountFujiNetDisk(args = {}) {
@@ -820,7 +1002,7 @@ async function startFujiNetSidecar(args = {}) {
   const argv = ['-c', prepared.configPath, '-s', prepared.sdPath];
   if (args.web_url) argv.unshift('-u', args.web_url);
   const proc = spawn(prepared.launcher, argv, {
-    cwd: prepared.workDir,
+    cwd: prepared.processCwd || prepared.workDir,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });
@@ -1349,6 +1531,251 @@ function formatToolResponse(summary, response) {
   return `${summary}\n${formatJson(response)}`;
 }
 
+function textFromScreenResponse(resp) {
+  if (!resp || !Array.isArray(resp.data)) return '';
+  return resp.data.join('\n');
+}
+
+function bytesEqual(actual = [], expected = []) {
+  if (actual.length < expected.length) return false;
+  return expected.every((value, index) => actual[index] === value);
+}
+
+function predicateSummary(predicate, matched, details = {}) {
+  return {
+    type: predicate.type,
+    matched,
+    ...details,
+  };
+}
+
+async function collectRunUntilDiagnostics(args, state) {
+  const diagnostics = {
+    elapsed_frames: state.elapsedFrames,
+    elapsed_ms_wallclock: Date.now() - state.startedAt,
+    last_cpu: state.lastCpu || null,
+    last_screen: state.lastScreen || null,
+    debug_tail: state.debugEvents.slice(-(args.include_debug_tail || 0)),
+    fujinet_log_tail: [],
+    netsio_trace_tail: [],
+    session: sessionSnapshot(false),
+  };
+
+  if (args.include_screenshot === true) {
+    try {
+      diagnostics.screenshot = await sendCommand({ cmd: 'screenshot' });
+    } catch (error) {
+      diagnostics.screenshot = { status: 'error', message: error.message };
+    }
+  }
+  if ((args.include_fujinet_log_tail || 0) > 0) {
+    diagnostics.fujinet_log_tail = readFujiNetLogs({ limit: args.include_fujinet_log_tail }).lines;
+  }
+  if ((args.include_netsio_trace_tail || 0) > 0) {
+    try {
+      const trace = await sendCommand({ cmd: 'netsio.trace.read', since_seq: 0, limit: args.include_netsio_trace_tail });
+      diagnostics.netsio_trace_tail = trace.entries || [];
+    } catch (error) {
+      diagnostics.netsio_trace_tail = { status: 'error', message: error.message };
+    }
+  }
+  return diagnostics;
+}
+
+async function evaluateRunUntilPredicates(predicates, state) {
+  const needed = new Set(predicates.map((predicate) => predicate.type));
+  let screenResp = null;
+  let cpuResp = null;
+  let debugResp = null;
+  let debuggerResp = null;
+  let netsioTrace = null;
+  const running = emulatorProcessRunning();
+
+  if (running && (needed.has('screen_contains') || needed.has('screen_not_contains'))) {
+    screenResp = await sendCommand({ cmd: 'screen_ascii' });
+    state.lastScreen = screenResp?.data || null;
+  }
+  if (running && (needed.has('pc_equals') || needed.has('pc_in_range'))) {
+    cpuResp = await sendCommand({ cmd: 'cpu' });
+    state.lastCpu = cpuResp;
+  }
+  if (running && needed.has('debug_contains')) {
+    debugResp = await sendCommand({ cmd: 'debug_read' });
+    const ascii = debugResp?.ascii || '';
+    if (ascii) state.debugEvents.push({ elapsed_frames: state.elapsedFrames, ascii, data: debugResp.data || [] });
+  }
+  if (running && needed.has('breakpoint_hit')) {
+    debuggerResp = await sendCommand({ cmd: 'debugger.status' });
+  }
+  if (running && needed.has('netsio_event')) {
+    netsioTrace = await sendCommand({ cmd: 'netsio.trace.read', since_seq: state.netsioSinceSeq || 0, limit: 100 });
+    if (Array.isArray(netsioTrace.entries) && netsioTrace.entries.length) {
+      state.netsioEvents.push(...netsioTrace.entries);
+      state.netsioSinceSeq = (netsioTrace.last_seq || state.netsioSinceSeq || 0) + 1;
+    }
+  }
+
+  return Promise.all(predicates.map(async (predicate) => {
+    switch (predicate.type) {
+      case 'frames_elapsed':
+        return predicateSummary(predicate, state.elapsedFrames >= Number(predicate.frames || 0), { elapsed_frames: state.elapsedFrames });
+      case 'screen_contains': {
+        const text = textFromScreenResponse(screenResp);
+        return predicateSummary(predicate, text.includes(predicate.text || ''), { text: predicate.text || '' });
+      }
+      case 'screen_not_contains': {
+        const text = textFromScreenResponse(screenResp);
+        return predicateSummary(predicate, !text.includes(predicate.text || ''), { text: predicate.text || '' });
+      }
+      case 'memory_equals': {
+        const expected = Array.isArray(predicate.data) ? predicate.data : [];
+        if (!running) return predicateSummary(predicate, false, { addr: predicate.addr, expected, actual: null });
+        const resp = await sendCommand({ cmd: 'peek', addr: predicate.addr, len: expected.length });
+        return predicateSummary(predicate, bytesEqual(resp.data || [], expected), {
+          addr: predicate.addr,
+          expected,
+          actual: (resp.data || []).slice(0, expected.length),
+        });
+      }
+      case 'memory_changed': {
+        const len = Math.max(1, Number(predicate.len || predicate.length || 1));
+        if (!running) return predicateSummary(predicate, false, { addr: predicate.addr, actual: null });
+        const resp = await sendCommand({ cmd: 'peek', addr: predicate.addr, len });
+        const key = `${predicate.addr}:${len}`;
+        const current = resp.data || [];
+        if (!state.memoryBaselines.has(key)) {
+          state.memoryBaselines.set(key, current);
+          return predicateSummary(predicate, false, { addr: predicate.addr, baseline: current, actual: current });
+        }
+        return predicateSummary(predicate, !bytesEqual(current, state.memoryBaselines.get(key)), {
+          addr: predicate.addr,
+          baseline: state.memoryBaselines.get(key),
+          actual: current,
+        });
+      }
+      case 'pc_equals':
+        return predicateSummary(predicate, cpuResp?.pc === predicate.addr || cpuResp?.pc === predicate.pc, { pc: cpuResp?.pc ?? null });
+      case 'pc_in_range': {
+        const pc = cpuResp?.pc;
+        return predicateSummary(predicate, pc >= predicate.start && pc <= predicate.end, { pc: pc ?? null });
+      }
+      case 'debug_contains': {
+        const text = state.debugEvents.map((event) => event.ascii).join('\n');
+        return predicateSummary(predicate, text.includes(predicate.text || ''), { text: predicate.text || '' });
+      }
+      case 'fujinet_log_contains': {
+        const logs = readFujiNetLogs({ since_seq: 0, limit: FUJINET_LOG_LIMIT }).lines;
+        const matched = logs.some((line) => line.text.includes(predicate.text || ''));
+        return predicateSummary(predicate, matched, { text: predicate.text || '', checked_lines: logs.length });
+      }
+      case 'netsio_event': {
+        const matched = state.netsioEvents.some((entry) => {
+          if (predicate.event && entry.type !== predicate.event) return false;
+          if (predicate.direction && entry.direction !== predicate.direction) return false;
+          if (predicate.id !== undefined && entry.id !== predicate.id) return false;
+          return true;
+        });
+        return predicateSummary(predicate, matched, { checked_entries: state.netsioEvents.length });
+      }
+      case 'breakpoint_hit': {
+        const reason = debuggerResp?.debugger?.stopped_reason || '';
+        const expected = predicate.reason || predicate.stopped_reason || null;
+        return predicateSummary(predicate, expected ? reason === expected : reason.startsWith('breakpoint'), { stopped_reason: reason });
+      }
+      case 'emulator_exited':
+        return predicateSummary(predicate, !emulatorProcessRunning(), {
+          exit_code: session?.emulator?.exit_code ?? null,
+          signal: session?.emulator?.signal ?? null,
+        });
+      default:
+        throw makeError('BAD_ARGUMENT', `unsupported run_until predicate type: ${predicate.type}`, { predicate });
+    }
+  }));
+}
+
+async function runUntil(args = {}) {
+  const predicates = Array.isArray(args.predicates) ? args.predicates : [];
+  if (predicates.length === 0) throw makeError('BAD_ARGUMENT', 'atari_run_until requires at least one predicate');
+  if (args.max_frames === undefined && args.max_ms_wallclock === undefined) {
+    throw makeError('BAD_ARGUMENT', 'atari_run_until requires max_frames or max_ms_wallclock');
+  }
+
+  const mode = args.mode || 'any';
+  if (!['any', 'all'].includes(mode)) throw makeError('BAD_ARGUMENT', 'mode must be any or all', { mode });
+  const maxFrames = args.max_frames === undefined ? Infinity : Math.max(0, Number(args.max_frames));
+  const maxMs = args.max_ms_wallclock === undefined ? Infinity : Math.max(1, Number(args.max_ms_wallclock));
+  const pollFrames = Math.max(1, Math.min(Number(args.poll_interval_frames || 5), Number.isFinite(maxFrames) ? Math.max(1, maxFrames) : 600));
+  const stableForFrames = Math.max(0, Number(args.stable_for_frames || 0));
+  const state = {
+    startedAt: Date.now(),
+    elapsedFrames: 0,
+    stableFrames: 0,
+    memoryBaselines: new Map(),
+    debugEvents: [],
+    netsioEvents: [],
+    netsioSinceSeq: 0,
+    lastCpu: null,
+    lastScreen: null,
+  };
+  let lastResults = [];
+  let lastRunResponse = null;
+
+  for (;;) {
+    if (!emulatorProcessRunning()) {
+      lastResults = await evaluateRunUntilPredicates(predicates, state);
+      const matched = mode === 'all' ? lastResults.every((r) => r.matched) : lastResults.some((r) => r.matched);
+      if (matched || predicates.some((predicate) => predicate.type === 'emulator_exited')) {
+        return {
+          status: 'ok',
+          reason: matched ? 'predicate_matched' : 'emulator_exited',
+          matched,
+          predicates: lastResults,
+          diagnostics: await collectRunUntilDiagnostics(args, state),
+        };
+      }
+      break;
+    }
+
+    lastResults = await evaluateRunUntilPredicates(predicates, state);
+    const matched = mode === 'all' ? lastResults.every((r) => r.matched) : lastResults.some((r) => r.matched);
+    if (matched) {
+      state.stableFrames += pollFrames;
+      if (stableForFrames === 0 || state.stableFrames >= stableForFrames) {
+        return {
+          status: 'ok',
+          reason: 'predicate_matched',
+          matched: true,
+          predicates: lastResults,
+          diagnostics: await collectRunUntilDiagnostics(args, state),
+        };
+      }
+    } else {
+      state.stableFrames = 0;
+    }
+
+    if (state.elapsedFrames >= maxFrames || Date.now() - state.startedAt >= maxMs) break;
+    const frames = Math.min(pollFrames, Number.isFinite(maxFrames) ? maxFrames - state.elapsedFrames : pollFrames);
+    if (frames <= 0) break;
+    lastRunResponse = await sendCommand({ cmd: 'run', frames });
+    state.elapsedFrames += frames;
+    if (lastRunResponse?.debugger?.paused && lastRunResponse?.debugger?.stopped_reason?.startsWith('breakpoint')) {
+      lastResults = await evaluateRunUntilPredicates(predicates, state);
+    }
+  }
+
+  if ((args.on_timeout || 'pause') === 'pause' && emulatorProcessRunning()) {
+    try { await sendCommand({ cmd: 'pause' }); } catch {}
+  }
+  return {
+    status: 'timeout',
+    reason: state.elapsedFrames >= maxFrames ? 'max_frames' : 'max_ms_wallclock',
+    matched: false,
+    predicates: lastResults,
+    last_run_response: lastRunResponse,
+    diagnostics: await collectRunUntilDiagnostics(args, state),
+  };
+}
+
 const server = new Server(
   { name: 'atari800', version: '1.0.0' },
   { capabilities: { tools: {} } },
@@ -1599,6 +2026,64 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'atari_run_until',
+      description: 'Run bounded frame batches until screen, memory, CPU, debug, FujiNet log, NetSIO trace, breakpoint, frame, or exit predicates match.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          predicates: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                type: {
+                  type: 'string',
+                  enum: [
+                    'frames_elapsed',
+                    'screen_contains',
+                    'screen_not_contains',
+                    'memory_equals',
+                    'memory_changed',
+                    'pc_equals',
+                    'pc_in_range',
+                    'debug_contains',
+                    'fujinet_log_contains',
+                    'netsio_event',
+                    'breakpoint_hit',
+                    'emulator_exited',
+                  ],
+                },
+                text: { type: 'string' },
+                addr: { type: 'number' },
+                pc: { type: 'number' },
+                start: { type: 'number' },
+                end: { type: 'number' },
+                data: { type: 'array', items: { type: 'number' } },
+                len: { type: 'number' },
+                frames: { type: 'number' },
+                event: { type: 'string' },
+                direction: { type: 'string' },
+                id: { type: 'number' },
+                reason: { type: 'string' },
+              },
+              required: ['type'],
+            },
+          },
+          mode: { type: 'string', enum: ['any', 'all'], default: 'any' },
+          max_frames: { type: 'number' },
+          max_ms_wallclock: { type: 'number' },
+          poll_interval_frames: { type: 'number', default: 5 },
+          stable_for_frames: { type: 'number', default: 0 },
+          on_timeout: { type: 'string', enum: ['pause', 'leave_running'], default: 'pause' },
+          include_screenshot: { type: 'boolean', default: false },
+          include_debug_tail: { type: 'number', default: 0 },
+          include_netsio_trace_tail: { type: 'number', default: 0 },
+          include_fujinet_log_tail: { type: 'number', default: 0 },
+        },
+        required: ['predicates'],
+      },
+    },
+    {
       name: 'atari_frame_step',
       description: 'Run N frame-loop ticks, then pause.',
       inputSchema: {
@@ -1616,8 +2101,69 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['path'],
       },
     },
+    {
+      name: 'atari_disk_insert',
+      description: 'Copy a user disk image into the session workspace and mount it in a native Atari drive.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          source_path: { type: 'string' },
+          drive: { type: 'number', minimum: 1, maximum: 8, default: 1 },
+          write_enabled: { type: 'boolean', default: false },
+        },
+        required: ['source_path'],
+      },
+    },
+    {
+      name: 'atari_disk_eject',
+      description: 'Eject a native Atari disk drive.',
+      inputSchema: {
+        type: 'object',
+        properties: { drive: { type: 'number', minimum: 1, maximum: 8 } },
+        required: ['drive'],
+      },
+    },
+    {
+      name: 'atari_disk_status',
+      description: 'Report native Atari disk drive state and managed workspace copies.',
+      inputSchema: { type: 'object', properties: { drive: { type: 'number' } } },
+    },
+    {
+      name: 'atari_artifact_list',
+      description: 'List bounded files from the session artifact, log, and native disk workspace roots.',
+      inputSchema: { type: 'object', properties: { limit: { type: 'number', default: 200 } } },
+    },
+    {
+      name: 'atari_artifact_info',
+      description: 'Get metadata for one session artifact.',
+      inputSchema: {
+        type: 'object',
+        properties: { root: { type: 'string' }, path: { type: 'string' } },
+        required: ['path'],
+      },
+    },
+    {
+      name: 'atari_artifact_read_text',
+      description: 'Read a bounded UTF-8 text artifact.',
+      inputSchema: {
+        type: 'object',
+        properties: { root: { type: 'string' }, path: { type: 'string' }, max_bytes: { type: 'number', default: 65536 } },
+        required: ['path'],
+      },
+    },
+    {
+      name: 'atari_artifact_delete',
+      description: 'Delete an artifact from a deletable session root.',
+      inputSchema: {
+        type: 'object',
+        properties: { root: { type: 'string' }, path: { type: 'string' } },
+        required: ['path'],
+      },
+    },
     { name: 'atari_screen', description: 'Get the current screen as ASCII art.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_screen_text', description: 'Read simple ANTIC text display memory with confidence and unsupported-mode reporting.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_screen_raw', description: 'Get the rendered framebuffer as base64 data.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_framebuffer_raw', description: 'Get the rendered framebuffer as base64 data.', inputSchema: { type: 'object', properties: {} } },
     {
       name: 'atari_screenshot',
       description: 'Save a screenshot. Omit path to use the managed artifact directory.',
@@ -1647,6 +2193,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['key'],
       },
     },
+    {
+      name: 'atari_key_down',
+      description: 'Hold a supported Atari keyboard key down.',
+      inputSchema: {
+        type: 'object',
+        properties: { key: { type: 'string' }, shift: { type: 'boolean' } },
+        required: ['key'],
+      },
+    },
+    { name: 'atari_key_up', description: 'Release all AI key state.', inputSchema: { type: 'object', properties: {} } },
+    {
+      name: 'atari_press_key',
+      description: 'Press a supported key for a bounded number of frames, then release it.',
+      inputSchema: {
+        type: 'object',
+        properties: { key: { type: 'string' }, frames: { type: 'number', default: 2 }, shift: { type: 'boolean' } },
+        required: ['key'],
+      },
+    },
+    {
+      name: 'atari_type_text',
+      description: 'Type supported text one key press at a time.',
+      inputSchema: {
+        type: 'object',
+        properties: { text: { type: 'string' }, frames_per_key: { type: 'number', default: 2 } },
+        required: ['text'],
+      },
+    },
     { name: 'atari_key_release', description: 'Release all AI key state.', inputSchema: { type: 'object', properties: {} } },
     {
       name: 'atari_paddle',
@@ -1659,6 +2233,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: 'atari_press_console',
+      description: 'Press one active-low console key for a bounded number of frames, then release it.',
+      inputSchema: {
+        type: 'object',
+        properties: { key: { type: 'string', enum: ['start', 'select', 'option'] }, frames: { type: 'number', default: 2 } },
+        required: ['key'],
+      },
+    },
+    { name: 'atari_input_status', description: 'Read keyboard, console, joystick override, trigger, and paddle input state.', inputSchema: { type: 'object', properties: {} } },
     {
       name: 'atari_consol',
       description: 'Press console keys.',
@@ -1870,6 +2454,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: { type: { type: 'string', enum: ['all', 'pc', 'brk', 'table', 'rich'], default: 'all' } },
       },
     },
+    { name: 'atari_netsio_status', description: 'Report emulator-side NetSIO, SIO, queue, sync, ACK/NAK, and NETStream status.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_netsio_trace_status', description: 'Report NetSIO trace ring enabled/count/drop state.', inputSchema: { type: 'object', properties: {} } },
+    {
+      name: 'atari_netsio_trace_read',
+      description: 'Read bounded decoded NetSIO/SIO trace entries.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          since_seq: { type: 'number', default: 0 },
+          limit: { type: 'number', default: 100 },
+        },
+      },
+    },
+    { name: 'atari_netsio_trace_clear', description: 'Clear the NetSIO trace ring.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_netsio_trace_enable', description: 'Enable NetSIO trace capture.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_netsio_trace_disable', description: 'Disable NetSIO trace capture.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_video_status', description: 'Get video socket and stream state.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_video_enable_push', description: 'Enable video push streaming.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_video_disable_push', description: 'Disable video push streaming.', inputSchema: { type: 'object', properties: {} } },
@@ -1932,6 +2532,54 @@ const KEY_CODES = {
   space: 33, ' ': 33, return: 12, enter: 12, escape: 28, esc: 28,
   tab: 44, backspace: 52,
 };
+
+function resolveKey(key, shift = undefined) {
+  if (typeof key !== 'string' || key.length === 0) {
+    throw makeError('BAD_ARGUMENT', 'key must be a non-empty string', { key });
+  }
+  const lower = key.toLowerCase();
+  const code = KEY_CODES[key] ?? KEY_CODES[lower];
+  if (code === undefined) {
+    throw makeError('BAD_ARGUMENT', `unknown key: ${key}`, { key });
+  }
+  return {
+    code,
+    shift: shift !== undefined ? Boolean(shift) : key.length === 1 && key !== lower,
+  };
+}
+
+async function pressKey(key, { frames = 2, shift = undefined } = {}) {
+  const resolved = resolveKey(key, shift);
+  const down = await sendCommand({ cmd: 'key.down', ...resolved });
+  if (frames > 0) await sendCommand({ cmd: 'run', frames });
+  const up = await sendCommand({ cmd: 'key.up' });
+  return { status: 'ok', key, frames, down, up };
+}
+
+async function typeText(text, { frames_per_key = 2 } = {}) {
+  if (typeof text !== 'string') throw makeError('BAD_ARGUMENT', 'text must be a string', { text });
+  const typed = [];
+  for (const ch of text) {
+    typed.push(await pressKey(ch, { frames: frames_per_key }));
+  }
+  return { status: 'ok', text, chars: typed.length };
+}
+
+function consoleCommandFor(key, pressed) {
+  const command = { cmd: 'consol', start: true, select: true, option: true };
+  command[key] = !pressed;
+  return command;
+}
+
+async function pressConsole(key, frames = 2) {
+  if (!['start', 'select', 'option'].includes(key)) {
+    throw makeError('BAD_ARGUMENT', 'console key must be start, select, or option', { key });
+  }
+  const down = await sendCommand(consoleCommandFor(key, true));
+  if (frames > 0) await sendCommand({ cmd: 'run', frames });
+  const up = await sendCommand({ cmd: 'consol', start: true, select: true, option: true });
+  return { status: 'ok', key, frames, active_low: true, down, up };
+}
 
 async function bootFujiNet(args = {}) {
   if (args.source_path) {
@@ -2270,6 +2918,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: formatToolResponse(`Ran ${frames} frames.`, resp) }] };
       }
 
+      case 'atari_run_until':
+        return { content: [{ type: 'text', text: formatJson(await runUntil(args)) }] };
+
       case 'atari_frame_step': {
         const frames = args.frames || 1;
         const resp = await sendCommand({ cmd: 'frame_step', frames });
@@ -2286,13 +2937,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: formatToolResponse(`Load requested: ${args.path}`, resp) }] };
       }
 
+      case 'atari_disk_insert':
+        return { content: [{ type: 'text', text: formatJson(await mountNativeDisk(args)) }] };
+
+      case 'atari_disk_eject':
+        return { content: [{ type: 'text', text: formatJson(await ejectNativeDisk(args)) }] };
+
+      case 'atari_disk_status':
+        return { content: [{ type: 'text', text: formatJson(await nativeDiskStatus(args)) }] };
+
+      case 'atari_artifact_list':
+        return { content: [{ type: 'text', text: formatJson(listArtifacts(args)) }] };
+
+      case 'atari_artifact_info':
+        return { content: [{ type: 'text', text: formatJson(artifactInfo(args)) }] };
+
+      case 'atari_artifact_read_text':
+        return { content: [{ type: 'text', text: formatJson(readArtifactText(args)) }] };
+
+      case 'atari_artifact_delete':
+        return { content: [{ type: 'text', text: formatJson(deleteArtifact(args)) }] };
+
       case 'atari_screen': {
         const resp = await sendCommand({ cmd: 'screen_ascii' });
         return { content: [{ type: 'text', text: `${formatScreen(resp.data)}\n${formatJson(resp)}` }] };
       }
 
+      case 'atari_screen_text': {
+        const resp = await sendCommand({ cmd: 'screen.text' });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
       case 'atari_screen_raw': {
         const resp = await sendCommand({ cmd: 'screen_raw' });
+        return { content: [{ type: 'text', text: formatToolResponse('Read rendered framebuffer.', resp) }] };
+      }
+
+      case 'atari_framebuffer_raw': {
+        const resp = await sendCommand({ cmd: 'framebuffer.raw' });
         return { content: [{ type: 'text', text: formatToolResponse('Read rendered framebuffer.', resp) }] };
       }
 
@@ -2314,14 +2996,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'atari_key': {
-        const key = args.key.toLowerCase();
-        const code = KEY_CODES[key];
-        if (code === undefined) {
-          return { content: [{ type: 'text', text: `Unknown key: ${args.key}` }], isError: true };
-        }
-        const resp = await sendCommand({ cmd: 'key', code, shift: false });
+        const resp = await sendCommand({ cmd: 'key', ...resolveKey(args.key, args.shift) });
         return { content: [{ type: 'text', text: formatJson(resp) }] };
       }
+
+      case 'atari_key_down': {
+        const resp = await sendCommand({ cmd: 'key.down', ...resolveKey(args.key, args.shift) });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_key_up': {
+        const resp = await sendCommand({ cmd: 'key.up' });
+        return { content: [{ type: 'text', text: formatToolResponse('Released AI key state.', resp) }] };
+      }
+
+      case 'atari_press_key':
+        return { content: [{ type: 'text', text: formatJson(await pressKey(args.key, { frames: args.frames ?? 2, shift: args.shift })) }] };
+
+      case 'atari_type_text':
+        return { content: [{ type: 'text', text: formatJson(await typeText(args.text, { frames_per_key: args.frames_per_key ?? 2 })) }] };
 
       case 'atari_key_release': {
         const resp = await sendCommand({ cmd: 'key_release' });
@@ -2340,10 +3033,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'atari_consol': {
         const resp = await sendCommand({
           cmd: 'consol',
-          start: args.start || false,
-          select: args.select || false,
-          option: args.option || false,
+          start: !(args.start || false),
+          select: !(args.select || false),
+          option: !(args.option || false),
         });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_press_console':
+        return { content: [{ type: 'text', text: formatJson(await pressConsole(args.key, args.frames ?? 2)) }] };
+
+      case 'atari_input_status': {
+        const resp = await sendCommand({ cmd: 'input.status' });
         return { content: [{ type: 'text', text: formatJson(resp) }] };
       }
 
@@ -2543,6 +3244,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (args.type) cmd.type = args.type;
         const resp = await sendCommand(cmd);
         return { content: [{ type: 'text', text: formatToolResponse('Breakpoint clear requested.', resp) }] };
+      }
+
+      case 'atari_netsio_status': {
+        const resp = await sendCommand({ cmd: 'netsio.status' });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_netsio_trace_status': {
+        const resp = await sendCommand({ cmd: 'netsio.trace.status' });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_netsio_trace_read': {
+        const resp = await sendCommand({
+          cmd: 'netsio.trace.read',
+          since_seq: args.since_seq ?? 0,
+          limit: args.limit ?? 100,
+        });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_netsio_trace_clear': {
+        const resp = await sendCommand({ cmd: 'netsio.trace.clear' });
+        return { content: [{ type: 'text', text: formatToolResponse('NetSIO trace cleared.', resp) }] };
+      }
+
+      case 'atari_netsio_trace_enable': {
+        const resp = await sendCommand({ cmd: 'netsio.trace.enable' });
+        return { content: [{ type: 'text', text: formatToolResponse('NetSIO trace enabled.', resp) }] };
+      }
+
+      case 'atari_netsio_trace_disable': {
+        const resp = await sendCommand({ cmd: 'netsio.trace.disable' });
+        return { content: [{ type: 'text', text: formatToolResponse('NetSIO trace disabled.', resp) }] };
       }
 
       case 'atari_video_status': {

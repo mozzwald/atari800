@@ -74,10 +74,12 @@ int AI_IsPaused(void);
  *
  * === INPUT ===
  * {"cmd": "key", "code": 33, "shift": false}
- *   Press a key (AKEY_* code)
+ * {"cmd": "key.down", "code": 33, "shift": false}
+ *   Press/hold a key (AKEY_* code)
  *   -> {"status": "ok"}
  *
  * {"cmd": "key_release"}
+ * {"cmd": "key.up"}
  *   Release all keys
  *   -> {"status": "ok"}
  *
@@ -91,7 +93,11 @@ int AI_IsPaused(void);
  *   -> {"status": "ok"}
  *
  * {"cmd": "consol", "start": false, "select": false, "option": false}
- *   Set console keys
+ *   Set console keys using active-low booleans: false means pressed
+ *   -> {"status": "ok"}
+ *
+ * {"cmd": "input.status"}
+ *   Read keyboard, console, joystick override, trigger, and paddle input state
  *   -> {"status": "ok"}
  *
  * === SCREEN ===
@@ -103,9 +109,27 @@ int AI_IsPaused(void);
  *   Get screen as ASCII art (40x24 chars approximation)
  *   -> {"status": "ok", "width": 40, "height": 24, "data": ["line1", ...]}
  *
+ * {"cmd": "screen.text"}
+ *   Read simple ANTIC/OS text screen memory with confidence and unsupported-mode reporting
+ *   -> {"status": "ok", "supported": true, "lines": ["READY", ...]}
+ *
  * {"cmd": "screen_raw"}
+ * {"cmd": "framebuffer.raw"}
  *   Get rendered screen buffer (base64 encoded, 384x240 bytes)
  *   -> {"status": "ok", "width": 384, "height": 240, "data": "base64..."}
+ *
+ * === DISK ===
+ * {"cmd": "disk.insert", "drive": 1, "path": "/tmp/disk.atr", "read_only": true}
+ *   Mount a native disk image in D1..D8. Use read_only=true by default.
+ *   -> {"status": "ok", "drives": [{"drive": 1, "state": "read_only", ...}]}
+ *
+ * {"cmd": "disk.eject", "drive": 1}
+ *   Dismount a native disk drive
+ *   -> {"status": "ok", "drives": [{"drive": 1, "state": "empty", ...}]}
+ *
+ * {"cmd": "disk.status", "drive": 0}
+ *   Report native disk drive status. drive=0 reports all drives.
+ *   -> {"status": "ok", "drives": [...]}
  *
  * === MEMORY ===
  * {"cmd": "peek", "addr": 0x1234, "len": 16}

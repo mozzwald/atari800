@@ -75,3 +75,52 @@ Use `fujinet_debug_read` with `since_seq`, `contains`, `regex`, and `stream` fil
 Use `fujinet_debug_status` for counters and `fujinet_debug_clear` between test cases. FujiNet output is bounded; consume it incrementally during long runs.
 
 Do not use the FujiNet CONFIG UI for automated tests. Configure mounts through the managed tools and verify behavior through screen, memory, debugger, and FujiNet debug output.
+
+## Waiting for Behavior
+
+Use `atari_run_until` for deterministic waits instead of open-ended frame loops. Always provide `max_frames` or `max_ms_wallclock`; providing both is preferred.
+
+Useful predicates include:
+
+- `screen_contains` / `screen_not_contains`
+- `memory_equals` / `memory_changed`
+- `pc_equals` / `pc_in_range`
+- `debug_contains`
+- `fujinet_log_contains`
+- `netsio_event`
+- `breakpoint_hit`
+- `frames_elapsed`
+- `emulator_exited`
+
+Set `poll_interval_frames` to a small batch size such as 1-10 for boot and input-sensitive waits. On timeout, request diagnostics with `include_debug_tail`, `include_fujinet_log_tail`, `include_netsio_trace_tail`, and `include_screenshot` when those artifacts help explain the failure.
+
+## Screen and Input
+
+Use `atari_screen_text` when the program is in a simple ANTIC/OS text mode. It returns screen codes, best-effort text lines, display-list mode, screen and charset addresses, confidence, and `unsupported_reason` for custom charset or non-text display modes. Use `atari_framebuffer_raw` or `atari_screen_raw` for the rendered framebuffer base64 bytes.
+
+For input, prefer bounded helpers: `atari_press_key`, `atari_type_text`, and `atari_press_console`. Use `atari_key_down`/`atari_key_up` only when a test needs a held key. `atari_consol` accepts natural pressed booleans; the low-level C command uses active-low console bits. `atari_input_status` reports the current key, console, joystick override, trigger override, and paddle state.
+
+## Native Disks and Artifacts
+
+Use `atari_disk_insert` for native Atari800 disk testing. The MCP copies the source image into the session `native-disks` workspace and mounts the copy read-only by default, so source disk images are not changed. Set `write_enabled=true` only when a test must write to the managed copy; the response reports the managed `output_path`, and no automatic copyback to the source occurs.
+
+Use `atari_disk_status` to inspect native SIO drive state and `atari_disk_eject` to dismount a drive. Use `atari_artifact_list`, `atari_artifact_info`, `atari_artifact_read_text`, and `atari_artifact_delete` to inspect session artifacts, logs, and managed disk copies. Logs are listable but not deletable through the artifact delete tool.
+
+## NetSIO Observability
+
+Use these Atari-side tools when FujiNet boot, SIO timing, or NETStream behavior is unclear:
+
+- `atari_netsio_status`
+- `atari_netsio_trace_status`
+- `atari_netsio_trace_enable`
+- `atari_netsio_trace_read`
+- `atari_netsio_trace_clear`
+- `atari_netsio_trace_disable`
+
+`atari_netsio_status` reports emulator-observed state: NetSIO compile/enable status, UDP port and peer, sync wait state, last sync/ACK/NAK data, timeout counters, queue and credit state, Proceed/Interrupt pin state, packet counters, and NETStream gates visible to the emulator.
+
+Proceed and Interrupt use active-low NetSIO pin semantics. The source-verified IDs are Proceed OFF/ON `0x30/0x31`, Interrupt OFF/ON `0x40/0x41`; Proceed maps to PIA CA1 and Interrupt maps to PIA CB1.
+
+`atari_netsio_trace_read` returns bounded decoded entries. Use `since_seq` for incremental reads and check `dropped`/`count` in trace status during long runs. Decoded entries include packet direction/type, SIO command frames, sync responses, speed changes, credit updates, send errors, and timestamps.
+
+Some NETStream fields are handler-side only and are not visible to the emulator transport: requested/final flags, REGISTER enablement, UDP sequencing, detected video standard, and sticky app-level status. Those appear as `null` in `atari_netsio_status`; collect them from Atari-side test app telemetry or debug-port output when needed.

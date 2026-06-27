@@ -1064,11 +1064,18 @@ Progress checklist:
 - [x] Add credit/queue/backpressure visibility.
 - [x] Add NETStream status fields.
 - [x] Verify Proceed/Interrupt constants and PIA CA1/CB1 mapping with source and tests.
-- [ ] Register the NetSIO status and trace commands as MCP tools.
-- [ ] Document the NetSIO tools and emulator-side versus handler-side fields for AI agents.
-- [ ] Add and run the headless MCP/FujiNet integration smoke test.
+- [x] Register the NetSIO status and trace commands as MCP tools.
+- [x] Document the NetSIO tools and emulator-side versus handler-side fields for AI agents.
+- [x] Add and run the headless MCP/FujiNet integration smoke test.
 
-Implementation status (2026-06-26): the emulator-side Phase 10 foundation is implemented. The POSIX and Windows NetSIO transports feed a thread-safe monitor with bounded packet and decoded SIO command tracing, sync timeout and ACK/NAK state, per-message counters, queue/credit state, timestamps, pin state, and NETStream gates. The AI socket exposes `netsio.status` and the five `netsio.trace.*` commands, and advertises their read-only/mutating classifications. Handler-only NETStream values that the emulator cannot observe are returned as `null` with an explanatory note. The focused monitor test covers protocol IDs, decoded state, trace bounds/drop accounting, and clearing. The emulator build and focused monitor test passed; MCP registration, agent documentation, and end-to-end headless testing remain.
+Implementation status (2026-06-26): the emulator-side Phase 10 foundation is implemented. The POSIX and Windows NetSIO transports feed a thread-safe monitor with bounded packet and decoded SIO command tracing, sync timeout and ACK/NAK state, per-message counters, queue/credit state, timestamps, pin state, and NETStream gates. The AI socket exposes `netsio.status` and the five `netsio.trace.*` commands, and advertises their read-only/mutating classifications. Handler-only NETStream values that the emulator cannot observe are returned as `null` with an explanatory note. The focused monitor test covers protocol IDs, decoded state, trace bounds/drop accounting, and clearing.
+
+Phase 10 completion notes:
+
+- MCP tools `atari_netsio_status`, `atari_netsio_trace_status`, `atari_netsio_trace_read`, `atari_netsio_trace_clear`, `atari_netsio_trace_enable`, and `atari_netsio_trace_disable` forward to the C socket commands.
+- `mcp-server/README.md` and `README.AI.md` document emulator-observed fields versus handler-only NETStream fields.
+- `tests/mcp_fujinet_phase10_smoke.mjs` exercises tool registration, managed FujiNet boot, NetSIO status, source-verified Proceed/Interrupt constants, handler-field nulls, trace enable/read/status/clear, and cleanup.
+- The headless smoke passed with local unpacked FujiNet-PC path `/home/mozzwald/fujinet-pc-ATARI`.
 
 ## 10.1 Important Source-Based Mapping
 
@@ -1193,11 +1200,11 @@ Purpose: give agents a deterministic way to wait for expected app behavior.
 
 Progress checklist:
 
-- [ ] Add MCP-level `atari_run_until`.
-- [ ] Add frame, memory, CPU, screen text, debug output, FujiNet log, and NetSIO trace predicates.
-- [ ] Add hard wall-clock and frame limits.
-- [ ] Add timeout diagnostics.
-- [ ] Add optional screenshot/debug/trace tails on success or failure.
+- [x] Add MCP-level `atari_run_until`.
+- [x] Add frame, memory, CPU, screen text, debug output, FujiNet log, and NetSIO trace predicates.
+- [x] Add hard wall-clock and frame limits.
+- [x] Add timeout diagnostics.
+- [x] Add optional screenshot/debug/trace tails on success or failure.
 
 ## 11.1 `atari_run_until`
 
@@ -1260,6 +1267,14 @@ On failure, include:
 - NetSIO trace tail
 - session status
 
+Phase 11 implementation notes:
+
+- `atari_run_until` is implemented as an MCP-level bounded polling loop that runs small `run` frame batches and samples only the data needed by the requested predicates.
+- Supported predicates: `frames_elapsed`, `screen_contains`, `screen_not_contains`, `memory_equals`, `memory_changed`, `pc_equals`, `pc_in_range`, `debug_contains`, `fujinet_log_contains`, `netsio_event`, `breakpoint_hit`, and `emulator_exited`.
+- The tool requires `max_frames` or `max_ms_wallclock`, supports `mode=any|all`, `poll_interval_frames`, `stable_for_frames`, and `on_timeout=pause|leave_running`.
+- Timeout/success diagnostics include elapsed frames/time, last CPU state, last screen text, session status, and optional screenshot/debug/FujiNet/NetSIO trace tails.
+- `tests/mcp_run_until_smoke.mjs` covers tool registration, `frames_elapsed`, `memory_equals`, and timeout diagnostics against a real headless Atari800 session.
+
 ---
 
 # Phase 12: Screen and Input Improvements
@@ -1268,12 +1283,12 @@ Purpose: make screen reading and input generation more reliable for AI-driven te
 
 Progress checklist:
 
-- [ ] Rename or clarify `screen_raw` as framebuffer raw/base64.
-- [ ] Add display-list-aware `screen_text` v1.
-- [ ] Add confidence and unsupported-mode reporting.
-- [ ] Add key down/up/typed-string helpers.
-- [ ] Add input state readback.
-- [ ] Add console key press-duration helper.
+- [x] Rename or clarify `screen_raw` as framebuffer raw/base64.
+- [x] Add display-list-aware `screen_text` v1.
+- [x] Add confidence and unsupported-mode reporting.
+- [x] Add key down/up/typed-string helpers.
+- [x] Add input state readback.
+- [x] Add console key press-duration helper.
 
 ## 12.1 Screen Text v1
 
@@ -1332,12 +1347,12 @@ Purpose: make program/disk/image testing safe and repeatable.
 
 Progress checklist:
 
-- [ ] Add native disk insert/eject/status C commands.
-- [ ] Add MCP wrappers.
-- [ ] Add managed disk workspace.
-- [ ] Add read-only by default behavior for user-supplied images.
-- [ ] Add dirty/writeback policy.
-- [ ] Add artifact listing helper.
+- [x] Add native disk insert/eject/status C commands.
+- [x] Add MCP wrappers.
+- [x] Add managed disk workspace.
+- [x] Add read-only by default behavior for user-supplied images.
+- [x] Add dirty/writeback policy.
+- [x] Add artifact listing helper.
 
 ## 13.1 Artifact Tools
 

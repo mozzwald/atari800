@@ -61,17 +61,33 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 | `atari_status` | Report session state, launch details, sockets, and bounded logs. |
 | `atari_logs` | Read bounded emulator/Xvfb startup logs. |
 | `atari_load` | Load an executable-style program through the Atari800 BIN loader. |
+| `atari_disk_insert` | Copy a disk image into the session workspace and mount it read-only by default. |
+| `atari_disk_eject` | Eject a native Atari disk drive. |
+| `atari_disk_status` | Report native disk drive state and managed workspace copies. |
+| `atari_artifact_list` | List session artifact, log, and native disk workspace files. |
+| `atari_artifact_info` | Get metadata for one session artifact. |
+| `atari_artifact_read_text` | Read a bounded UTF-8 text artifact. |
+| `atari_artifact_delete` | Delete an artifact from a deletable session root. |
 | `atari_run` | Run for N frame-loop frames. |
+| `atari_run_until` | Run bounded frame batches until predicates match, with diagnostics on timeout. |
 | `atari_frame_step` | Run N frame-loop ticks, then pause. |
 | `atari_pause` | Pause emulation. |
 | `atari_screen` | Get the approximate 40x24 ASCII screen. |
+| `atari_screen_text` | Read simple ANTIC text memory with confidence and unsupported-mode reporting. |
 | `atari_screen_raw` | Get rendered framebuffer bytes as base64 data. |
+| `atari_framebuffer_raw` | Explicit rendered framebuffer base64 alias. |
 | `atari_screenshot` | Save a screenshot to the managed artifact directory or an explicit safe path. |
 | `atari_joystick` | Set joystick direction/fire/port. |
 | `atari_key` | Press a supported key name through AKEY mapping. |
+| `atari_key_down` | Hold a supported key name down. |
+| `atari_key_up` | Release all AI key state. |
+| `atari_press_key` | Press a supported key for a bounded number of frames, then release it. |
+| `atari_type_text` | Type supported text one key press at a time. |
 | `atari_key_release` | Release all AI key state. |
 | `atari_paddle` | Set paddle position. |
-| `atari_consol` | Set console key booleans. |
+| `atari_consol` | Set natural console pressed booleans; the C protocol underneath is active-low. |
+| `atari_press_console` | Press one console key for a bounded number of frames, then release it. |
+| `atari_input_status` | Read keyboard, console, joystick override, trigger, and paddle input state. |
 | `atari_peek` | Read memory bytes. |
 | `atari_poke` | Write memory bytes directly. |
 | `atari_dump_memory` | Dump memory to an artifact-safe path. |
@@ -117,6 +133,12 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 | `atari_video_set_fps_cap` | Set push stream max FPS. |
 | `atari_video_set_frameskip` | Set push stream frame skip. |
 | `atari_video_set_change_triggered` | Push only frames whose CRC changes. |
+| `atari_netsio_status` | Report emulator-side NetSIO, SIO, queue, sync, ACK/NAK, and NETStream status. |
+| `atari_netsio_trace_status` | Report NetSIO trace ring enabled/count/drop state. |
+| `atari_netsio_trace_read` | Read bounded decoded NetSIO/SIO trace entries. |
+| `atari_netsio_trace_clear` | Clear the NetSIO trace ring. |
+| `atari_netsio_trace_enable` | Enable NetSIO trace capture. |
+| `atari_netsio_trace_disable` | Disable NetSIO trace capture. |
 
 ## Example Workflow
 
@@ -125,6 +147,12 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 3. Run frames: `atari_run` with `frames`.
 4. Inspect output: `atari_screen`, `atari_cpu`, `atari_peek`.
 5. Stop session: `atari_stop`.
+
+## Native Disks and Artifacts
+
+Use `atari_disk_insert` for native Atari800 disk images. The MCP copies the source image into the session `native-disks` workspace and mounts that copy read-only unless `write_enabled=true` is requested. Writable mounts report the managed `output_path`; source images are not modified automatically.
+
+Use `atari_artifact_list`, `atari_artifact_info`, `atari_artifact_read_text`, and `atari_artifact_delete` for files under the session artifact root and managed native disk workspace. Log files are listable but not deletable through the artifact delete tool.
 
 ## FujiNet Workflow
 
@@ -140,5 +168,21 @@ Use `fujinet_debug_read` or `fujinet_logs` to inspect FujiNet-PC debug output wh
 For deterministic disk boot, use `fujinet_boot` with `source_path`. The default copies the image into the managed SD workspace, mounts it read-only on D1, disables CONFIG boot, starts both processes headlessly, reloads FujiNet configuration, and cold-resets Atari. Use `fujinet_remount` after config or mount changes made during a running session.
 
 See `README.AI.md` for agent-oriented FujiNet safety, preservation, and debugging workflows.
+
+## NetSIO Observability
+
+Use `atari_netsio_status` after starting Atari800 with NetSIO enabled. It reports emulator-side state: compile/enable status, UDP port and peer, sync wait state, last ACK/NAK byte, timeout counters, queue capacity/availability, credit status, Proceed/Interrupt pin state, packet counters, and emulator-observable NETStream gates.
+
+Use `atari_netsio_trace_enable`, `atari_netsio_trace_read`, and `atari_netsio_trace_clear` around FujiNet boot or NETStream workflows. Trace entries are bounded and include decoded SIO command frames, sync responses, speed changes, credit updates, send errors, timestamps, sequence numbers, and dropped-entry accounting.
+
+Handler-only NETStream values such as requested/final flags, REGISTER enablement, UDP sequencing, and detected video standard are not directly observable from the emulator transport. Those fields are reported as `null` with a note; use Atari-side app/debug-port telemetry when those values are required.
+
+## Run Until
+
+Use `atari_run_until` instead of hand-written polling loops. It requires at least one of `max_frames` or `max_ms_wallclock`, runs small frame batches, and supports `any` or `all` predicate mode.
+
+Supported predicates are `frames_elapsed`, `screen_contains`, `screen_not_contains`, `memory_equals`, `memory_changed`, `pc_equals`, `pc_in_range`, `debug_contains`, `fujinet_log_contains`, `netsio_event`, `breakpoint_hit`, and `emulator_exited`.
+
+On timeout it can pause the emulator and include CPU/screen/session diagnostics plus optional screenshot, debug tail, FujiNet log tail, and NetSIO trace tail.
 
 MCP wrappers are intentionally narrower than the C socket API. See `AGENT_CONTRACT.md` for the full C command inventory and known gaps.
