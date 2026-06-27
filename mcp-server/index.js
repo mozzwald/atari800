@@ -1224,8 +1224,153 @@ async function fetchFujiNetAsset(args = {}) {
   return { asset, path: dest, selection: currentFujiNetSelection() };
 }
 
-function nativeDisplayAvailable() {
-  return Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY || process.platform === 'darwin');
+function compactEnv(env) {
+  return {
+    DISPLAY: env.DISPLAY || null,
+    WAYLAND_DISPLAY: env.WAYLAND_DISPLAY || null,
+    XAUTHORITY: env.XAUTHORITY || null,
+    XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR || null,
+    DBUS_SESSION_BUS_ADDRESS: env.DBUS_SESSION_BUS_ADDRESS || null,
+  };
+}
+
+function displayKey(candidate) {
+  return JSON.stringify(compactEnv(candidate.env || {}));
+}
+
+function defaultXauthority() {
+  if (process.env.XAUTHORITY) return process.env.XAUTHORITY;
+  if (!process.env.HOME) return null;
+  const candidate = path.join(process.env.HOME, '.Xauthority');
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+function pushDisplayCandidate(candidates, source, env, extra = {}) {
+  if (!env.DISPLAY && !env.WAYLAND_DISPLAY && process.platform !== 'darwin') return;
+  const candidate = { source, env: compactEnv(env), ...extra };
+  if (candidates.some((item) => displayKey(item) === displayKey(candidate))) return;
+  candidates.push(candidate);
+}
+
+function parseProcEnviron(pid) {
+  try {
+    const stat = fs.statSync(`/proc/${pid}`);
+    if (stat.uid !== process.getuid?.()) return null;
+    const raw = fs.readFileSync(`/proc/${pid}/environ`);
+    const env = {};
+    for (const entry of raw.toString('utf8').split('\0')) {
+      if (!entry) continue;
+      const idx = entry.indexOf('=');
+      if (idx > 0) env[entry.slice(0, idx)] = entry.slice(idx + 1);
+    }
+    return env;
+  } catch {
+    return null;
+  }
+}
+
+function discoverLinuxProcessDisplays(candidates) {
+  let entries = [];
+  try { entries = fs.readdirSync('/proc'); } catch { return; }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const env = parseProcEnviron(entry);
+    if (!env) continue;
+    pushDisplayCandidate(candidates, 'linux-process-env', env, { pid: Number(entry) });
+  }
+}
+
+function parseEnvironmentLines(text) {
+  const env = {};
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) continue;
+    const idx = line.indexOf('=');
+    if (idx > 0) env[line.slice(0, idx)] = line.slice(idx + 1);
+  }
+  return env;
+}
+
+function discoverLinuxUserManagerDisplays(candidates) {
+  const result = spawnSync('systemctl', ['--user', 'show-environment'], {
+    encoding: 'utf8',
+    timeout: 1000,
+    maxBuffer: 64 * 1024,
+  });
+  if (result.status !== 0 || !result.stdout) return;
+  pushDisplayCandidate(candidates, 'linux-systemd-user-env', parseEnvironmentLines(result.stdout));
+}
+
+function discoverLinuxSocketDisplays(candidates) {
+  try {
+    const x11Dir = '/tmp/.X11-unix';
+    for (const entry of fs.readdirSync(x11Dir)) {
+      const match = entry.match(/^X(\d+)$/);
+      if (!match) continue;
+      pushDisplayCandidate(candidates, 'linux-x11-socket', {
+        DISPLAY: `:${match[1]}`,
+        XAUTHORITY: defaultXauthority(),
+      });
+    }
+  } catch {}
+
+  const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.()}`;
+  try {
+    for (const entry of fs.readdirSync(runtimeDir)) {
+      if (!/^wayland-\d+$/.test(entry)) continue;
+      pushDisplayCandidate(candidates, 'linux-wayland-socket', {
+        WAYLAND_DISPLAY: entry,
+        XDG_RUNTIME_DIR: runtimeDir,
+        DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS || `unix:path=${path.join(runtimeDir, 'bus')}`,
+      });
+    }
+  } catch {}
+}
+
+function discoverLinuxDefaultDisplays(candidates) {
+  const xauthority = defaultXauthority();
+  if (xauthority || fs.existsSync('/tmp/.X11-unix/X0')) {
+    pushDisplayCandidate(candidates, 'linux-default-x11', {
+      DISPLAY: ':0',
+      XAUTHORITY: xauthority,
+    });
+  }
+}
+
+function discoverNativeDisplays(overrides = {}) {
+  const candidates = [];
+  pushDisplayCandidate(candidates, 'explicit-arguments', {
+    ...process.env,
+    DISPLAY: overrides.display || process.env.DISPLAY || null,
+    WAYLAND_DISPLAY: overrides.wayland_display || process.env.WAYLAND_DISPLAY || null,
+    XAUTHORITY: overrides.xauthority || defaultXauthority(),
+    XDG_RUNTIME_DIR: overrides.xdg_runtime_dir || process.env.XDG_RUNTIME_DIR || null,
+  });
+  pushDisplayCandidate(candidates, 'inherited-env', process.env);
+  if (process.platform === 'linux') {
+    discoverLinuxUserManagerDisplays(candidates);
+    discoverLinuxProcessDisplays(candidates);
+    discoverLinuxSocketDisplays(candidates);
+    discoverLinuxDefaultDisplays(candidates);
+  } else if (process.platform === 'darwin') {
+    pushDisplayCandidate(candidates, 'macos-native', { DISPLAY: process.env.DISPLAY || ':0' });
+  }
+  candidates.sort((a, b) => {
+    const ax = a.env.DISPLAY ? 0 : 1;
+    const bx = b.env.DISPLAY ? 0 : 1;
+    return ax - bx;
+  });
+  return candidates;
+}
+
+function nativeDisplayAvailable(overrides = {}) {
+  return discoverNativeDisplays(overrides).length > 0;
+}
+
+function applyNativeDisplayEnv(env, candidate) {
+  for (const key of ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS']) {
+    if (candidate.env[key]) env[key] = candidate.env[key];
+  }
+  return env;
 }
 
 let aiMcpProbeCache = null;
@@ -1314,6 +1459,7 @@ async function probeAiMcpCapabilities(emulatorPath) {
 
 async function buildPreflight() {
   const xvfbPath = executablePath('Xvfb');
+  const nativeDisplayCandidates = discoverNativeDisplays();
   const emulatorExists = fs.existsSync(EMULATOR_PATH);
   const emulatorExecutable = emulatorExists && fileExecutable(EMULATOR_PATH);
   const help = emulatorExecutable ? await runCapture(EMULATOR_PATH, ['-help'], 2500) : null;
@@ -1354,11 +1500,15 @@ async function buildPreflight() {
     display: {
       display: process.env.DISPLAY || null,
       wayland_display: process.env.WAYLAND_DISPLAY || null,
-      native_available: nativeDisplayAvailable(),
+      inherited_available: Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY || process.platform === 'darwin'),
+      native_available: nativeDisplayCandidates.length > 0,
+      native_discovered: nativeDisplayCandidates.length,
+      selected_visible_candidate: nativeDisplayCandidates[0] || null,
+      native_candidates: nativeDisplayCandidates,
       xvfb_path: xvfbPath,
       xvfb_available: Boolean(xvfbPath),
       headless_supported: process.platform === 'linux' && Boolean(xvfbPath),
-      caveat: 'Xvfb helps only with X11-compatible Atari800/SDL builds.',
+      caveat: 'Visible mode prefers X11 displays because SDL 1.2 builds usually require X11; Wayland candidates may require XWayland or an SDL build that supports Wayland.',
     },
     runtime: {
       root: RUNTIME_ROOT,
@@ -2085,6 +2235,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           port: { type: 'number' },
           timeout_ms: { type: 'number', default: 10000 },
           display_mode: { type: 'string', enum: ['headless', 'visible'], default: 'headless' },
+          display: { type: 'string', description: 'Optional X11 DISPLAY override for visible mode, e.g. :0' },
+          wayland_display: { type: 'string', description: 'Optional Wayland display name for visible mode, e.g. wayland-0' },
+          xauthority: { type: 'string', description: 'Optional XAUTHORITY path for visible X11 mode' },
+          xdg_runtime_dir: { type: 'string', description: 'Optional XDG_RUNTIME_DIR for visible Wayland mode' },
           machine: { type: 'string', enum: ['atari', 'xl', 'xe', 'xegs', '5200'], default: 'xl' },
           ram: { type: 'number' },
           basic: { type: 'boolean' },
@@ -2117,6 +2271,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           turbo: { type: 'boolean', default: false },
           sound: { type: 'boolean' },
           display_mode: { type: 'string', enum: ['auto', 'headless', 'visible'], default: 'auto' },
+          display: { type: 'string', description: 'Optional X11 DISPLAY override for visible mode, e.g. :0' },
+          wayland_display: { type: 'string', description: 'Optional Wayland display name for visible mode, e.g. wayland-0' },
+          xauthority: { type: 'string', description: 'Optional XAUTHORITY path for visible X11 mode' },
+          xdg_runtime_dir: { type: 'string', description: 'Optional XDG_RUNTIME_DIR for visible Wayland mode' },
           xvfb_display: { type: 'number' },
           xvfb_screen: { type: 'string', default: '1024x768x24' },
           args: { type: 'array', items: { type: 'string' } },
@@ -2757,6 +2915,10 @@ async function bootFujiNet(args = {}) {
   if (!emulatorProcessRunning()) {
     await startAtariSession({
       display_mode: args.display_mode || 'headless',
+      display: args.display,
+      wayland_display: args.wayland_display,
+      xauthority: args.xauthority,
+      xdg_runtime_dir: args.xdg_runtime_dir,
       machine: args.machine || 'xl',
       ram: args.ram,
       basic: args.basic,
@@ -2819,17 +2981,26 @@ async function startAtariSession(args = {}) {
   const xvfbScreen = args.xvfb_screen || '1024x768x24';
   const env = { ...process.env };
   let displayName = env.DISPLAY || null;
+  let displaySource = displayName ? 'inherited-env' : null;
+  let nativeDisplay = null;
 
   if (displayMode === 'headless') {
     const displayNumber = selectXvfbDisplay(args.xvfb_display);
     displayName = await startXvfbForSession(displayNumber, xvfbScreen);
     env.DISPLAY = displayName;
+    displaySource = 'xvfb';
   } else if (displayMode === 'visible') {
-    if (!nativeDisplayAvailable()) {
+    const candidates = discoverNativeDisplays(args);
+    nativeDisplay = candidates[0] || null;
+    if (!nativeDisplay) {
       throw makeError('MISSING_DISPLAY', 'visible display requested but DISPLAY/WAYLAND_DISPLAY/native desktop is unavailable', {
-        hint: 'Use display_mode=headless on Linux with Xvfb installed.',
+        hint: 'Use display_mode=headless, pass display/wayland_display explicitly, or launch the MCP server from the desktop session.',
+        candidates,
       });
     }
+    applyNativeDisplayEnv(env, nativeDisplay);
+    displayName = env.DISPLAY || env.WAYLAND_DISPLAY || null;
+    displaySource = nativeDisplay.source;
   } else {
     throw makeError('BAD_ARGUMENT', 'display_mode must be auto, headless, or visible', { display_mode: requestedMode });
   }
@@ -2874,6 +3045,10 @@ async function startAtariSession(args = {}) {
   session.emulator.argv = [EMULATOR_PATH, ...argv];
   session.emulator.env = {
     DISPLAY: env.DISPLAY || null,
+    WAYLAND_DISPLAY: env.WAYLAND_DISPLAY || null,
+    XAUTHORITY: env.XAUTHORITY || null,
+    XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR || null,
+    DBUS_SESSION_BUS_ADDRESS: env.DBUS_SESSION_BUS_ADDRESS || null,
     SDL_VIDEODRIVER: env.SDL_VIDEODRIVER || null,
     SDL_AUDIODRIVER: env.SDL_AUDIODRIVER || null,
   };
@@ -2886,6 +3061,8 @@ async function startAtariSession(args = {}) {
     requested_mode: requestedMode,
     effective_mode: displayMode,
     display: displayName,
+    display_source: displaySource,
+    native_display: nativeDisplay,
     xvfb_screen: displayMode === 'headless' ? xvfbScreen : null,
     sound,
   };

@@ -11,6 +11,8 @@ This branch exposes Atari800 through the MCP server in `mcp-server/index.js`. Us
 3. Use headless mode unless the user explicitly requests a visible window.
 4. Call `atari_stop` when finished; it stops only processes owned by the current MCP session.
 
+Visible mode uses inherited desktop variables when present, then attempts to discover a same-user Linux X11 or Wayland session. `atari_preflight` reports discovered native display candidates. If discovery is wrong or unavailable, pass `display`, `wayland_display`, `xauthority`, or `xdg_runtime_dir` explicitly to `atari_start` or `fujinet_boot`.
+
 The complete low-level AI command inventory and capability notes are in `AGENT_CONTRACT.md`. MCP tool summaries are in `mcp-server/README.md`. The repo and runtime bundle include `skills/atari800-mcp`, a Codex/Claude Code compatible skill for Atari app/game development and validation with this MCP server.
 
 ## Build Flags

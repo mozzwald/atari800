@@ -17,6 +17,7 @@ If source changed, build the runnable artifact before emulator validation.
 - Use MCP preflight/capability/status tools when the environment or tool support is uncertain.
 - Start Atari800 through the MCP server so sockets, display mode, artifact paths, and cleanup are session-owned.
 - Prefer headless sessions for automated tests unless visible display behavior is specifically being checked.
+- Use `display_mode=visible` when the user wants to watch. The MCP server attempts to discover a same-user X11 or Wayland desktop session; check `atari_preflight` display candidates or pass explicit `display`, `wayland_display`, `xauthority`, or `xdg_runtime_dir` when auto-discovery is wrong.
 - Stop through MCP cleanup tools; never use broad process cleanup for emulator tests.
 
 ## Loading And Booting

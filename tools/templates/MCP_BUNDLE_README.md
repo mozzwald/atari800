@@ -38,6 +38,10 @@ cwd = "/path/to/bundle"
 
 Use `start-mcp.sh` for bundled installs. It sets `ATARI800_PATH` to the bundled `bin/atari800`. Direct `node mcp-server/index.js` startup is supported as a fallback, but the launcher is the intended entry point.
 
+## Display Modes
+
+Use `display_mode=headless` for automated runs. Use `display_mode=visible` when you want to watch the emulator. Visible mode uses inherited `DISPLAY`/`WAYLAND_DISPLAY` first, then attempts to discover a same-user Linux X11 or Wayland desktop session. Run `atari_preflight` to inspect detected display candidates. If needed, pass `display`, `wayland_display`, `xauthority`, or `xdg_runtime_dir` explicitly.
+
 ## Skill
 
 The bundle includes `skills/atari800-mcp`, a Codex/Claude Code compatible skill for Atari 8-bit app/game development and validation through this MCP server. Copy or symlink that directory into your client skill directory if you want the agent to automatically use the Atari800 MCP testing workflow.

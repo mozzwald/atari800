@@ -48,7 +48,9 @@ Supported host environment for the full test matrix is Linux with Node.js 18+, S
 
 `atari_start` creates one managed session under `/tmp/atari800-mcp` by default. The session has its own runtime directory, artifact directory, command socket, video push socket, and video pull socket.
 
-`display_mode` can be `auto`, `headless`, or `visible`. `auto` currently behaves like `headless`; on Linux this launches an MCP-owned `Xvfb` process directly and cleans it up with the session. Use `atari_preflight` to check whether Xvfb and a native display are available.
+`display_mode` can be `auto`, `headless`, or `visible`. `auto` currently behaves like `headless`; on Linux this launches an MCP-owned `Xvfb` process directly and cleans it up with the session. `visible` mode uses inherited `DISPLAY`/`WAYLAND_DISPLAY` when present, then attempts to discover a same-user desktop session from Linux process environments and display sockets. Use `atari_preflight` to inspect discovered native display candidates.
+
+For visible mode, `atari_start` and `fujinet_boot` also accept explicit display overrides: `display`, `wayland_display`, `xauthority`, and `xdg_runtime_dir`. X11 is preferred for SDL 1.2 builds; Wayland candidates may require XWayland or a compatible SDL build.
 
 `atari_stop` stops only the tracked MCP-owned emulator process. It does not use global `pkill` cleanup.
 
