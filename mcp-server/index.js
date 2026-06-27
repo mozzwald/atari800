@@ -373,6 +373,20 @@ function findFujiNetLauncher(root) {
   return null;
 }
 
+function validateFujiNetArchive(sourcePath) {
+  const listed = spawnSync('tar', ['-tzf', sourcePath], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+  if (listed.status !== 0) {
+    throw makeError('IO_ERROR', 'failed to inspect FujiNet-PC archive', { stderr: listed.stderr, sourcePath });
+  }
+  for (const entry of listed.stdout.split(/\r?\n/)) {
+    if (!entry) continue;
+    const normalized = entry.replace(/\\/g, '/');
+    if (normalized.startsWith('/') || normalized.split('/').includes('..')) {
+      throw makeError('PATH_DENIED', 'FujiNet-PC archive contains an unsafe path', { entry, sourcePath });
+    }
+  }
+}
+
 function copyOrExtractFujiNet(sourcePath, targetRoot) {
   ensureDir(targetRoot);
   const stat = fs.statSync(sourcePath);
@@ -384,6 +398,7 @@ function copyOrExtractFujiNet(sourcePath, targetRoot) {
   if (!/\.(tar\.gz|tgz)$/i.test(sourcePath)) {
     throw makeError('BAD_ARGUMENT', 'FujiNet local path must be an unpacked directory or .tar.gz archive', { path: sourcePath });
   }
+  validateFujiNetArchive(sourcePath);
   const result = spawnSync('tar', ['-xzf', sourcePath, '-C', targetRoot], { encoding: 'utf8' });
   if (result.status !== 0) {
     throw makeError('IO_ERROR', 'failed to extract FujiNet-PC archive', { stderr: result.stderr, sourcePath });
@@ -807,6 +822,9 @@ function deleteArtifact(args = {}) {
   const info = artifactInfo(args);
   const rootInfo = artifactRoots().find((item) => item.name === info.root);
   if (!rootInfo?.deletable) throw makeError('PATH_DENIED', 'selected artifact root is not deletable', { root: info.root });
+  if (path.resolve(info.absolute_path) === path.resolve(rootInfo.root)) {
+    throw makeError('PATH_DENIED', 'refusing to delete artifact root', { root: info.root });
+  }
   if (info.is_directory) fs.rmSync(info.absolute_path, { recursive: true, force: true });
   else fs.unlinkSync(info.absolute_path);
   return { status: 'ok', deleted: { root: info.root, path: info.path, absolute_path: info.absolute_path } };
@@ -1055,11 +1073,24 @@ async function startFujiNetSidecar(args = {}) {
   }
 }
 
+function safeUserRegex(pattern) {
+  const source = String(pattern);
+  if (source.length > 256) throw makeError('BAD_ARGUMENT', 'regex is too long', { max_length: 256 });
+  if (/\([^)]*[+*][^)]*\)[+*?]/.test(source) || /(?:\.\*){2,}/.test(source)) {
+    throw makeError('BAD_ARGUMENT', 'regex uses unsupported nested or repeated wildcard quantifiers');
+  }
+  try {
+    return new RegExp(source);
+  } catch (error) {
+    throw makeError('BAD_ARGUMENT', 'regex is invalid', { message: error.message });
+  }
+}
+
 function readFujiNetLogs({ since_seq = 0, limit = 100, contains, regex, stream = 'both' } = {}) {
-  if (!session?.fujinet) return { lines: [], next_seq: since_seq, dropped: 0 };
   const max = Math.max(1, Math.min(Number(limit) || 100, FUJINET_LOG_LIMIT));
   let matcher = null;
-  if (regex) matcher = new RegExp(regex);
+  if (regex) matcher = safeUserRegex(regex);
+  if (!session?.fujinet) return { lines: [], next_seq: since_seq, dropped: 0, limit: FUJINET_LOG_LIMIT };
   let lines = session.fujinet.logs || [];
   lines = lines.filter((line) => line.seq > since_seq);
   if (stream !== 'both') lines = lines.filter((line) => line.stream === stream);

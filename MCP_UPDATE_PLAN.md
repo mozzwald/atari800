@@ -1581,15 +1581,15 @@ Purpose: review attack surface and accidental destructive behavior before treati
 
 Progress checklist:
 
-- [ ] Review all file reads/writes.
-- [ ] Review all process spawning.
-- [ ] Review path normalization.
-- [ ] Review regex filters for ReDoS or unbounded work.
-- [ ] Review log ring buffer bounds.
-- [ ] Review trace/profile memory bounds.
-- [ ] Review all tools for explicit unsafe modes.
-- [ ] Confirm no shell escape path is exposed.
-- [ ] Confirm `pkill` or global process cleanup is not used by default.
+- [x] Review all file reads/writes.
+- [x] Review all process spawning.
+- [x] Review path normalization.
+- [x] Review regex filters for ReDoS or unbounded work.
+- [x] Review log ring buffer bounds.
+- [x] Review trace/profile memory bounds.
+- [x] Review all tools for explicit unsafe modes.
+- [x] Confirm no shell escape path is exposed.
+- [x] Confirm `pkill` or global process cleanup is not used by default.
 
 ## 17.1 Safety Checklist
 
@@ -1601,6 +1601,14 @@ Progress checklist:
 - All errors are structured.
 - All capabilities are discoverable.
 - Required compile-time features such as AI interface and NetSIO fail clearly when unavailable; optional debugger/trace/profile features report unavailable capabilities clearly.
+
+Phase 17 implementation notes:
+
+- FujiNet archive extraction now lists and validates `.tar.gz` entries before extraction, rejecting absolute paths and `..` components.
+- FujiNet log regex filters are bounded and reject nested/repeated wildcard quantifier forms before matching against the bounded log ring.
+- Artifact deletion refuses to delete a managed artifact root directory itself while still allowing scoped deletions below deletable roots.
+- Process spawning uses argv arrays with no shell escape tool exposed; emulator, FujiNet-PC, and Xvfb cleanup remains scoped to tracked session-owned processes.
+- `tests/mcp_phase17_hardening.mjs` covers unsafe log regex rejection and artifact root deletion denial through the MCP tool layer.
 
 ---
 
