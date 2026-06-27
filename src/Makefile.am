@@ -264,6 +264,7 @@ if WANT_PBI_MIO_OR_BB
 atari800_SOURCES += pbi_scsi.c pbi_scsi.h
 endif
 if WANT_NETSIO
+atari800_SOURCES += netsio_monitor.c netsio_monitor.h ai_netsio.inc
 if CONFIGURE_HOST_WIN
 atari800_SOURCES += netsiowin.c netsio.h
 else

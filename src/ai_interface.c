@@ -37,6 +37,9 @@
 #include "monitor.h"
 #include "log.h"
 #include "crc32.h"
+#ifdef NETSIO
+#include "netsio.h"
+#endif
 
 /* Configuration */
 int AI_enabled = 0;
@@ -1611,6 +1614,8 @@ static void ai_default_artifact_path(char *path, size_t path_size, const char *p
     strncat(path, suffix, path_size - strlen(path) - 1);
 }
 
+#include "ai_netsio.inc"
+
 static void ai_send_hello(void)
 {
     size_t pos = 0;
@@ -1678,18 +1683,21 @@ static void ai_send_hello(void)
         "\"debugger.dlist\",\"debugger.search_memory\",\"debugger.search_string\",\"debugger.search_screencode_string\",\"debugger.labels\","
         "\"debugger.continue\",\"breakpoint.pc\",\"breakpoint.brk\",\"breakpoint.status\",\"breakpoint.clear\","
         "\"breakpoint.list\",\"breakpoint.add\",\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\","
-        "\"save_state\",\"load_state\"],"
+        "\"save_state\",\"load_state\",\"netsio.status\",\"netsio.trace.status\",\"netsio.trace.read\","
+        "\"netsio.trace.clear\",\"netsio.trace.enable\",\"netsio.trace.disable\"],"
         "\"command_classes\":{\"read_only\":[\"ping\",\"hello\",\"capabilities\",\"screen_ascii\",\"screen_raw\","
         "\"video.status\",\"peek\",\"cpu\",\"antic\",\"gtia\",\"pokey\",\"pia\",\"debug_read\","
         "\"debugger.status\",\"debugger.show_state\",\"debugger.history\",\"debugger.jumps\",\"debugger.stack\","
         "\"debugger.disassemble\",\"debugger.disassemble_loop\",\"debugger.dlist\",\"debugger.search_memory\","
-        "\"debugger.search_string\",\"debugger.search_screencode_string\",\"debugger.labels\",\"breakpoint.status\",\"breakpoint.list\"],"
+        "\"debugger.search_string\",\"debugger.search_screencode_string\",\"debugger.labels\",\"breakpoint.status\",\"breakpoint.list\","
+        "\"netsio.status\",\"netsio.trace.status\",\"netsio.trace.read\"],"
         "\"mutating\":[\"load\",\"run\",\"frame_step\",\"step\",\"pause\",\"reset\",\"key\",\"key_release\","
         "\"joystick\",\"paddle\",\"consol\",\"screenshot\",\"video.enable_push\",\"video.disable_push\","
         "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\",\"video.push.set_frameskip\","
         "\"video.push.enable_change_triggered\",\"dump\",\"debug_enable\",\"debugger.step_instruction\","
         "\"debugger.continue\",\"breakpoint.pc\",\"breakpoint.brk\",\"breakpoint.clear\",\"breakpoint.add\","
-        "\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\",\"save_state\",\"load_state\"],"
+        "\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\",\"save_state\",\"load_state\","
+        "\"netsio.trace.clear\",\"netsio.trace.enable\",\"netsio.trace.disable\"],"
         "\"unsafe\":[\"poke\",\"cpu_set\"]}}");
     AI_SendResponse(ai_response);
 }
@@ -2114,6 +2122,58 @@ static void process_command(const char *cmd) {
             PIA_PORTA, PIA_PORTB, PIA_PACTL, PIA_PBCTL,
             PIA_PORT_input[0], PIA_PORT_input[1]);
         AI_SendResponse(ai_response);
+    }
+
+    else if (strcmp(cmd_type, "netsio.status") == 0) {
+#ifdef NETSIO
+        ai_send_netsio_status();
+#else
+        AI_SendResponse("{\"status\":\"ok\",\"compiled\":false}");
+#endif
+    }
+    else if (strcmp(cmd_type, "netsio.trace.status") == 0) {
+#ifdef NETSIO
+        ai_send_netsio_trace_status();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "NetSIO support is not compiled in", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "netsio.trace.read") == 0) {
+#ifdef NETSIO
+        int since_seq;
+        int limit;
+        rc = AI_JSON_GetInt(cmd, "since_seq", &since_seq, 0, FALSE, 0, 0x7fffffff);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "since_seq", FALSE); return; }
+        rc = AI_JSON_GetInt(cmd, "limit", &limit, 100, FALSE, 1, NETSIO_TRACE_CAPACITY);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "limit", FALSE); return; }
+        ai_send_netsio_trace_read((uint64_t)since_seq, (size_t)limit);
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "NetSIO support is not compiled in", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "netsio.trace.clear") == 0) {
+#ifdef NETSIO
+        NETSIO_MONITOR_ClearTrace();
+        ai_send_netsio_trace_status();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "NetSIO support is not compiled in", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "netsio.trace.enable") == 0) {
+#ifdef NETSIO
+        NETSIO_MONITOR_SetTraceEnabled(TRUE);
+        ai_send_netsio_trace_status();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "NetSIO support is not compiled in", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "netsio.trace.disable") == 0) {
+#ifdef NETSIO
+        NETSIO_MONITOR_SetTraceEnabled(FALSE);
+        ai_send_netsio_trace_status();
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "NetSIO support is not compiled in", NULL);
+#endif
     }
 
     /* === DEBUG === */

@@ -1057,13 +1057,18 @@ Purpose: let agents diagnose SIO, FujiNet, and NETStream behavior without readin
 
 Progress checklist:
 
-- [ ] Add NetSIO status C command.
-- [ ] Add NetSIO trace ring buffer.
-- [ ] Add SIO command frame tracing.
-- [ ] Add sync/ACK/NAK observability.
-- [ ] Add credit/queue/backpressure visibility.
-- [ ] Add NETStream status fields.
-- [ ] Verify Proceed/Interrupt constants and PIA CA1/CB1 mapping with source and tests.
+- [x] Add NetSIO status C command.
+- [x] Add NetSIO trace ring buffer.
+- [x] Add SIO command frame tracing.
+- [x] Add sync/ACK/NAK observability.
+- [x] Add credit/queue/backpressure visibility.
+- [x] Add NETStream status fields.
+- [x] Verify Proceed/Interrupt constants and PIA CA1/CB1 mapping with source and tests.
+- [ ] Register the NetSIO status and trace commands as MCP tools.
+- [ ] Document the NetSIO tools and emulator-side versus handler-side fields for AI agents.
+- [ ] Add and run the headless MCP/FujiNet integration smoke test.
+
+Implementation status (2026-06-26): the emulator-side Phase 10 foundation is implemented. The POSIX and Windows NetSIO transports feed a thread-safe monitor with bounded packet and decoded SIO command tracing, sync timeout and ACK/NAK state, per-message counters, queue/credit state, timestamps, pin state, and NETStream gates. The AI socket exposes `netsio.status` and the five `netsio.trace.*` commands, and advertises their read-only/mutating classifications. Handler-only NETStream values that the emulator cannot observe are returned as `null` with an explanatory note. The focused monitor test covers protocol IDs, decoded state, trace bounds/drop accounting, and clearing. The emulator build and focused monitor test passed; MCP registration, agent documentation, and end-to-end headless testing remain.
 
 ## 10.1 Important Source-Based Mapping
 

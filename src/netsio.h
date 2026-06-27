@@ -108,4 +108,33 @@ void netsio_netstream_clear_pending(void);
 void netsio_netstream_update_pokey(uint8_t skctl, uint8_t audctl, uint8_t audf3, uint8_t audf4);
 int netsio_netstream_active(void);
 
+#include "netsio_monitor.h"
+
+typedef struct NetSIOStatus {
+	int initialized;
+	int enabled;
+	int fujinet_known;
+	uint16_t port;
+	char peer_address[64];
+	uint16_t peer_port;
+	int sync_wait;
+	uint8_t sync_num;
+	int next_write_size;
+	int command_asserted;
+	int proceed_ca1;
+	int interrupt_cb1;
+	int fifo_available;
+	int fifo_capacity;
+	int netstream_active;
+	int netstream_pending_enable;
+	int netstream_fuji_enabled;
+	int netstream_motor_on;
+	int netstream_pokey_compatible;
+	uint8_t audf3;
+	uint8_t audf4;
+	NETSIO_MONITOR_Snapshot monitor;
+} NetSIOStatus;
+
+void netsio_get_status(NetSIOStatus *status);
+
 #endif /* NETSIO_H */

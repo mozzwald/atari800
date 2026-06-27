@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <time.h>
 #include "netsio.h"
@@ -48,13 +49,16 @@ static volatile int netsio_netstream_fuji_enabled = 0;
 static volatile int netsio_netstream_motor_on = 0;
 static volatile int netsio_netstream_pokey_ok = 0;
 static volatile int netsio_netstream_is_active = 0;
+static uint8_t netsio_netstream_audf3 = 0;
+static uint8_t netsio_netstream_audf4 = 0;
+static uint16_t netsio_port = 0;
 
 /* PIA Pin buffered states for synchronous emulator polling */
 volatile int netsio_ca1_state = 1;
 volatile int netsio_cb1_state = 1;
 
 /* FIFO pipe: fds0: FujiNet->emulator */
-int fds0[2];
+int fds0[2] = {-1, -1};
 
 /* UDP socket for NetSIO and return address holder */
 static int sockfd = -1;
@@ -140,6 +144,7 @@ static void send_to_fujinet(const uint8_t *pkt, size_t len) {
     /* if we never received a ping from FujiNet or we have no address to reply to */
     if (!fujinet_known || fujinet_addr.ss_family != AF_INET)
     {
+        NETSIO_MONITOR_ObservePacket(NETSIO_TRACE_DIRECTION_ATARI_TO_FUJINET, pkt, len, 0);
 #ifdef DEBUG
         Log_print("netsio: can't send_to_fujinet, no address");
 #endif
@@ -180,6 +185,7 @@ static void send_to_fujinet(const uint8_t *pkt, size_t len) {
         }
         if (n < 0)
         {
+            NETSIO_MONITOR_ObservePacket(NETSIO_TRACE_DIRECTION_ATARI_TO_FUJINET, pkt, len, 0);
 #ifdef DEBUG
             Log_print("netsio: sendto fn failed: %d", errno);
 #endif
@@ -188,12 +194,14 @@ static void send_to_fujinet(const uint8_t *pkt, size_t len) {
     }
     else if ((size_t)n != len)
     {
+        NETSIO_MONITOR_ObservePacket(NETSIO_TRACE_DIRECTION_ATARI_TO_FUJINET, pkt, len, 0);
 #ifdef DEBUG
         Log_print("netsio: partial send (%zd of %zu bytes)", n, len);
 #endif
         return;
     }
 
+    NETSIO_MONITOR_ObservePacket(NETSIO_TRACE_DIRECTION_ATARI_TO_FUJINET, pkt, len, 1);
 #ifdef DEBUG2
     /* build a hex string: each byte "XX " */
     for (i = 0; i < len; i++) {
@@ -240,6 +248,9 @@ int netsio_init(uint16_t port) {
 #endif
         return 0;
     }
+
+    netsio_port = port;
+    NETSIO_MONITOR_Init(port);
 
     /* create emulator <-> netsio FIFOs */
     if (pipe(fds0) < 0)
@@ -327,6 +338,7 @@ int netsio_init(uint16_t port) {
 
     /* Mark as initialized to prevent re-initialization */
     netsio_initialized = 1;
+    NETSIO_MONITOR_SetInitialized(1);
 #ifdef DEBUG
     Log_print("netsio: initialization complete");
 #endif
@@ -353,6 +365,7 @@ void netsio_wait_for_sync(void)
 #endif
         if (pthread_cond_timedwait(&netsio_sync_cond, &netsio_sync_mutex, &deadline) == ETIMEDOUT) {
             netsio_sync_wait = 0;
+            NETSIO_MONITOR_ObserveSyncTimeout();
             break;
         }
     }
@@ -393,6 +406,7 @@ int netsio_cmd_off(void)
 {
     uint8_t p;
     p = NETSIO_COMMAND_OFF;
+    netsio_cmd_state = 0;
 #ifdef DEBUG
     Log_print("netsio: CMD OFF");
 #endif
@@ -408,6 +422,7 @@ int netsio_cmd_off_sync(void)
     netsio_sync_wait = 1; /* pause emulation until we hear back or timeout */
     pthread_mutex_unlock(&netsio_sync_mutex);
     p[0] = NETSIO_COMMAND_OFF_SYNC;
+    netsio_cmd_state = 0;
     netsio_sync_num++;
     p[1] = netsio_sync_num;
 #ifdef DEBUG
@@ -473,6 +488,7 @@ void netsio_netstream_set_motor(int motor_on)
 
 void netsio_netstream_note_command_frame(const uint8_t *cmd, size_t len)
 {
+    NETSIO_MONITOR_ObserveCommandFrame(cmd, len);
     if (len >= 2 && cmd != NULL && cmd[0] == 0x70 && cmd[1] == 0xF0) {
         netsio_netstream_pending_enable = 1;
 #ifdef DEBUG
@@ -503,8 +519,8 @@ void netsio_netstream_clear_pending(void)
 void netsio_netstream_update_pokey(uint8_t skctl, uint8_t audctl, uint8_t audf3, uint8_t audf4)
 {
     uint8_t mode = skctl & 0x70;
-    (void)audf3;
-    (void)audf4;
+    netsio_netstream_audf3 = audf3;
+    netsio_netstream_audf4 = audf4;
     netsio_netstream_pokey_ok =
         ((audctl & 0x28) == 0x28)
         && (mode == 0x00 || mode == 0x10 || mode == 0x30 || mode == 0x40);
@@ -648,6 +664,7 @@ static void *fujinet_rx_thread(void *arg) {
 #endif
             continue;
         }
+        NETSIO_MONITOR_ObservePacket(NETSIO_TRACE_DIRECTION_FUJINET_TO_ATARI, buf, (size_t)n, 1);
         fujinet_known = 1;
         
         /* Update the address length to the correct size for future sends */
@@ -882,6 +899,40 @@ static void *fujinet_rx_thread(void *arg) {
     return NULL;
 }
 
+void netsio_get_status(NetSIOStatus *status)
+{
+    struct sockaddr_in *peer;
+
+    if (status == NULL)
+        return;
+    memset(status, 0, sizeof(*status));
+    status->initialized = netsio_initialized;
+    status->enabled = netsio_enabled;
+    status->fujinet_known = fujinet_known;
+    status->port = netsio_port;
+    status->sync_wait = netsio_sync_wait;
+    status->sync_num = netsio_sync_num;
+    status->next_write_size = netsio_next_write_size;
+    status->command_asserted = netsio_cmd_state;
+    status->proceed_ca1 = netsio_ca1_state;
+    status->interrupt_cb1 = netsio_cb1_state;
+    status->fifo_available = netsio_initialized ? netsio_available() : 0;
+    status->fifo_capacity = NETSIO_FIFO_SIZE;
+    status->netstream_active = netsio_netstream_is_active;
+    status->netstream_pending_enable = netsio_netstream_pending_enable;
+    status->netstream_fuji_enabled = netsio_netstream_fuji_enabled;
+    status->netstream_motor_on = netsio_netstream_motor_on;
+    status->netstream_pokey_compatible = netsio_netstream_pokey_ok;
+    status->audf3 = netsio_netstream_audf3;
+    status->audf4 = netsio_netstream_audf4;
+    if (fujinet_known && fujinet_addr.ss_family == AF_INET) {
+        peer = (struct sockaddr_in *)&fujinet_addr;
+        inet_ntop(AF_INET, &peer->sin_addr, status->peer_address, sizeof(status->peer_address));
+        status->peer_port = ntohs(peer->sin_port);
+    }
+    NETSIO_MONITOR_GetSnapshot(&status->monitor);
+}
+
 /* Shutdown NetSIO subsystem and clean up resources */
 void netsio_shutdown(void) {
 #ifdef DEBUG
@@ -919,6 +970,8 @@ void netsio_shutdown(void) {
     /* Reset global state variables */
     netsio_enabled = 0;
     netsio_initialized = 0;  /* Allow re-initialization after shutdown */
+    NETSIO_MONITOR_SetInitialized(0);
+    netsio_port = 0;
     netsio_sync_num = 0;
     fujinet_known = 0;
     pthread_mutex_lock(&netsio_sync_mutex);
@@ -932,6 +985,10 @@ void netsio_shutdown(void) {
     netsio_netstream_motor_on = 0;
     netsio_netstream_pokey_ok = 0;
     netsio_netstream_is_active = 0;
+    netsio_netstream_audf3 = 0;
+    netsio_netstream_audf4 = 0;
+    netsio_ca1_state = 1;
+    netsio_cb1_state = 1;
 
     /* Clear address info */
     memset(&fujinet_addr, 0, sizeof(fujinet_addr));
