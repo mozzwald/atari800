@@ -978,13 +978,13 @@ Purpose: boot FujiNet-based programs deterministically without driving CONFIG UI
 
 Progress checklist:
 
-- [ ] Generate managed FujiNet-PC working directory.
-- [ ] Parse and write `fnconfig.ini` as structured config.
-- [ ] Use atomic writes and backups.
-- [ ] Add managed SD/data path handling.
-- [ ] Implement mount-and-boot workflow using deterministic config and cold reset.
-- [ ] Add remount and cold reset semantics.
-- [ ] Document FujiNet workflows for agents in `README.AI.md`.
+- [x] Generate managed FujiNet-PC working directory.
+- [x] Parse and write `fnconfig.ini` as structured config.
+- [x] Use atomic writes and backups.
+- [x] Add managed SD/data path handling.
+- [x] Implement mount-and-boot workflow using deterministic config and cold reset.
+- [x] Add remount and cold reset semantics.
+- [x] Document FujiNet workflows for agents in `README.AI.md`.
 
 ## 9.1 Config Ownership Rules
 
@@ -1039,6 +1039,15 @@ Suggested deterministic flow:
 8. Wait for NetSIO connection and FujiNet readiness.
 9. Cold reset Atari/FujiNet pair.
 10. Use `run_until` plus screen/debug/SIO trace to confirm boot.
+
+
+Phase 9 implementation notes:
+
+- `mcp-server/fujinet-config.js` preserves INI ordering/comments while providing case-insensitive structured access and atomic writes with timestamped backups.
+- Mounts use Host1 as the local SD host and managed paths under `SD/mcp-disks/driveN`; copied read-only images are the default.
+- Direct writable source mounts require `allow_source_write=true`; opted-in managed copies are preserved outside cleanup-owned runtime directories.
+- `fujinet_boot` starts missing managed processes headlessly by default. `fujinet_remount` restarts only the owned sidecar on the same NetSIO port, waits for FujiNet's `### NetSIO initialized ###` event, then cold-resets Atari.
+- `tests/fujinet_config_test.mjs` covers structured parsing and backups. `tests/mcp_fujinet_phase9_smoke.mjs` covers real managed mounting, boot, remount, preservation, and cleanup under Xvfb.
 
 ---
 

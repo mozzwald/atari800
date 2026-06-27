@@ -104,7 +104,13 @@ async function main() {
       throw new Error(`Atari headless arguments are incomplete: ${atariStatus}`);
     }
 
-    const fujinetAfterReset = await callTool('fujinet_status');
+    const reconnectDeadline = Date.now() + 10000;
+    let fujinetAfterReset = '';
+    while (Date.now() < reconnectDeadline) {
+      fujinetAfterReset = await callTool('fujinet_status');
+      if (fujinetAfterReset.includes('"atari_netsio_connected": true')) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     if (!fujinetAfterReset.includes('"atari_netsio_connected": true')) {
       throw new Error(`Atari NetSIO connection was not observed: ${fujinetAfterReset}`);
     }

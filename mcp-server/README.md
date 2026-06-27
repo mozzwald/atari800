@@ -49,6 +49,13 @@ The server uses `../src/atari800` relative to `mcp-server/index.js` by default. 
 | `fujinet_debug_read` | Read bounded FujiNet-PC debug output with sequence/filter support. |
 | `fujinet_debug_clear` | Clear the FujiNet-PC debug output buffer. |
 | `fujinet_debug_status` | Report FujiNet-PC debug output buffer counters. |
+| `fujinet_config_get` | Read the managed `fnconfig.ini` as structured data or a selected value. |
+| `fujinet_config_set` | Atomically update a managed config value with a timestamped backup. |
+| `fujinet_mount_disk` | Copy or explicitly link an image into a managed FujiNet drive slot. |
+| `fujinet_unmount_disk` | Remove a drive mount and preserve its working image when requested. |
+| `fujinet_mount_status` | Report configured slots, paths, modes, and pending remount state. |
+| `fujinet_boot` | Mount optionally, start missing processes, reload FujiNet, cold reset, and wait for NetSIO. |
+| `fujinet_remount` | Restart the owned sidecar, reload config, cold reset Atari, and wait for NetSIO. |
 | `atari_start` | Start an MCP-owned emulator session. |
 | `atari_stop` | Stop the tracked session; accepts `force` and `cleanup_runtime_dir`. |
 | `atari_status` | Report session state, launch details, sockets, and bounded logs. |
@@ -128,5 +135,10 @@ Use `fujinet_list_versions` first. If a matching local archive exists, use `fuji
 When supplied by the package, `run-fujinet` handles FujiNet-PC's exit-75 reboot requests while remaining under MCP lifecycle control.
 
 Use `fujinet_debug_read` or `fujinet_logs` to inspect FujiNet-PC debug output while testing FujiNet-enabled apps. Use `fujinet_stop` to stop only the MCP-owned FujiNet-PC process; `atari_stop` stops the whole managed session.
+
+
+For deterministic disk boot, use `fujinet_boot` with `source_path`. The default copies the image into the managed SD workspace, mounts it read-only on D1, disables CONFIG boot, starts both processes headlessly, reloads FujiNet configuration, and cold-resets Atari. Use `fujinet_remount` after config or mount changes made during a running session.
+
+See `README.AI.md` for agent-oriented FujiNet safety, preservation, and debugging workflows.
 
 MCP wrappers are intentionally narrower than the C socket API. See `AGENT_CONTRACT.md` for the full C command inventory and known gaps.

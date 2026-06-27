@@ -19,6 +19,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  getIniValue,
+  iniToObject,
+  parseIni,
+  removeIniSection,
+  setIniValue,
+  writeIniAtomic,
+} from './fujinet-config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,6 +98,7 @@ function createSession(program, artifactDirOverride = null) {
       netsio: null,
       netsio_port: null,
       netsio_connected: false,
+      netsio_connection_count: 0,
     },
     display: null,
     xvfb: null,
@@ -114,6 +123,7 @@ function recordLog(stream, chunk) {
     });
     if (stream === 'stdout' && line.includes('netsio connected after')) {
       session.emulator.netsio_connected = true;
+      session.emulator.netsio_connection_count = (session.emulator.netsio_connection_count || 0) + 1;
     }
   }
 }
@@ -239,6 +249,12 @@ function recordFujiNetLog(stream, chunk) {
       text: line,
     };
     session.fujinet.logs.push(entry);
+    if (line.includes('### NetSIO initialized ###') &&
+        session.emulator?.netsio_port === session.fujinet.udp_port) {
+      session.emulator.netsio_connected = true;
+    } else if (line.includes('### NetSIO stopped ###')) {
+      session.emulator.netsio_connected = false;
+    }
     recordLog(`fujinet.${stream}`, Buffer.from(line));
   }
 }
@@ -359,12 +375,34 @@ function copyOrExtractFujiNet(sourcePath, targetRoot) {
   return path.dirname(executable);
 }
 
+function preparedFujiNetInstall(sourcePath = null) {
+  const info = session?.fujinet;
+  if (!info?.managed || !info.config_path || !fs.existsSync(info.config_path)) return null;
+  const selectedSource = sourcePath || fujinetSelection.local_path;
+  if (selectedSource && path.resolve(selectedSource) !== path.resolve(info.source_path)) return null;
+  return {
+    sourcePath: info.source_path,
+    workDir: info.working_dir,
+    executable: info.executable_path,
+    launcher: info.launcher_path,
+    sdPath: info.sd_path,
+    configPath: info.config_path,
+  };
+}
+
 function prepareFujiNetInstall(sourcePath) {
   if (!session) {
     cleanupStaleRuntimeDirs();
     session = createSession(null);
     session.state = 'not_started';
   }
+
+  const reusable = preparedFujiNetInstall(sourcePath);
+  if (reusable) return reusable;
+  if (fujinetProcessRunning()) {
+    throw makeError('BUSY', 'stop FujiNet-PC before selecting a different managed installation');
+  }
+
   const resolvedSource = selectedOrDiscoveredFujiNetPath(sourcePath);
   const installRoot = path.join(session.runtime_dir, 'fujinet-install');
   fs.rmSync(installRoot, { recursive: true, force: true });
@@ -379,54 +417,294 @@ function prepareFujiNetInstall(sourcePath) {
   fs.chmodSync(launcher, 0o755);
   const sdPath = path.join(workDir, 'SD');
   ensureDir(sdPath);
+  const dataPath = path.join(workDir, 'data');
+  ensureDir(dataPath);
   const configPath = path.join(workDir, 'fnconfig.ini');
   if (!fs.existsSync(configPath)) {
-    const dataConfig = path.join(workDir, 'data', 'fnconfig.ini');
+    const dataConfig = path.join(dataPath, 'fnconfig.ini');
     if (fs.existsSync(dataConfig)) fs.copyFileSync(dataConfig, configPath);
-    else fs.writeFileSync(configPath, '[BOIP]\nenabled=1\nhost=localhost\nport=\n');
+    else fs.writeFileSync(configPath, '[General]\nboot_mode=0\nconfigenabled=0\n\n[BOIP]\nenabled=1\nhost=localhost\nport=\n');
   }
+
+  session.fujinet = {
+    state: 'prepared',
+    managed: true,
+    selected_version: fujinetSelection.version || path.basename(resolvedSource),
+    source_path: resolvedSource,
+    executable_path: executable,
+    launcher_path: launcher,
+    working_dir: workDir,
+    argv: [],
+    pid: null,
+    udp_port: null,
+    config_path: configPath,
+    sd_path: sdPath,
+    data_path: dataPath,
+    started_at: null,
+    exit_code: null,
+    signal: null,
+    process_group: false,
+    mounts: [],
+    config_backups: [],
+    logs: [],
+    dropped_logs: 0,
+    log_seq: 0,
+  };
+  if (!session.owned_paths.includes(installRoot)) session.owned_paths.push(installRoot);
   return { sourcePath: resolvedSource, workDir, executable, launcher, sdPath, configPath };
 }
 
-function setIniSectionValue(text, section, key, value) {
-  const lines = text.split(/\r?\n/);
-  let sectionStart = -1;
-  let sectionEnd = lines.length;
-  for (let i = 0; i < lines.length; i += 1) {
-    if (lines[i].trim().toLowerCase() === `[${section.toLowerCase()}]`) {
-      sectionStart = i;
-      for (let j = i + 1; j < lines.length; j += 1) {
-        if (/^\s*\[.*\]\s*$/.test(lines[j])) {
-          sectionEnd = j;
-          break;
-        }
-      }
-      break;
-    }
+function readFujiNetConfig(configPath) {
+  return parseIni(fs.readFileSync(configPath, 'utf8'));
+}
+
+function writeManagedFujiNetConfig(configPath, config) {
+  if (!session?.fujinet?.managed || path.resolve(configPath) !== path.resolve(session.fujinet.config_path)) {
+    throw makeError('PATH_DENIED', 'only the MCP-managed FujiNet configuration may be written');
   }
-  if (sectionStart < 0) {
-    lines.push('', `[${section}]`, `${key}=${value}`);
-    return lines.join('\n');
-  }
-  const keyRe = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=`, 'i');
-  for (let i = sectionStart + 1; i < sectionEnd; i += 1) {
-    if (keyRe.test(lines[i])) {
-      lines[i] = `${key}=${value}`;
-      return lines.join('\n');
-    }
-  }
-  lines.splice(sectionEnd, 0, `${key}=${value}`);
-  return lines.join('\n');
+  const result = writeIniAtomic(configPath, config);
+  if (result.backup_path) session.fujinet.config_backups.push(result.backup_path);
+  session.fujinet.last_config_write = {
+    ...result,
+    timestamp: nowIso(),
+  };
+  return result;
 }
 
 function writeFujiNetConfig(configPath, port) {
-  let text = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
-  text = setIniSectionValue(text, 'BOIP', 'enabled', '1');
-  text = setIniSectionValue(text, 'BOIP', 'host', 'localhost');
-  text = setIniSectionValue(text, 'BOIP', 'port', String(port));
-  const tmp = `${configPath}.tmp`;
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, configPath);
+  const config = readFujiNetConfig(configPath);
+  setIniValue(config, 'BOIP', 'enabled', '1');
+  setIniValue(config, 'BOIP', 'host', 'localhost');
+  setIniValue(config, 'BOIP', 'port', String(port));
+  return writeManagedFujiNetConfig(configPath, config);
+}
+
+
+function managedFujiNetConfig(sourcePath = null) {
+  const prepared = prepareFujiNetInstall(sourcePath);
+  return { prepared, config: readFujiNetConfig(prepared.configPath) };
+}
+
+function validateFujiNetDrive(value) {
+  const drive = Number(value);
+  if (!Number.isInteger(drive) || drive < 1 || drive > 8) {
+    throw makeError('BAD_ARGUMENT', 'drive must be an integer from 1 through 8', { drive: value });
+  }
+  return drive;
+}
+
+function safeDiskName(sourcePath) {
+  const name = path.basename(sourcePath).replace(/[^A-Za-z0-9._-]/g, '_');
+  return name && name !== '.' && name !== '..' ? name : 'disk.atr';
+}
+
+function pathIsInside(candidate, root) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function copyFileAtomic(source, destination) {
+  ensureDir(path.dirname(destination));
+  const temp = path.join(path.dirname(destination), `.${path.basename(destination)}.tmp-${process.pid}`);
+  fs.copyFileSync(source, temp);
+  fs.renameSync(temp, destination);
+}
+
+function configGet(args = {}) {
+  const { prepared, config } = managedFujiNetConfig(args.local_path || null);
+  let value = iniToObject(config);
+  if (args.section) {
+    const sectionName = config.sections.find(
+      (section) => section.name.toLowerCase() === String(args.section).toLowerCase()
+    )?.name;
+    value = sectionName ? value[sectionName] : null;
+    if (args.key) value = getIniValue(config, args.section, args.key);
+  } else if (args.key) {
+    throw makeError('BAD_ARGUMENT', 'key requires section');
+  }
+  return { status: 'ok', config_path: prepared.configPath, section: args.section || null, key: args.key || null, value };
+}
+
+function configSet(args = {}) {
+  if (!args.section || !args.key || args.value === undefined) {
+    throw makeError('MISSING_FIELD', 'section, key, and value are required');
+  }
+  const { prepared, config } = managedFujiNetConfig(args.local_path || null);
+  try {
+    setIniValue(config, args.section, args.key, args.value);
+  } catch (error) {
+    throw makeError('BAD_ARGUMENT', error.message);
+  }
+  const written = writeManagedFujiNetConfig(prepared.configPath, config);
+  if (fujinetProcessRunning()) session.fujinet.pending_remount = true;
+  return {
+    status: 'ok', ...written, section: args.section, key: args.key, value: String(args.value),
+    pending_remount: Boolean(session.fujinet.pending_remount),
+  };
+}
+
+function preserveMountOutput(mount) {
+  if (!mount?.preserve_modified || !mount.managed_path || !fs.existsSync(mount.managed_path)) return null;
+  const persistentRoot = pathIsInside(session.artifact_dir, session.runtime_dir)
+    ? path.join(RUNTIME_ROOT, 'preserved', session.session_id)
+    : session.artifact_dir;
+  const outputPath = mount.output_path || path.join(
+    persistentRoot, 'fujinet-disks', `drive${mount.drive}-${path.basename(mount.managed_path)}`
+  );
+  if (!pathIsInside(outputPath, persistentRoot)) {
+    throw makeError('PATH_DENIED', 'preserved disk output must be inside the persistent artifact directory', {
+      output_path: outputPath, persistent_artifact_dir: persistentRoot,
+    });
+  }
+  copyFileAtomic(mount.managed_path, outputPath);
+  mount.preserved_path = outputPath;
+  mount.preserved_at = nowIso();
+  return outputPath;
+}
+
+function currentMount(drive) {
+  return session?.fujinet?.mounts?.find((mount) => mount.drive === drive) || null;
+}
+
+function removeManagedMountFile(mount) {
+  if (!mount?.managed_path || !pathIsInside(mount.managed_path, session.fujinet.sd_path)) return;
+  try { fs.unlinkSync(mount.managed_path); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+}
+
+function mountFujiNetDisk(args = {}) {
+  if (!args.source_path) throw makeError('MISSING_FIELD', 'source_path is required');
+  const sourcePath = path.resolve(args.source_path);
+  if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+    throw makeError('BAD_ARGUMENT', 'source disk image does not exist or is not a file', { source_path: sourcePath });
+  }
+  const drive = validateFujiNetDrive(args.drive ?? args.slot ?? 1);
+  const readOnly = args.read_only !== false;
+  const copyToWorkspace = args.copy_to_workspace !== false;
+  if (!readOnly && !copyToWorkspace && args.allow_source_write !== true) {
+    throw makeError('BAD_ARGUMENT', 'direct writable mounts require allow_source_write=true', { source_path: sourcePath });
+  }
+
+  const { prepared, config } = managedFujiNetConfig(args.local_path || null);
+  const previous = currentMount(drive);
+  const preservedPath = preserveMountOutput(previous);
+  removeManagedMountFile(previous);
+
+  const targetDir = path.join(prepared.sdPath, 'mcp-disks', `drive${drive}`);
+  ensureDir(targetDir);
+  const targetPath = path.join(targetDir, safeDiskName(sourcePath));
+  if (copyToWorkspace) copyFileAtomic(sourcePath, targetPath);
+  else {
+    try { fs.unlinkSync(targetPath); } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    fs.symlinkSync(sourcePath, targetPath);
+  }
+
+  setIniValue(config, 'Host1', 'type', 'SD');
+  setIniValue(config, 'Host1', 'name', 'SD');
+  setIniValue(config, `Mount${drive}`, 'hostslot', '1');
+  setIniValue(config, `Mount${drive}`, 'path', `/${path.relative(prepared.sdPath, targetPath).split(path.sep).join('/')}`);
+  setIniValue(config, `Mount${drive}`, 'mode', readOnly ? 'r' : 'w');
+  if (args.boot_mode !== false) {
+    setIniValue(config, 'General', 'boot_mode', '1');
+    setIniValue(config, 'General', 'configenabled', '0');
+  }
+  const written = writeManagedFujiNetConfig(prepared.configPath, config);
+  const mount = {
+    drive, source_path: sourcePath, managed_path: targetPath,
+    fujinet_path: getIniValue(config, `Mount${drive}`, 'path'), host_slot: 1,
+    mode: readOnly ? 'r' : 'w', read_only: readOnly, copy_to_workspace: copyToWorkspace,
+    source_write_enabled: !readOnly && !copyToWorkspace,
+    preserve_modified: args.preserve_modified === true,
+    output_path: args.output_path ? path.resolve(args.output_path) : null, mounted_at: nowIso(),
+  };
+  session.fujinet.mounts = (session.fujinet.mounts || []).filter((item) => item.drive !== drive);
+  session.fujinet.mounts.push(mount);
+  session.fujinet.mounts.sort((a, b) => a.drive - b.drive);
+  if (fujinetProcessRunning()) session.fujinet.pending_remount = true;
+  return {
+    status: 'ok', mount, replaced_preserved_path: preservedPath, config_write: written,
+    pending_remount: Boolean(session.fujinet.pending_remount),
+  };
+}
+
+function unmountFujiNetDisk(args = {}) {
+  const drive = validateFujiNetDrive(args.drive ?? args.slot);
+  const { prepared, config } = managedFujiNetConfig(args.local_path || null);
+  const mount = currentMount(drive);
+  const preservedPath = preserveMountOutput(mount);
+  removeManagedMountFile(mount);
+  removeIniSection(config, `Mount${drive}`);
+  const written = writeManagedFujiNetConfig(prepared.configPath, config);
+  session.fujinet.mounts = (session.fujinet.mounts || []).filter((item) => item.drive !== drive);
+  if (fujinetProcessRunning()) session.fujinet.pending_remount = true;
+  return {
+    status: 'ok', drive, was_mounted: Boolean(mount), preserved_path: preservedPath,
+    config_write: written, pending_remount: Boolean(session.fujinet.pending_remount),
+  };
+}
+
+function fujinetMountStatus() {
+  if (!session?.fujinet?.managed) return { status: 'ok', state: 'not_prepared', mounts: [] };
+  const config = readFujiNetConfig(session.fujinet.config_path);
+  const configured = [];
+  for (let drive = 1; drive <= 8; drive += 1) {
+    const diskPath = getIniValue(config, `Mount${drive}`, 'path');
+    if (!diskPath) continue;
+    configured.push({
+      drive, hostslot: Number(getIniValue(config, `Mount${drive}`, 'hostslot') || 0),
+      path: diskPath, mode: getIniValue(config, `Mount${drive}`, 'mode') || 'r',
+    });
+  }
+  return {
+    status: 'ok', config_path: session.fujinet.config_path, sd_path: session.fujinet.sd_path,
+    boot_mode: getIniValue(config, 'General', 'boot_mode'),
+    pending_remount: Boolean(session.fujinet.pending_remount),
+    configured, mounts: session.fujinet.mounts || [],
+  };
+}
+
+function preserveAllMountOutputs() {
+  const preserved = [];
+  for (const mount of session?.fujinet?.mounts || []) {
+    const output = preserveMountOutput(mount);
+    if (output) preserved.push({ drive: mount.drive, path: output });
+  }
+  return preserved;
+}
+
+async function waitForFujiNetConnectionAfter(logSeq, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const connected = session?.fujinet?.logs?.some(
+      (line) => line.seq > logSeq && line.text.includes('### NetSIO initialized ###')
+    );
+    if (emulatorProcessRunning() && fujinetProcessRunning() && connected) {
+      session.emulator.netsio_connected = true;
+      session.fujinet.pending_remount = false;
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw makeError('TIMEOUT', 'FujiNet-PC did not initialize NetSIO after managed restart', {
+    fujinet: fujinetStatusSnapshot(),
+    logs: session?.fujinet?.logs?.slice(-40) || [],
+  });
+}
+
+async function remountFujiNet(args = {}) {
+  if (!fujinetProcessRunning()) throw makeError('NOT_RUNNING', 'FujiNet-PC must be running before remount');
+  if (!emulatorProcessRunning()) throw makeError('NOT_RUNNING', 'Atari800 must be running before remount');
+  const baselineLogSeq = session.fujinet.log_seq || 0;
+  const port = session.fujinet.udp_port;
+  session.emulator.netsio_connected = false;
+  await stopFujiNet({ force: true });
+  await startFujiNetSidecar({ port, reuse_port: true, timeout_ms: args.timeout_ms ?? 10000 });
+  await waitForFujiNetConnectionAfter(baselineLogSeq, args.timeout_ms ?? 10000);
+  const reset = await sendCommand({ cmd: 'reset' });
+  return { status: 'ok', reset, mount_status: fujinetMountStatus(), fujinet: fujinetStatusSnapshot() };
 }
 
 async function udpPortAvailable(port) {
@@ -485,7 +763,7 @@ function signalFujiNetProcess(proc, signal) {
 
 async function stopFujiNet({ force = false } = {}) {
   if (!session?.fujinet_process || !session.fujinet) {
-    return { status: 'ok', state: 'not_started' };
+    return { status: 'ok', state: session?.fujinet?.state || 'not_started' };
   }
   const proc = session.fujinet_process;
   if (proc.exitCode === null && proc.signalCode === null) {
@@ -495,7 +773,7 @@ async function stopFujiNet({ force = false } = {}) {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     if (force && proc.exitCode === null && proc.signalCode === null) {
-      proc.kill('SIGKILL');
+      signalFujiNetProcess(proc, 'SIGKILL');
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     if (proc.exitCode === null && proc.signalCode === null) {
@@ -531,10 +809,14 @@ async function startFujiNetSidecar(args = {}) {
   if (session?.fujinet_process && session.fujinet_process.exitCode === null && session.fujinet_process.signalCode === null) {
     throw makeError('BUSY', 'FujiNet-PC sidecar is already running', { fujinet: session.fujinet });
   }
-  const port = await allocateFujiNetPort(args.port ?? args.netsio_port ?? null);
+  const requestedPort = args.port ?? args.netsio_port ?? null;
+  const reuseActiveAtariPort = args.reuse_port === true && emulatorProcessRunning() &&
+    Number(requestedPort) === session.emulator.netsio_port;
+  const port = reuseActiveAtariPort ? Number(requestedPort) : await allocateFujiNetPort(requestedPort);
   const prepared = prepareFujiNetInstall(args.local_path || args.archive_path || null);
   writeFujiNetConfig(prepared.configPath, port);
 
+  const managed = session.fujinet;
   const argv = ['-c', prepared.configPath, '-s', prepared.sdPath];
   if (args.web_url) argv.unshift('-u', args.web_url);
   const proc = spawn(prepared.launcher, argv, {
@@ -543,7 +825,9 @@ async function startFujiNetSidecar(args = {}) {
     detached: true,
   });
   session.fujinet = {
+    ...managed,
     state: 'starting',
+    managed: true,
     selected_version: fujinetSelection.version || path.basename(prepared.sourcePath),
     source_path: prepared.sourcePath,
     executable_path: prepared.executable,
@@ -559,12 +843,13 @@ async function startFujiNetSidecar(args = {}) {
     exit_code: null,
     signal: null,
     process_group: true,
-    logs: [],
-    dropped_logs: 0,
-    log_seq: 0,
+    logs: managed?.logs || [],
+    dropped_logs: managed?.dropped_logs || 0,
+    log_seq: managed?.log_seq || 0,
+    mounts: managed?.mounts || [],
+    config_backups: managed?.config_backups || [],
   };
   session.fujinet_process = proc;
-  session.owned_paths.push(path.dirname(prepared.workDir));
   proc.stdout.on('data', (chunk) => recordFujiNetLog('stdout', chunk));
   proc.stderr.on('data', (chunk) => recordFujiNetLog('stderr', chunk));
   proc.on('error', (error) => {
@@ -1012,6 +1297,9 @@ async function stopSession({ force = false, cleanup_runtime_dir = true } = {}) {
   if (session.state !== 'cleanup_failed') {
     session.state = 'exited';
   }
+  if (session.fujinet) {
+    session.fujinet.preserved_on_stop = preserveAllMountOutputs();
+  }
   const xvfbProc = session.xvfb_process;
   if (xvfbProc && xvfbProc.exitCode === null && xvfbProc.signalCode === null) {
     xvfbProc.kill('SIGTERM');
@@ -1152,6 +1440,102 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     { name: 'fujinet_debug_clear', description: 'Clear the MCP FujiNet-PC debug output buffer.', inputSchema: { type: 'object', properties: {} } },
     { name: 'fujinet_debug_status', description: 'Report FujiNet-PC debug output buffer counters.', inputSchema: { type: 'object', properties: {} } },
+    {
+      name: 'fujinet_config_get',
+      description: 'Read the MCP-managed FujiNet fnconfig.ini as structured data or a selected value.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          local_path: { type: 'string' },
+          section: { type: 'string' },
+          key: { type: 'string' },
+        },
+      },
+    },
+    {
+      name: 'fujinet_config_set',
+      description: 'Atomically update one value in the MCP-managed FujiNet fnconfig.ini and create a backup.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          local_path: { type: 'string' },
+          section: { type: 'string' },
+          key: { type: 'string' },
+          value: { oneOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }] },
+        },
+        required: ['section', 'key', 'value'],
+      },
+    },
+    {
+      name: 'fujinet_mount_disk',
+      description: 'Safely copy or explicitly link a disk image into a managed FujiNet drive slot.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          source_path: { type: 'string' },
+          drive: { type: 'number', minimum: 1, maximum: 8, default: 1 },
+          read_only: { type: 'boolean', default: true },
+          copy_to_workspace: { type: 'boolean', default: true },
+          preserve_modified: { type: 'boolean', default: false },
+          output_path: { type: 'string' },
+          allow_source_write: { type: 'boolean', default: false },
+          boot_mode: { type: 'boolean', default: true },
+          local_path: { type: 'string' },
+        },
+        required: ['source_path'],
+      },
+    },
+    {
+      name: 'fujinet_unmount_disk',
+      description: 'Remove a managed FujiNet drive mount and preserve its working copy when requested.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          drive: { type: 'number', minimum: 1, maximum: 8 },
+          local_path: { type: 'string' },
+        },
+        required: ['drive'],
+      },
+    },
+    {
+      name: 'fujinet_mount_status',
+      description: 'Report configured FujiNet drive slots, managed paths, modes, and remount state.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'fujinet_boot',
+      description: 'Configure boot mode, start missing managed processes, cold reset, and wait for NetSIO reconnection.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          source_path: { type: 'string' },
+          drive: { type: 'number', minimum: 1, maximum: 8, default: 1 },
+          read_only: { type: 'boolean', default: true },
+          copy_to_workspace: { type: 'boolean', default: true },
+          preserve_modified: { type: 'boolean', default: false },
+          output_path: { type: 'string' },
+          allow_source_write: { type: 'boolean', default: false },
+          allow_no_disk: { type: 'boolean', default: false },
+          local_path: { type: 'string' },
+          port: { type: 'number' },
+          timeout_ms: { type: 'number', default: 10000 },
+          display_mode: { type: 'string', enum: ['headless', 'visible'], default: 'headless' },
+          machine: { type: 'string', enum: ['atari', 'xl', 'xe', 'xegs', '5200'], default: 'xl' },
+          ram: { type: 'number' },
+          basic: { type: 'boolean' },
+          turbo: { type: 'boolean', default: false },
+          sound: { type: 'boolean', default: false },
+        },
+      },
+    },
+    {
+      name: 'fujinet_remount',
+      description: 'Cold reset a running managed Atari/FujiNet pair and wait for observed NetSIO reconnection.',
+      inputSchema: {
+        type: 'object',
+        properties: { timeout_ms: { type: 'number', default: 10000 } },
+      },
+    },
     {
       name: 'atari_start',
       description: 'Start an MCP-owned Atari800 emulator session.',
@@ -1549,6 +1933,197 @@ const KEY_CODES = {
   tab: 44, backspace: 52,
 };
 
+async function bootFujiNet(args = {}) {
+  if (args.source_path) {
+    mountFujiNetDisk({
+      source_path: args.source_path,
+      drive: args.drive ?? 1,
+      read_only: args.read_only,
+      copy_to_workspace: args.copy_to_workspace,
+      preserve_modified: args.preserve_modified,
+      output_path: args.output_path,
+      allow_source_write: args.allow_source_write,
+      boot_mode: true,
+      local_path: args.local_path,
+    });
+  }
+
+  const status = fujinetMountStatus();
+  if (!status.configured?.length && args.allow_no_disk !== true) {
+    throw makeError('BAD_ARGUMENT', 'fujinet_boot requires at least one configured disk mount');
+  }
+  const { prepared, config } = managedFujiNetConfig(args.local_path || null);
+  setIniValue(config, 'General', 'boot_mode', '1');
+  setIniValue(config, 'General', 'configenabled', '0');
+  const configWrite = writeManagedFujiNetConfig(prepared.configPath, config);
+
+  let sidecarStarted = false;
+  if (!fujinetProcessRunning()) {
+    await startFujiNetSidecar({
+      local_path: args.local_path,
+      port: args.port,
+      timeout_ms: args.timeout_ms,
+    });
+    sidecarStarted = true;
+  }
+
+  let emulatorStarted = false;
+  if (!emulatorProcessRunning()) {
+    await startAtariSession({
+      display_mode: args.display_mode || 'headless',
+      machine: args.machine || 'xl',
+      ram: args.ram,
+      basic: args.basic,
+      turbo: args.turbo,
+      sound: args.sound ?? false,
+    });
+    emulatorStarted = true;
+  } else if (!session.emulator.netsio || session.emulator.netsio_port !== session.fujinet.udp_port) {
+    throw makeError('BAD_ARGUMENT', 'running Atari800 is not connected to the managed FujiNet NetSIO port', {
+      emulator_port: session.emulator.netsio_port,
+      fujinet_port: session.fujinet.udp_port,
+    });
+  }
+
+  const remount = await remountFujiNet({ timeout_ms: args.timeout_ms ?? 10000 });
+  return {
+    status: 'ok',
+    sidecar_started: sidecarStarted,
+    emulator_started: emulatorStarted,
+    config_write: configWrite,
+    ...remount,
+  };
+}
+
+async function startAtariSession(args = {}) {
+  if (emulatorProcessRunning()) {
+    await stopSession({ force: true, cleanup_runtime_dir: true });
+  }
+  const preflight = await buildPreflight();
+  if (!preflight.emulator.executable) {
+    throw makeError('CAPABILITY_UNAVAILABLE', 'Atari800 emulator is not executable', { preflight });
+  }
+  cleanupStaleRuntimeDirs();
+  if (!session) {
+    session = createSession(args.program, args.artifact_dir || null);
+  } else {
+    if (args.artifact_dir && path.resolve(args.artifact_dir) !== session.artifact_dir) {
+      throw makeError('BAD_ARGUMENT', 'artifact_dir cannot be changed after starting a FujiNet sidecar; start Atari first or stop the session', {
+        requested: path.resolve(args.artifact_dir),
+        current: session.artifact_dir,
+      });
+    }
+    session.state = 'starting';
+    session.emulator.program = args.program || null;
+    session.emulator.started_at = null;
+    session.emulator.exit_code = null;
+    session.emulator.signal = null;
+    session.emulator.netsio_connected = false;
+  }
+
+  const requestedMode = args.display_mode || 'auto';
+  const displayMode = requestedMode === 'auto' ? 'headless' : requestedMode;
+  const xvfbScreen = args.xvfb_screen || '1024x768x24';
+  const env = { ...process.env };
+  let displayName = env.DISPLAY || null;
+
+  if (displayMode === 'headless') {
+    const displayNumber = selectXvfbDisplay(args.xvfb_display);
+    displayName = await startXvfbForSession(displayNumber, xvfbScreen);
+    env.DISPLAY = displayName;
+  } else if (displayMode === 'visible') {
+    if (!nativeDisplayAvailable()) {
+      throw makeError('MISSING_DISPLAY', 'visible display requested but DISPLAY/WAYLAND_DISPLAY/native desktop is unavailable', {
+        hint: 'Use display_mode=headless on Linux with Xvfb installed.',
+      });
+    }
+  } else {
+    throw makeError('BAD_ARGUMENT', 'display_mode must be auto, headless, or visible', { display_mode: requestedMode });
+  }
+
+  const sound = args.sound !== undefined ? Boolean(args.sound) : displayMode === 'visible';
+  const machineArg = resolveMachineArg(args.machine, args.ram);
+
+  const argv = [
+    '-ai',
+    '-ai-socket', session.emulator.socket,
+    '-ai-video-push-socket', session.emulator.video_push_socket,
+    '-ai-video-pull-socket', session.emulator.video_pull_socket,
+    '-ai-artifact-dir', session.artifact_dir,
+    machineArg,
+  ];
+  if (args.basic === true) argv.push('-basic');
+  if (args.basic === false) argv.push('-nobasic');
+  const sidecarNetSioPort = fujinetProcessRunning() ? session.fujinet.udp_port : null;
+  const netsioEnabled = args.netsio !== undefined ? Boolean(args.netsio) : Boolean(sidecarNetSioPort);
+  const netsioPort = args.netsio_port ?? sidecarNetSioPort;
+  if (netsioEnabled) {
+    argv.push('-netsio');
+    if (netsioPort !== null && netsioPort !== undefined) argv.push(String(netsioPort));
+  }
+  if (args.debug_port !== undefined) argv.push('-ai-debug-port', String(args.debug_port));
+  if (args.turbo) argv.push('-turbo');
+  if (!sound) argv.push('-nosound');
+  if (displayMode === 'headless') argv.push('-no-video-accel');
+  argv.push(...filterExtraArgs(args.args || [], args.unsafe_override === true));
+  if (args.program) {
+    argv.push('-run', args.program);
+  }
+  if (Array.isArray(args.disks)) {
+    for (const disk of args.disks) {
+      if (typeof disk !== 'string') {
+        throw makeError('BAD_ARGUMENT', 'disks must contain only paths');
+      }
+      argv.push(disk);
+    }
+  }
+
+  session.emulator.argv = [EMULATOR_PATH, ...argv];
+  session.emulator.env = {
+    DISPLAY: env.DISPLAY || null,
+    SDL_VIDEODRIVER: env.SDL_VIDEODRIVER || null,
+    SDL_AUDIODRIVER: env.SDL_AUDIODRIVER || null,
+  };
+  session.emulator.display_mode = displayMode;
+  session.emulator.display = displayName;
+  session.emulator.sound = sound;
+  session.emulator.netsio = netsioEnabled;
+  session.emulator.netsio_port = netsioEnabled ? (netsioPort ?? 9997) : null;
+  session.display = {
+    requested_mode: requestedMode,
+    effective_mode: displayMode,
+    display: displayName,
+    xvfb_screen: displayMode === 'headless' ? xvfbScreen : null,
+    sound,
+  };
+  session.emulator.started_at = nowIso();
+  session.process = spawn(EMULATOR_PATH, argv, { stdio: ['ignore', 'pipe', 'pipe'], env });
+  session.emulator.pid = session.process.pid;
+  session.process.stdout.on('data', (chunk) => recordLog('stdout', chunk));
+  session.process.stderr.on('data', (chunk) => recordLog('stderr', chunk));
+  session.process.on('error', (error) => {
+    if (!session) return;
+    session.state = 'crashed';
+    recordLog('mcp', Buffer.from(`emulator spawn error: ${error.message}`));
+  });
+  session.process.on('exit', (code, signal) => {
+    if (!session) return;
+    session.emulator.exit_code = code;
+    session.emulator.signal = signal;
+    session.emulator.netsio_connected = false;
+    if (session.state !== 'cleanup_failed') {
+      session.state = code === 0 ? 'exited' : 'crashed';
+    }
+  });
+
+  const hello = await waitForReady(10000);
+  return {
+    content: [{
+      type: 'text',
+      text: `Emulator started\n${formatJson({ session: sessionSnapshot(false), hello })}`,
+    }],
+  };}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
@@ -1624,135 +2199,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }) }] };
       }
 
-      case 'atari_start': {
-        if (emulatorProcessRunning()) {
-          await stopSession({ force: true, cleanup_runtime_dir: true });
-        }
-        const preflight = await buildPreflight();
-        if (!preflight.emulator.executable) {
-          throw makeError('CAPABILITY_UNAVAILABLE', 'Atari800 emulator is not executable', { preflight });
-        }
-        cleanupStaleRuntimeDirs();
-        if (!session) {
-          session = createSession(args.program, args.artifact_dir || null);
-        } else {
-          if (args.artifact_dir && path.resolve(args.artifact_dir) !== session.artifact_dir) {
-            throw makeError('BAD_ARGUMENT', 'artifact_dir cannot be changed after starting a FujiNet sidecar; start Atari first or stop the session', {
-              requested: path.resolve(args.artifact_dir),
-              current: session.artifact_dir,
-            });
-          }
-          session.state = 'starting';
-          session.emulator.program = args.program || null;
-          session.emulator.started_at = null;
-          session.emulator.exit_code = null;
-          session.emulator.signal = null;
-          session.emulator.netsio_connected = false;
-        }
+      case 'fujinet_config_get':
+        return { content: [{ type: 'text', text: formatJson(configGet(args)) }] };
 
-        const requestedMode = args.display_mode || 'auto';
-        const displayMode = requestedMode === 'auto' ? 'headless' : requestedMode;
-        const xvfbScreen = args.xvfb_screen || '1024x768x24';
-        const env = { ...process.env };
-        let displayName = env.DISPLAY || null;
+      case 'fujinet_config_set':
+        return { content: [{ type: 'text', text: formatJson(configSet(args)) }] };
 
-        if (displayMode === 'headless') {
-          const displayNumber = selectXvfbDisplay(args.xvfb_display);
-          displayName = await startXvfbForSession(displayNumber, xvfbScreen);
-          env.DISPLAY = displayName;
-        } else if (displayMode === 'visible') {
-          if (!nativeDisplayAvailable()) {
-            throw makeError('MISSING_DISPLAY', 'visible display requested but DISPLAY/WAYLAND_DISPLAY/native desktop is unavailable', {
-              hint: 'Use display_mode=headless on Linux with Xvfb installed.',
-            });
-          }
-        } else {
-          throw makeError('BAD_ARGUMENT', 'display_mode must be auto, headless, or visible', { display_mode: requestedMode });
-        }
+      case 'fujinet_mount_disk':
+        return { content: [{ type: 'text', text: formatJson(mountFujiNetDisk(args)) }] };
 
-        const sound = args.sound !== undefined ? Boolean(args.sound) : displayMode === 'visible';
-        const machineArg = resolveMachineArg(args.machine, args.ram);
+      case 'fujinet_unmount_disk':
+        return { content: [{ type: 'text', text: formatJson(unmountFujiNetDisk(args)) }] };
 
-        const argv = [
-          '-ai',
-          '-ai-socket', session.emulator.socket,
-          '-ai-video-push-socket', session.emulator.video_push_socket,
-          '-ai-video-pull-socket', session.emulator.video_pull_socket,
-          '-ai-artifact-dir', session.artifact_dir,
-          machineArg,
-        ];
-        if (args.basic === true) argv.push('-basic');
-        if (args.basic === false) argv.push('-nobasic');
-        const sidecarNetSioPort = fujinetProcessRunning() ? session.fujinet.udp_port : null;
-        const netsioEnabled = args.netsio !== undefined ? Boolean(args.netsio) : Boolean(sidecarNetSioPort);
-        const netsioPort = args.netsio_port ?? sidecarNetSioPort;
-        if (netsioEnabled) {
-          argv.push('-netsio');
-          if (netsioPort !== null && netsioPort !== undefined) argv.push(String(netsioPort));
-        }
-        if (args.debug_port !== undefined) argv.push('-ai-debug-port', String(args.debug_port));
-        if (args.turbo) argv.push('-turbo');
-        if (!sound) argv.push('-nosound');
-        if (displayMode === 'headless') argv.push('-no-video-accel');
-        argv.push(...filterExtraArgs(args.args || [], args.unsafe_override === true));
-        if (args.program) {
-          argv.push('-run', args.program);
-        }
-        if (Array.isArray(args.disks)) {
-          for (const disk of args.disks) {
-            if (typeof disk !== 'string') {
-              throw makeError('BAD_ARGUMENT', 'disks must contain only paths');
-            }
-            argv.push(disk);
-          }
-        }
+      case 'fujinet_mount_status':
+        return { content: [{ type: 'text', text: formatJson(fujinetMountStatus()) }] };
 
-        session.emulator.argv = [EMULATOR_PATH, ...argv];
-        session.emulator.env = {
-          DISPLAY: env.DISPLAY || null,
-          SDL_VIDEODRIVER: env.SDL_VIDEODRIVER || null,
-          SDL_AUDIODRIVER: env.SDL_AUDIODRIVER || null,
-        };
-        session.emulator.display_mode = displayMode;
-        session.emulator.display = displayName;
-        session.emulator.sound = sound;
-        session.emulator.netsio = netsioEnabled;
-        session.emulator.netsio_port = netsioEnabled ? (netsioPort ?? 9997) : null;
-        session.display = {
-          requested_mode: requestedMode,
-          effective_mode: displayMode,
-          display: displayName,
-          xvfb_screen: displayMode === 'headless' ? xvfbScreen : null,
-          sound,
-        };
-        session.emulator.started_at = nowIso();
-        session.process = spawn(EMULATOR_PATH, argv, { stdio: ['ignore', 'pipe', 'pipe'], env });
-        session.emulator.pid = session.process.pid;
-        session.process.stdout.on('data', (chunk) => recordLog('stdout', chunk));
-        session.process.stderr.on('data', (chunk) => recordLog('stderr', chunk));
-        session.process.on('error', (error) => {
-          if (!session) return;
-          session.state = 'crashed';
-          recordLog('mcp', Buffer.from(`emulator spawn error: ${error.message}`));
-        });
-        session.process.on('exit', (code, signal) => {
-          if (!session) return;
-          session.emulator.exit_code = code;
-          session.emulator.signal = signal;
-          session.emulator.netsio_connected = false;
-          if (session.state !== 'cleanup_failed') {
-            session.state = code === 0 ? 'exited' : 'crashed';
-          }
-        });
+      case 'fujinet_boot':
+        return { content: [{ type: 'text', text: formatJson(await bootFujiNet(args)) }] };
 
-        const hello = await waitForReady(10000);
-        return {
-          content: [{
-            type: 'text',
-            text: `Emulator started\n${formatJson({ session: sessionSnapshot(false), hello })}`,
-          }],
-        };
-      }
+      case 'fujinet_remount':
+        return { content: [{ type: 'text', text: formatJson(await remountFujiNet(args)) }] };
+
+      case 'atari_start':
+        return startAtariSession(args);
 
       case 'atari_stop': {
         const stopped = await stopSession({
