@@ -14,7 +14,7 @@ Use this skill to develop and validate Atari 8-bit apps and games. Do not treat 
 The expected loop is:
 
 1. Build or locate the Atari target artifact.
-2. Start or boot it through MCP-managed tools.
+2. Start or boot it through MCP-managed tools. If no emulator session is active, call `atari_start` first; `atari_load` only works after an MCP-owned session exists.
 3. Drive input deterministically.
 4. Wait for bounded observable conditions with MCP automation.
 5. Inspect screen, artifacts, debug output, memory, CPU, disk, FujiNet logs, or NetSIO trace as needed.

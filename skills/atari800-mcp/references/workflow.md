@@ -22,7 +22,7 @@ If source changed, build the runnable artifact before emulator validation.
 
 ## Loading And Booting
 
-- For executable-style programs, use the MCP load/start path appropriate to the tool inventory.
+- For executable-style programs with no active emulator session, prefer `atari_start` with `program` set to the built artifact. Use `atari_load` only to load into an existing MCP-owned session.
 - For native Atari disk testing, use native disk insert/eject/status tools. Source disk images should be copied into the managed workspace and mounted read-only by default.
 - Request write-enabled disk tests only when the app needs to write, and report the managed output disk path instead of mutating the source image.
 - For FujiNet disk/network workflows, use the FujiNet reference instead of trying to drive CONFIG UI manually.
