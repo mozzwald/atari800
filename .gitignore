@@ -47,3 +47,8 @@
 
 # VS Code
 /.vscode
+
+# AI
+ref/
+dist/
+

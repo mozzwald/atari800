@@ -14,6 +14,8 @@ echo "Configuring with SDL 1.2..."
     --with-sound=sdl \
     --enable-ai-interface \
     --enable-netsio \
+    --enable-monitorbreak --enable-monitorbreakpoints \
+    --enable-monitortrace --enable-monitorprofile \
     SDL_CONFIG=/usr/bin/sdl-config \
     CFLAGS="-O2 -g"
 
