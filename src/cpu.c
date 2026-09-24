@@ -191,6 +191,7 @@ UBYTE CPU_delayed_nmi;
 
 /* 6502 registers. */
 UWORD CPU_regPC;
+UWORD CPU_instruction_pc;
 UBYTE CPU_regA;
 UBYTE CPU_regX;
 UBYTE CPU_regY;
@@ -667,6 +668,14 @@ void CPU_GO(int limit)
 #endif /* PC_PTR */
 
 #ifdef MONITOR_TRACE
+		MONITOR_TraceCaptureState(GET_PC(), A, X, Y, S,
+			(N & 0x80) ? 'N' : '-',
+#ifndef NO_V_FLAG_VARIABLE
+			V ? 'V' : '-',
+#else
+			(CPU_regP & CPU_V_FLAG) ? 'V' : '-',
+#endif
+			(Z == 0) ? 'Z' : '-', (C != 0) ? 'C' : '-');
 		if (MONITOR_trace_file != NULL) {
 			MONITOR_ShowState(MONITOR_trace_file, GET_PC(), A, X, Y, S,
 				(N & 0x80) ? 'N' : '-',
@@ -708,6 +717,7 @@ void CPU_GO(int limit)
 #endif
 
 		insn = GET_CODE_BYTE();
+		CPU_instruction_pc = (UWORD)(GET_PC() - 1);
 
 #ifdef MONITOR_BREAKPOINTS
 #ifdef MONITOR_BREAK
@@ -718,6 +728,7 @@ void CPU_GO(int limit)
 		{
 			UBYTE optype = MONITOR_optype6502[insn];
 			int i;
+			int breakpoint_slot = -1;
 			switch (optype >> 4) {
 			case 1:
 				addr = PEEK_CODE_WORD();
@@ -755,9 +766,13 @@ void CPU_GO(int limit)
 				int value, m_addr;
 				if (!MONITOR_breakpoint_table[i].enabled)
 					continue; /* skip */
+				if (i == 0 || MONITOR_breakpoint_table[i - 1].condition == MONITOR_BREAKPOINT_OR)
+					breakpoint_slot = i;
 				cond = MONITOR_breakpoint_table[i].condition;
-				if (cond == MONITOR_BREAKPOINT_OR)
+				if (cond == MONITOR_BREAKPOINT_OR) {
+					breakpoint_slot = i;
 					break; /* fire */
+				}
 				value = MONITOR_breakpoint_table[i].value;
 				m_addr = MONITOR_breakpoint_table[i].m_addr;
 				if (cond == MONITOR_BREAKPOINT_FLAG_CLEAR) {
@@ -870,7 +885,7 @@ void CPU_GO(int limit)
 			}
 			/* fire breakpoint */
 			PC--;
-			DO_BREAK;
+			DO_BREAK_REASON("breakpoint_condition", breakpoint_slot);
 			goto breakpoint_return;
 		no_breakpoint:
 			;

@@ -50,6 +50,7 @@ void CPU_GO(int limit);
 #define CPU_GenerateIRQ() (CPU_IRQ = 1)
 
 extern UWORD CPU_regPC;
+extern UWORD CPU_instruction_pc;
 extern UBYTE CPU_regA;
 extern UBYTE CPU_regP;
 extern UBYTE CPU_regS;

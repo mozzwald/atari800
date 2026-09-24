@@ -17,7 +17,7 @@ The expected loop is:
 2. Start or boot it through MCP-managed tools. If no emulator session is active, call `atari_start` first; `atari_load` only works after an MCP-owned session exists.
 3. Drive input deterministically.
 4. Wait for bounded observable conditions with MCP automation.
-5. Inspect screen, artifacts, debug output, memory, CPU, disk, FujiNet logs, or NetSIO trace as needed.
+5. Inspect screen, artifacts, debug output, memory, CPU, disk, FujiNet logs, NetSIO trace, or monitor instruction trace as needed.
 6. Report pass/fail with concrete emulator evidence.
 
 ## Core Rules
@@ -26,6 +26,9 @@ The expected loop is:
 - Use managed runtime/artifact directories and safe disk workflows.
 - Use `run_until`-style bounded waits instead of open-ended sleeps.
 - Use screen/input helpers first; use debugger and memory tools when behavior needs deeper diagnosis.
+- For instruction-level diagnosis, use `atari_monitor_trace_enable`, run a bounded interval, then read entries with `atari_monitor_trace_read` (using `since_seq` to fetch later batches). Check `atari_monitor_trace_status` for buffer usage and overwritten entries; clear between captures when needed, and disable capture when finished.
+- For cartridge bank auditing, configure `atari_monitor_bank_trace_configure` with an inclusive address range (for example `$D500` to `$D500`), clear and enable `atari_monitor_bank_trace_*`, run the session, then page through `atari_monitor_bank_trace_read` with `since_seq`. Each retained event includes write address/value, the writing instruction PC, frame, and CPU cycle. This log grows for the emulator session and reports allocation failures as dropped events.
+- Rich WRITE breakpoints return a debugger stop to MCP in headless mode. Inspect `atari_debugger_status` and the breakpoint slot after a hit; disable or remove that breakpoint before continuing past the same write.
 - For FujiNet workflows, let MCP select/fetch/start/stop FujiNet-PC and configure managed `fnconfig.ini`; do not manually run FujiNet-PC unless the user explicitly asks.
 - Stop managed sessions cleanly after testing.
 

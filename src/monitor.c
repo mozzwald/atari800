@@ -99,6 +99,153 @@ UBYTE *trainer_flags = NULL;
 
 #ifdef MONITOR_TRACE
 FILE *MONITOR_trace_file = NULL;
+static MONITOR_trace_entry monitor_trace_entries[MONITOR_TRACE_CAPACITY];
+static size_t monitor_trace_head = 0;
+static size_t monitor_trace_count = 0;
+static unsigned long long monitor_trace_next_seq = 1;
+static unsigned long long monitor_trace_dropped = 0;
+static int monitor_trace_enabled = 0;
+static FILE *monitor_trace_scratch = NULL;
+static MONITOR_bank_trace_entry *monitor_bank_trace_entries = NULL;
+static size_t monitor_bank_trace_count = 0;
+static size_t monitor_bank_trace_capacity = 0;
+static unsigned short monitor_bank_trace_start = 0xd500;
+static unsigned short monitor_bank_trace_end = 0xd500;
+static unsigned long long monitor_bank_trace_next_seq = 1;
+static unsigned long long monitor_bank_trace_dropped = 0;
+static int monitor_bank_trace_enabled = 0;
+
+void MONITOR_TraceSetEnabled(int enabled)
+{
+	monitor_trace_enabled = enabled != 0;
+}
+
+void MONITOR_TraceClear(void)
+{
+	monitor_trace_head = 0;
+	monitor_trace_count = 0;
+	monitor_trace_next_seq = 1;
+	monitor_trace_dropped = 0;
+}
+
+int MONITOR_TraceGetStatus(unsigned long long *next_seq, unsigned long long *dropped)
+{
+	if (next_seq != NULL)
+		*next_seq = monitor_trace_next_seq;
+	if (dropped != NULL)
+		*dropped = monitor_trace_dropped;
+	return monitor_trace_enabled;
+}
+
+size_t MONITOR_TraceCount(void)
+{
+	return monitor_trace_count;
+}
+
+size_t MONITOR_TraceRead(unsigned long long since_seq, MONITOR_trace_entry *entries, size_t max_entries)
+{
+	size_t i;
+	size_t count = 0;
+	for (i = 0; i < monitor_trace_count && count < max_entries; i++) {
+		MONITOR_trace_entry *entry = &monitor_trace_entries[(monitor_trace_head + i) % MONITOR_TRACE_CAPACITY];
+		if (entry->seq > since_seq)
+			entries[count++] = *entry;
+	}
+	return count;
+}
+
+void MONITOR_BankTraceConfigure(unsigned short start_addr, unsigned short end_addr)
+{
+	monitor_bank_trace_start = start_addr;
+	monitor_bank_trace_end = end_addr;
+}
+
+void MONITOR_BankTraceSetEnabled(int enabled)
+{
+	monitor_bank_trace_enabled = enabled != 0;
+}
+
+void MONITOR_BankTraceClear(void)
+{
+	monitor_bank_trace_count = 0;
+	monitor_bank_trace_next_seq = 1;
+	monitor_bank_trace_dropped = 0;
+}
+
+void MONITOR_BankTraceCapture(unsigned short addr, unsigned char value, unsigned short pc,
+				unsigned int frame, unsigned int cycle)
+{
+	MONITOR_bank_trace_entry *entry;
+	MONITOR_bank_trace_entry *grown;
+	size_t new_capacity;
+	if (!monitor_bank_trace_enabled || addr < monitor_bank_trace_start || addr > monitor_bank_trace_end)
+		return;
+	if (monitor_bank_trace_count == monitor_bank_trace_capacity) {
+		new_capacity = monitor_bank_trace_capacity == 0 ? 1024 : monitor_bank_trace_capacity * 2;
+		grown = (MONITOR_bank_trace_entry *)realloc(monitor_bank_trace_entries,
+			new_capacity * sizeof(*monitor_bank_trace_entries));
+		if (grown == NULL) {
+			monitor_bank_trace_dropped++;
+			return;
+		}
+		monitor_bank_trace_entries = grown;
+		monitor_bank_trace_capacity = new_capacity;
+	}
+	entry = &monitor_bank_trace_entries[monitor_bank_trace_count++];
+	entry->seq = monitor_bank_trace_next_seq++;
+	entry->addr = addr;
+	entry->value = value;
+	entry->pc = pc;
+	entry->frame = frame;
+	entry->cycle = cycle;
+}
+
+int MONITOR_BankTraceGetStatus(unsigned short *start_addr, unsigned short *end_addr,
+				unsigned long long *next_seq, unsigned long long *dropped, size_t *count)
+{
+	if (start_addr != NULL) *start_addr = monitor_bank_trace_start;
+	if (end_addr != NULL) *end_addr = monitor_bank_trace_end;
+	if (next_seq != NULL) *next_seq = monitor_bank_trace_next_seq;
+	if (dropped != NULL) *dropped = monitor_bank_trace_dropped;
+	if (count != NULL) *count = monitor_bank_trace_count;
+	return monitor_bank_trace_enabled;
+}
+
+size_t MONITOR_BankTraceRead(unsigned long long since_seq, MONITOR_bank_trace_entry *entries, size_t max_entries)
+{
+	size_t i, count = 0;
+	for (i = 0; i < monitor_bank_trace_count && count < max_entries; i++) {
+		if (monitor_bank_trace_entries[i].seq > since_seq)
+			entries[count++] = monitor_bank_trace_entries[i];
+	}
+	return count;
+}
+
+void MONITOR_TraceCaptureState(UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
+				char n, char v, char z, char c)
+{
+	MONITOR_trace_entry *entry;
+	if (!monitor_trace_enabled)
+		return;
+	if (monitor_trace_scratch == NULL)
+		monitor_trace_scratch = tmpfile();
+	if (monitor_trace_scratch == NULL)
+		return;
+	rewind(monitor_trace_scratch);
+	MONITOR_ShowState(monitor_trace_scratch, pc, a, x, y, s, n, v, z, c);
+	fflush(monitor_trace_scratch);
+	rewind(monitor_trace_scratch);
+	if (monitor_trace_count == MONITOR_TRACE_CAPACITY) {
+		monitor_trace_head = (monitor_trace_head + 1) % MONITOR_TRACE_CAPACITY;
+		monitor_trace_count--;
+		monitor_trace_dropped++;
+	}
+	entry = &monitor_trace_entries[(monitor_trace_head + monitor_trace_count) % MONITOR_TRACE_CAPACITY];
+	entry->seq = monitor_trace_next_seq++;
+	if (fgets(entry->line, sizeof(entry->line), monitor_trace_scratch) == NULL)
+		entry->line[0] = '\0';
+	monitor_trace_count++;
+}
 #endif
 
 #ifdef MONITOR_HINTS
@@ -968,6 +1115,16 @@ UWORD MONITOR_Disassemble(FILE *fp, UWORD addr, int count)
 
 void MONITOR_Exit(void)
 {
+#ifdef MONITOR_TRACE
+	if (monitor_trace_scratch != NULL) {
+		fclose(monitor_trace_scratch);
+		monitor_trace_scratch = NULL;
+	}
+	free(monitor_bank_trace_entries);
+	monitor_bank_trace_entries = NULL;
+	monitor_bank_trace_count = 0;
+	monitor_bank_trace_capacity = 0;
+#endif
 	if (trainer_memory != NULL) {
 		free(trainer_memory);
 		trainer_memory=NULL;

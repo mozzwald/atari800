@@ -1018,7 +1018,8 @@ int AI_DebuggerBreak(const char *reason, int breakpoint_id)
         return TRUE;
     }
 
-    if (strcmp(reason, "breakpoint_pc") == 0 || strcmp(reason, "breakpoint_brk") == 0) {
+    if (strcmp(reason, "breakpoint_pc") == 0 || strcmp(reason, "breakpoint_brk") == 0 ||
+        strcmp(reason, "breakpoint_condition") == 0) {
 #ifdef MONITOR_BREAK
         MONITOR_break_step = FALSE;
 #endif
@@ -1852,20 +1853,24 @@ static void ai_send_hello(void)
         "\"debugger.continue\",\"breakpoint.pc\",\"breakpoint.brk\",\"breakpoint.status\",\"breakpoint.clear\","
         "\"breakpoint.list\",\"breakpoint.add\",\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\","
         "\"save_state\",\"load_state\",\"netsio.status\",\"netsio.trace.status\",\"netsio.trace.read\","
-        "\"netsio.trace.clear\",\"netsio.trace.enable\",\"netsio.trace.disable\"],"
+        "\"netsio.trace.clear\",\"netsio.trace.enable\",\"netsio.trace.disable\","
+        "\"monitor.trace.status\",\"monitor.trace.read\",\"monitor.trace.clear\",\"monitor.trace.enable\",\"monitor.trace.disable\","
+        "\"monitor.bank_trace.status\",\"monitor.bank_trace.read\",\"monitor.bank_trace.configure\",\"monitor.bank_trace.clear\",\"monitor.bank_trace.enable\",\"monitor.bank_trace.disable\"],"
         "\"command_classes\":{\"read_only\":[\"ping\",\"hello\",\"capabilities\",\"screen_ascii\",\"screen.text\",\"screen_raw\",\"framebuffer.raw\",\"input.status\","
         "\"video.status\",\"disk.status\",\"peek\",\"cpu\",\"antic\",\"gtia\",\"pokey\",\"pia\",\"debug_read\","
         "\"debugger.status\",\"debugger.show_state\",\"debugger.history\",\"debugger.jumps\",\"debugger.stack\","
         "\"debugger.disassemble\",\"debugger.disassemble_loop\",\"debugger.dlist\",\"debugger.search_memory\","
         "\"debugger.search_string\",\"debugger.search_screencode_string\",\"debugger.labels\",\"breakpoint.status\",\"breakpoint.list\","
-        "\"netsio.status\",\"netsio.trace.status\",\"netsio.trace.read\"],"
+        "\"netsio.status\",\"netsio.trace.status\",\"netsio.trace.read\",\"monitor.trace.status\",\"monitor.trace.read\",\"monitor.bank_trace.status\",\"monitor.bank_trace.read\"],"
         "\"mutating\":[\"load\",\"run\",\"frame_step\",\"step\",\"pause\",\"reset\",\"key\",\"key.down\",\"key.up\",\"key_release\","
         "\"joystick\",\"paddle\",\"consol\",\"screenshot\",\"video.enable_push\",\"video.disable_push\","
         "\"video.enable_pull\",\"video.disable_pull\",\"video.push.set_fps_cap\",\"video.push.set_frameskip\",\"disk.insert\",\"disk.eject\","
         "\"video.push.enable_change_triggered\",\"dump\",\"debug_enable\",\"debugger.step_instruction\","
         "\"debugger.continue\",\"breakpoint.pc\",\"breakpoint.brk\",\"breakpoint.clear\",\"breakpoint.add\","
         "\"breakpoint.delete\",\"breakpoint.enable\",\"breakpoint.disable\",\"save_state\",\"load_state\","
-        "\"netsio.trace.clear\",\"netsio.trace.enable\",\"netsio.trace.disable\"],"
+        "\"netsio.trace.clear\",\"netsio.trace.enable\",\"netsio.trace.disable\","
+        "\"monitor.trace.clear\",\"monitor.trace.enable\",\"monitor.trace.disable\","
+        "\"monitor.bank_trace.configure\",\"monitor.bank_trace.clear\",\"monitor.bank_trace.enable\",\"monitor.bank_trace.disable\"],"
         "\"unsafe\":[\"poke\",\"cpu_set\"]}}");
     AI_SendResponse(ai_response);
 }
@@ -2361,6 +2366,150 @@ static void process_command(const char *cmd) {
         ai_send_netsio_status();
 #else
         AI_SendResponse("{\"status\":\"ok\",\"compiled\":false}");
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.bank_trace.status") == 0) {
+#ifdef MONITOR_TRACE
+        unsigned short start_addr, end_addr;
+        unsigned long long next_seq, dropped;
+        size_t count;
+        int enabled = MONITOR_BankTraceGetStatus(&start_addr, &end_addr, &next_seq, &dropped, &count);
+        snprintf(ai_response, sizeof(ai_response),
+            "{\"status\":\"ok\",\"enabled\":%s,\"start_addr\":%u,\"end_addr\":%u,\"count\":%lu,\"next_seq\":%llu,\"dropped\":%llu}",
+            enabled ? "true" : "false", (unsigned)start_addr, (unsigned)end_addr,
+            (unsigned long)count, next_seq, dropped);
+        AI_SendResponse(ai_response);
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.bank_trace.configure") == 0) {
+#ifdef MONITOR_TRACE
+        int start_addr, end_addr;
+        rc = AI_JSON_GetInt(cmd, "start_addr", &start_addr, 0xd500, FALSE, 0, 0xffff);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "start_addr", FALSE); return; }
+        rc = AI_JSON_GetInt(cmd, "end_addr", &end_addr, start_addr, FALSE, 0, 0xffff);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "end_addr", FALSE); return; }
+        if (end_addr < start_addr) { ai_send_error("BAD_ARGUMENT", "end_addr must be greater than or equal to start_addr", "end_addr"); return; }
+        MONITOR_BankTraceConfigure((unsigned short)start_addr, (unsigned short)end_addr);
+        AI_SendResponse("{\"status\":\"ok\"}");
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.bank_trace.read") == 0) {
+#ifdef MONITOR_TRACE
+        int since_seq, limit;
+        MONITOR_bank_trace_entry entries[100];
+        size_t count, i, pos = 0;
+        rc = AI_JSON_GetInt(cmd, "since_seq", &since_seq, 0, FALSE, 0, 0x7fffffff);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "since_seq", FALSE); return; }
+        rc = AI_JSON_GetInt(cmd, "limit", &limit, 100, FALSE, 1, 100);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "limit", FALSE); return; }
+        count = MONITOR_BankTraceRead((unsigned long long)since_seq, entries, (size_t)limit);
+        ai_response[0] = '\0';
+        ai_append(ai_response, sizeof(ai_response), &pos, "{\"status\":\"ok\",\"entries\":[");
+        for (i = 0; i < count; i++) {
+            if (i > 0) ai_append(ai_response, sizeof(ai_response), &pos, ",");
+            ai_append(ai_response, sizeof(ai_response), &pos,
+                "{\"seq\":%llu,\"address\":%u,\"value\":%u,\"pc\":%u,\"frame\":%u,\"cycle\":%u}",
+                entries[i].seq, (unsigned)entries[i].addr, (unsigned)entries[i].value,
+                (unsigned)entries[i].pc, entries[i].frame, entries[i].cycle);
+        }
+        ai_append(ai_response, sizeof(ai_response), &pos, "],\"count\":%lu}", (unsigned long)count);
+        AI_SendResponse(ai_response);
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.bank_trace.clear") == 0) {
+#ifdef MONITOR_TRACE
+        MONITOR_BankTraceClear();
+        AI_SendResponse("{\"status\":\"ok\"}");
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.bank_trace.enable") == 0) {
+#ifdef MONITOR_TRACE
+        MONITOR_BankTraceSetEnabled(1);
+        AI_SendResponse("{\"status\":\"ok\",\"enabled\":true}");
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.bank_trace.disable") == 0) {
+#ifdef MONITOR_TRACE
+        MONITOR_BankTraceSetEnabled(0);
+        AI_SendResponse("{\"status\":\"ok\",\"enabled\":false}");
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.trace.status") == 0) {
+#ifdef MONITOR_TRACE
+        unsigned long long next_seq, dropped;
+        int enabled = MONITOR_TraceGetStatus(&next_seq, &dropped);
+        snprintf(ai_response, sizeof(ai_response),
+            "{\"status\":\"ok\",\"enabled\":%s,\"count\":%lu,\"capacity\":%d,\"next_seq\":%llu,\"dropped\":%llu}",
+            enabled ? "true" : "false", (unsigned long)MONITOR_TraceCount(), MONITOR_TRACE_CAPACITY,
+            next_seq, dropped);
+        AI_SendResponse(ai_response);
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.trace.read") == 0) {
+#ifdef MONITOR_TRACE
+        int since_seq, limit;
+        MONITOR_trace_entry entries[100];
+        size_t count, i, pos = 0;
+        rc = AI_JSON_GetInt(cmd, "since_seq", &since_seq, 0, FALSE, 0, 0x7fffffff);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "since_seq", FALSE); return; }
+        rc = AI_JSON_GetInt(cmd, "limit", &limit, 100, FALSE, 1, 100);
+        if (rc != AI_JSON_OK) { ai_send_validation_error(rc, "limit", FALSE); return; }
+        count = MONITOR_TraceRead((unsigned long long)since_seq, entries, (size_t)limit);
+        ai_response[0] = '\0';
+        ai_append(ai_response, sizeof(ai_response), &pos, "{\"status\":\"ok\",\"entries\":[");
+        for (i = 0; i < count; i++) {
+            if (i > 0) ai_append(ai_response, sizeof(ai_response), &pos, ",");
+            ai_append(ai_response, sizeof(ai_response), &pos, "{\"seq\":%llu,\"line\":", entries[i].seq);
+            AI_JSON_EscapeAppend(ai_response, sizeof(ai_response), &pos, entries[i].line);
+            ai_append(ai_response, sizeof(ai_response), &pos, "}");
+        }
+        ai_append(ai_response, sizeof(ai_response), &pos, "],\"count\":%lu}", (unsigned long)count);
+        AI_SendResponse(ai_response);
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.trace.clear") == 0) {
+#ifdef MONITOR_TRACE
+        MONITOR_TraceClear();
+        {
+            unsigned long long next_seq, dropped;
+            int enabled = MONITOR_TraceGetStatus(&next_seq, &dropped);
+            snprintf(ai_response, sizeof(ai_response), "{\"status\":\"ok\",\"enabled\":%s,\"count\":0,\"capacity\":%d,\"next_seq\":%llu,\"dropped\":0}", enabled ? "true" : "false", MONITOR_TRACE_CAPACITY, next_seq);
+            AI_SendResponse(ai_response);
+        }
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.trace.enable") == 0) {
+#ifdef MONITOR_TRACE
+        MONITOR_TraceSetEnabled(1);
+        AI_SendResponse("{\"status\":\"ok\",\"enabled\":true}");
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
+#endif
+    }
+    else if (strcmp(cmd_type, "monitor.trace.disable") == 0) {
+#ifdef MONITOR_TRACE
+        MONITOR_TraceSetEnabled(0);
+        AI_SendResponse("{\"status\":\"ok\",\"enabled\":false}");
+#else
+        ai_send_error("CAPABILITY_UNAVAILABLE", "monitor tracing requires MONITOR_TRACE", NULL);
 #endif
     }
     else if (strcmp(cmd_type, "netsio.trace.status") == 0) {

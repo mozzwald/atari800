@@ -2766,6 +2766,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     { name: 'atari_netsio_trace_clear', description: 'Clear the NetSIO trace ring.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_netsio_trace_enable', description: 'Enable NetSIO trace capture.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_netsio_trace_disable', description: 'Disable NetSIO trace capture.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_monitor_trace_status', description: 'Report monitor instruction trace buffer state.', inputSchema: { type: 'object', properties: {} } },
+    {
+      name: 'atari_monitor_trace_read',
+      description: 'Read bounded monitor instruction trace entries after a sequence number.',
+      inputSchema: { type: 'object', properties: { since_seq: { type: 'number', default: 0 }, limit: { type: 'number', default: 100 } } },
+    },
+    { name: 'atari_monitor_trace_clear', description: 'Clear captured monitor instruction trace entries.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_monitor_trace_enable', description: 'Enable monitor instruction trace capture.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_monitor_trace_disable', description: 'Disable monitor instruction trace capture.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_monitor_bank_trace_status', description: 'Report filtered cartridge bank-write trace state and dropped event count.', inputSchema: { type: 'object', properties: {} } },
+    {
+      name: 'atari_monitor_bank_trace_read',
+      description: 'Read persistent, sequence-paginated cartridge bank-select writes with PC, frame, and cycle.',
+      inputSchema: { type: 'object', properties: { since_seq: { type: 'number', default: 0 }, limit: { type: 'number', default: 100 } } },
+    },
+    {
+      name: 'atari_monitor_bank_trace_configure',
+      description: 'Set the inclusive cartridge-write address range to capture (default $D500 only).',
+      inputSchema: { type: 'object', properties: { start_addr: { type: 'number' }, end_addr: { type: 'number' } }, required: ['start_addr', 'end_addr'] },
+    },
+    { name: 'atari_monitor_bank_trace_clear', description: 'Clear captured cartridge bank-write events and reset sequence numbers.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_monitor_bank_trace_enable', description: 'Enable filtered cartridge bank-write event capture.', inputSchema: { type: 'object', properties: {} } },
+    { name: 'atari_monitor_bank_trace_disable', description: 'Disable filtered cartridge bank-write event capture.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_video_status', description: 'Get video socket and stream state.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_video_enable_push', description: 'Enable video push streaming.', inputSchema: { type: 'object', properties: {} } },
     { name: 'atari_video_disable_push', description: 'Disable video push streaming.', inputSchema: { type: 'object', properties: {} } },
@@ -3600,6 +3623,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'atari_netsio_trace_disable': {
         const resp = await sendCommand({ cmd: 'netsio.trace.disable' });
         return { content: [{ type: 'text', text: formatToolResponse('NetSIO trace disabled.', resp) }] };
+      }
+
+      case 'atari_monitor_trace_status': {
+        const resp = await sendCommand({ cmd: 'monitor.trace.status' });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_monitor_trace_read': {
+        const resp = await sendCommand({ cmd: 'monitor.trace.read', since_seq: args.since_seq ?? 0, limit: args.limit ?? 100 });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_monitor_trace_clear': {
+        const resp = await sendCommand({ cmd: 'monitor.trace.clear' });
+        return { content: [{ type: 'text', text: formatToolResponse('Monitor trace cleared.', resp) }] };
+      }
+
+      case 'atari_monitor_trace_enable': {
+        const resp = await sendCommand({ cmd: 'monitor.trace.enable' });
+        return { content: [{ type: 'text', text: formatToolResponse('Monitor trace enabled.', resp) }] };
+      }
+
+      case 'atari_monitor_trace_disable': {
+        const resp = await sendCommand({ cmd: 'monitor.trace.disable' });
+        return { content: [{ type: 'text', text: formatToolResponse('Monitor trace disabled.', resp) }] };
+      }
+
+      case 'atari_monitor_bank_trace_status': {
+        const resp = await sendCommand({ cmd: 'monitor.bank_trace.status' });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_monitor_bank_trace_read': {
+        const resp = await sendCommand({ cmd: 'monitor.bank_trace.read', since_seq: args.since_seq ?? 0, limit: args.limit ?? 100 });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_monitor_bank_trace_configure': {
+        const resp = await sendCommand({ cmd: 'monitor.bank_trace.configure', start_addr: args.start_addr, end_addr: args.end_addr });
+        return { content: [{ type: 'text', text: formatJson(resp) }] };
+      }
+
+      case 'atari_monitor_bank_trace_clear': {
+        const resp = await sendCommand({ cmd: 'monitor.bank_trace.clear' });
+        return { content: [{ type: 'text', text: formatToolResponse('Monitor bank-write trace cleared.', resp) }] };
+      }
+
+      case 'atari_monitor_bank_trace_enable': {
+        const resp = await sendCommand({ cmd: 'monitor.bank_trace.enable' });
+        return { content: [{ type: 'text', text: formatToolResponse('Monitor bank-write trace enabled.', resp) }] };
+      }
+
+      case 'atari_monitor_bank_trace_disable': {
+        const resp = await sendCommand({ cmd: 'monitor.bank_trace.disable' });
+        return { content: [{ type: 'text', text: formatToolResponse('Monitor bank-write trace disabled.', resp) }] };
       }
 
       case 'atari_video_status': {

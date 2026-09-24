@@ -14,6 +14,35 @@ void MONITOR_PreloadLabelFile(char *filename);
 
 #ifdef MONITOR_TRACE
 extern FILE *MONITOR_trace_file;
+#define MONITOR_TRACE_CAPACITY 1024
+#define MONITOR_TRACE_LINE_SIZE 256
+typedef struct {
+	unsigned long long seq;
+	char line[MONITOR_TRACE_LINE_SIZE];
+} MONITOR_trace_entry;
+void MONITOR_TraceSetEnabled(int enabled);
+void MONITOR_TraceClear(void);
+int MONITOR_TraceGetStatus(unsigned long long *next_seq, unsigned long long *dropped);
+size_t MONITOR_TraceCount(void);
+size_t MONITOR_TraceRead(unsigned long long since_seq, MONITOR_trace_entry *entries, size_t max_entries);
+typedef struct {
+	unsigned long long seq;
+	unsigned short addr;
+	unsigned char value;
+	unsigned short pc;
+	unsigned int frame;
+	unsigned int cycle;
+} MONITOR_bank_trace_entry;
+void MONITOR_BankTraceConfigure(unsigned short start_addr, unsigned short end_addr);
+void MONITOR_BankTraceSetEnabled(int enabled);
+void MONITOR_BankTraceClear(void);
+void MONITOR_BankTraceCapture(unsigned short addr, unsigned char value, unsigned short pc,
+				unsigned int frame, unsigned int cycle);
+int MONITOR_BankTraceGetStatus(unsigned short *start_addr, unsigned short *end_addr,
+				unsigned long long *next_seq, unsigned long long *dropped, size_t *count);
+size_t MONITOR_BankTraceRead(unsigned long long since_seq, MONITOR_bank_trace_entry *entries, size_t max_entries);
+void MONITOR_TraceCaptureState(UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
+				char n, char v, char z, char c);
 #endif
 
 #ifdef MONITOR_BREAK

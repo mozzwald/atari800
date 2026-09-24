@@ -28,9 +28,14 @@
 #include <string.h>
 
 #include "atari.h"
+#include "antic.h"
 #include "binload.h" /* BINLOAD_loading_basic */
 #include "cartridge.h"
+#include "cpu.h"
 #include "memory.h"
+#ifdef MONITOR_TRACE
+#include "monitor.h"
+#endif
 #ifdef IDE
 #  include "ide.h"
 #endif
@@ -1309,6 +1314,10 @@ void CARTRIDGE_PutByte(UWORD addr, UBYTE byte)
 		return;
 	}
 #endif
+#ifdef MONITOR_TRACE
+	MONITOR_BankTraceCapture(addr, byte, CPU_instruction_pc,
+		(unsigned int)Atari800_nframes, (unsigned int)ANTIC_CPU_CLOCK);
+#endif
 #ifdef BIT3
 	if (BIT3_enabled && (addr == 0xd508 || addr == 0xd580 || addr == 0xd581 || addr == 0xd583 || addr == 0xd585)) {
 		BIT3_D5PutByte(addr,byte);
@@ -2142,4 +2151,3 @@ void CARTRIDGE_StateSave(void)
 /*
 vim:ts=4:sw=4:
 */
-

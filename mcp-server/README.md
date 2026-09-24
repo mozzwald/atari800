@@ -204,6 +204,17 @@ The bundled `skills/atari800-mcp` directory can be copied or symlinked into Code
 | `atari_netsio_trace_clear` | Clear the NetSIO trace ring. |
 | `atari_netsio_trace_enable` | Enable NetSIO trace capture. |
 | `atari_netsio_trace_disable` | Disable NetSIO trace capture. |
+| `atari_monitor_trace_status` | Report the bounded monitor instruction trace buffer state. |
+| `atari_monitor_trace_read` | Read captured instruction lines after a sequence number. |
+| `atari_monitor_trace_clear` | Clear captured monitor instruction trace entries. |
+| `atari_monitor_trace_enable` | Enable monitor instruction trace capture. |
+| `atari_monitor_trace_disable` | Disable monitor instruction trace capture. |
+| `atari_monitor_bank_trace_status` | Report filtered cartridge-write trace count, range, and dropped events. |
+| `atari_monitor_bank_trace_read` | Read paginated cartridge bank writes with address, value, PC, frame, and cycle. |
+| `atari_monitor_bank_trace_configure` | Set the inclusive address range for cartridge-write capture. |
+| `atari_monitor_bank_trace_clear` | Clear cartridge bank-write events and reset sequence numbers. |
+| `atari_monitor_bank_trace_enable` | Enable filtered cartridge bank-write capture. |
+| `atari_monitor_bank_trace_disable` | Disable filtered cartridge bank-write capture. |
 
 ## Example Workflow
 
@@ -243,6 +254,10 @@ See `README.AI.md` for agent-oriented FujiNet safety, preservation, and debuggin
 Use `atari_netsio_status` after starting Atari800 with NetSIO enabled. It reports emulator-side state: compile/enable status, UDP port and peer, sync wait state, last ACK/NAK byte, timeout counters, queue capacity/availability, credit status, Proceed/Interrupt pin state, packet counters, and emulator-observable NETStream gates.
 
 Use `atari_netsio_trace_enable`, `atari_netsio_trace_read`, and `atari_netsio_trace_clear` around FujiNet boot or NETStream workflows. Trace entries are bounded and include decoded SIO command frames, sync responses, speed changes, credit updates, send errors, timestamps, sequence numbers, and dropped-entry accounting.
+
+Use `atari_monitor_trace_enable`, `atari_monitor_trace_read`, and `atari_monitor_trace_clear` to capture executed 6502 instruction lines. The buffer holds the latest 1,024 entries; reads accept `since_seq` and a limit up to 100 entries. Status reports the current count and number of overwritten entries. The existing monitor `TRACE [filename]` file output remains available separately.
+
+For cartridge bank auditing, call `atari_monitor_bank_trace_configure` with inclusive `start_addr` and `end_addr` values (for example, both `54528` / `$D500` for MIDI Maze), clear the trace, and enable it before running. `atari_monitor_bank_trace_read` pages events with `since_seq` and `limit`; entries include sequence, write address/value, instruction PC, frame, and cycle. The separate event log grows for the emulator session instead of overwriting old writes; status reports allocation-related dropped events. Disable capture after the session to avoid unnecessary event collection.
 
 Handler-only NETStream values such as requested/final flags, REGISTER enablement, UDP sequencing, and detected video standard are not directly observable from the emulator transport. Those fields are reported as `null` with a note; use Atari-side app/debug-port telemetry when those values are required.
 

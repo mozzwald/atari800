@@ -214,6 +214,23 @@ int AI_IsPaused(void);
  * {"cmd": "debugger.continue"}
  *   Continue emulation from a debugger stop.
  *
+ * {"cmd": "monitor.trace.status"}
+ * {"cmd": "monitor.trace.read", "since_seq": 0, "limit": 100}
+ * {"cmd": "monitor.trace.clear"}
+ * {"cmd": "monitor.trace.enable"}
+ * {"cmd": "monitor.trace.disable"}
+ *   Bounded 6502 instruction trace capture; reads return sequence-numbered monitor lines.
+ *   Requires MONITOR_TRACE.
+ *
+ * {"cmd": "monitor.bank_trace.configure", "start_addr": 0xd500, "end_addr": 0xd500}
+ * {"cmd": "monitor.bank_trace.status"}
+ * {"cmd": "monitor.bank_trace.read", "since_seq": 0, "limit": 100}
+ * {"cmd": "monitor.bank_trace.clear"}
+ * {"cmd": "monitor.bank_trace.enable"}
+ * {"cmd": "monitor.bank_trace.disable"}
+ *   Session-persistent filtered cartridge writes, including address, value, instruction PC,
+ *   frame, and cycle. The event log grows dynamically until cleared or emulator exit.
+ *
  * {"cmd": "breakpoint.pc", "addr": 0x1234, "enabled": true}
  * {"cmd": "breakpoint.brk", "enabled": true}
  * {"cmd": "breakpoint.status"}
