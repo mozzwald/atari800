@@ -114,6 +114,16 @@ static unsigned short monitor_bank_trace_end = 0xd500;
 static unsigned long long monitor_bank_trace_next_seq = 1;
 static unsigned long long monitor_bank_trace_dropped = 0;
 static int monitor_bank_trace_enabled = 0;
+static MONITOR_ram_trace_entry *monitor_ram_trace_entries = NULL;
+static size_t monitor_ram_trace_count = 0;
+static size_t monitor_ram_trace_capacity = 0;
+static unsigned short monitor_ram_trace_start = 0x2800;
+static unsigned short monitor_ram_trace_end = 0x2fff;
+static unsigned long long monitor_ram_trace_next_seq = 1;
+static unsigned long long monitor_ram_trace_dropped = 0;
+static int monitor_ram_trace_enabled = 0;
+static int monitor_ram_trace_reads = 0;
+static int monitor_ram_trace_writes = 1;
 
 void MONITOR_TraceSetEnabled(int enabled)
 {
@@ -218,6 +228,84 @@ size_t MONITOR_BankTraceRead(unsigned long long since_seq, MONITOR_bank_trace_en
 		if (monitor_bank_trace_entries[i].seq > since_seq)
 			entries[count++] = monitor_bank_trace_entries[i];
 	}
+	return count;
+}
+
+void MONITOR_RamTraceConfigure(unsigned short start_addr, unsigned short end_addr, int reads, int writes)
+{
+	monitor_ram_trace_start = start_addr;
+	monitor_ram_trace_end = end_addr;
+	monitor_ram_trace_reads = reads != 0;
+	monitor_ram_trace_writes = writes != 0;
+}
+
+void MONITOR_RamTraceSetEnabled(int enabled)
+{
+	monitor_ram_trace_enabled = enabled != 0;
+}
+
+void MONITOR_RamTraceClear(void)
+{
+	monitor_ram_trace_count = 0;
+	monitor_ram_trace_next_seq = 1;
+	monitor_ram_trace_dropped = 0;
+}
+
+void MONITOR_RamTraceCapture(unsigned short addr, unsigned char value, int is_write, unsigned short pc)
+{
+	MONITOR_ram_trace_entry *entry, *grown;
+	size_t new_capacity;
+	if (!monitor_ram_trace_enabled || addr < monitor_ram_trace_start || addr > monitor_ram_trace_end ||
+		(is_write ? !monitor_ram_trace_writes : !monitor_ram_trace_reads))
+		return;
+	/* Cap session memory at roughly 24 MiB; a full log is explicitly detectable. */
+	if (monitor_ram_trace_count == 1000000) {
+		monitor_ram_trace_dropped++;
+		return;
+	}
+	if (monitor_ram_trace_count == monitor_ram_trace_capacity) {
+		new_capacity = monitor_ram_trace_capacity == 0 ? 1024 : monitor_ram_trace_capacity * 2;
+		if (new_capacity > 1000000) new_capacity = 1000000;
+		grown = (MONITOR_ram_trace_entry *)realloc(monitor_ram_trace_entries,
+			new_capacity * sizeof(*monitor_ram_trace_entries));
+		if (grown == NULL) {
+			monitor_ram_trace_dropped++;
+			return;
+		}
+		monitor_ram_trace_entries = grown;
+		monitor_ram_trace_capacity = new_capacity;
+	}
+	entry = &monitor_ram_trace_entries[monitor_ram_trace_count++];
+	entry->seq = monitor_ram_trace_next_seq++;
+	entry->addr = addr;
+	entry->value = value;
+	entry->is_write = is_write != 0;
+	entry->pc = pc;
+	entry->bank = CARTRIDGE_main.state;
+	entry->frame = Atari800_nframes;
+	entry->cycle = ANTIC_xpos;
+}
+
+int MONITOR_RamTraceGetStatus(unsigned short *start_addr, unsigned short *end_addr, int *reads, int *writes,
+				unsigned long long *next_seq, unsigned long long *dropped, size_t *count)
+{
+	if (start_addr != NULL) *start_addr = monitor_ram_trace_start;
+	if (end_addr != NULL) *end_addr = monitor_ram_trace_end;
+	if (reads != NULL) *reads = monitor_ram_trace_reads;
+	if (writes != NULL) *writes = monitor_ram_trace_writes;
+	if (next_seq != NULL) *next_seq = monitor_ram_trace_next_seq;
+	if (dropped != NULL) *dropped = monitor_ram_trace_dropped;
+	if (count != NULL) *count = monitor_ram_trace_count;
+	return monitor_ram_trace_enabled;
+}
+
+size_t MONITOR_RamTraceRead(unsigned long long since_seq, MONITOR_ram_trace_entry *entries, size_t max_entries)
+{
+	size_t i, count = 0;
+	/* Sequence numbers are contiguous across retained entries, even if later captures drop. */
+	for (i = since_seq < monitor_ram_trace_count ? (size_t)since_seq : monitor_ram_trace_count;
+	     i < monitor_ram_trace_count && count < max_entries; i++)
+		entries[count++] = monitor_ram_trace_entries[i];
 	return count;
 }
 
@@ -1124,6 +1212,10 @@ void MONITOR_Exit(void)
 	monitor_bank_trace_entries = NULL;
 	monitor_bank_trace_count = 0;
 	monitor_bank_trace_capacity = 0;
+	free(monitor_ram_trace_entries);
+	monitor_ram_trace_entries = NULL;
+	monitor_ram_trace_count = 0;
+	monitor_ram_trace_capacity = 0;
 #endif
 	if (trainer_memory != NULL) {
 		free(trainer_memory);

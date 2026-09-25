@@ -192,6 +192,43 @@ UBYTE CPU_delayed_nmi;
 /* 6502 registers. */
 UWORD CPU_regPC;
 UWORD CPU_instruction_pc;
+#if defined(MONITOR_TRACE) && !defined(ASAP)
+/* Instrument CPU accesses only; monitor peeks and ANTIC DMA must not contaminate the audit. */
+static UBYTE CPU_TraceGetByte(UWORD addr)
+{
+	UBYTE value = MEMORY_GetByte(addr);
+	MONITOR_RamTraceCapture(addr, value, 0, CPU_instruction_pc);
+	return value;
+}
+
+static void CPU_TracePutByte(UWORD addr, UBYTE value)
+{
+	MEMORY_PutByte(addr, value);
+	MONITOR_RamTraceCapture(addr, value, 1, CPU_instruction_pc);
+}
+
+static UBYTE CPU_TraceDirectGetByte(UWORD addr)
+{
+	UBYTE value = MEMORY_dGetByte(addr);
+	MONITOR_RamTraceCapture(addr, value, 0, CPU_instruction_pc);
+	return value;
+}
+
+static void CPU_TraceDirectPutByte(UWORD addr, UBYTE value)
+{
+	MEMORY_dPutByte(addr, value);
+	MONITOR_RamTraceCapture(addr, value, 1, CPU_instruction_pc);
+}
+
+#undef MEMORY_GetByte
+#undef MEMORY_PutByte
+#undef MEMORY_dGetByte
+#undef MEMORY_dPutByte
+#define MEMORY_GetByte(addr) CPU_TraceGetByte(addr)
+#define MEMORY_PutByte(addr, value) CPU_TracePutByte(addr, value)
+#define MEMORY_dGetByte(addr) CPU_TraceDirectGetByte(addr)
+#define MEMORY_dPutByte(addr, value) CPU_TraceDirectPutByte(addr, value)
+#endif
 UBYTE CPU_regA;
 UBYTE CPU_regX;
 UBYTE CPU_regY;

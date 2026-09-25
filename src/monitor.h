@@ -41,6 +41,23 @@ void MONITOR_BankTraceCapture(unsigned short addr, unsigned char value, unsigned
 int MONITOR_BankTraceGetStatus(unsigned short *start_addr, unsigned short *end_addr,
 				unsigned long long *next_seq, unsigned long long *dropped, size_t *count);
 size_t MONITOR_BankTraceRead(unsigned long long since_seq, MONITOR_bank_trace_entry *entries, size_t max_entries);
+typedef struct {
+	unsigned long long seq;
+	unsigned short addr;
+	unsigned char value;
+	unsigned char is_write;
+	unsigned short pc;
+	int bank;
+	unsigned int frame;
+	unsigned int cycle;
+} MONITOR_ram_trace_entry;
+void MONITOR_RamTraceConfigure(unsigned short start_addr, unsigned short end_addr, int reads, int writes);
+void MONITOR_RamTraceSetEnabled(int enabled);
+void MONITOR_RamTraceClear(void);
+void MONITOR_RamTraceCapture(unsigned short addr, unsigned char value, int is_write, unsigned short pc);
+int MONITOR_RamTraceGetStatus(unsigned short *start_addr, unsigned short *end_addr, int *reads, int *writes,
+				unsigned long long *next_seq, unsigned long long *dropped, size_t *count);
+size_t MONITOR_RamTraceRead(unsigned long long since_seq, MONITOR_ram_trace_entry *entries, size_t max_entries);
 void MONITOR_TraceCaptureState(UWORD pc, UBYTE a, UBYTE x, UBYTE y, UBYTE s,
 				char n, char v, char z, char c);
 #endif
