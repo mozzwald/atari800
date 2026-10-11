@@ -1532,11 +1532,15 @@ function selectXvfbDisplay(preferred) {
   throw makeError('CAPABILITY_UNAVAILABLE', 'No free Xvfb display number found');
 }
 
-async function waitForXvfb(display, timeoutMs = 3000) {
+async function waitForXvfb(display, timeoutMs = 3000, ready = () => false) {
+  // Xvfb writes the display number to -displayfd once it is accepting
+  // connections. Watching for /tmp/.X11-unix/X<n> alone fails where that
+  // directory is read-only (WSLg), and Xvfb then listens only on the
+  // abstract socket, which Xlib still reaches.
   const socketPath = `/tmp/.X11-unix/X${display}`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (fs.existsSync(socketPath)) return true;
+    if (ready() || fs.existsSync(socketPath)) return true;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return false;
@@ -1550,8 +1554,10 @@ async function startXvfbForSession(display, screen) {
     });
   }
   const displayName = `:${display}`;
-  const argv = [displayName, '-screen', '0', screen, '-nolisten', 'tcp'];
-  const proc = spawn(xvfbPath, argv, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const argv = [displayName, '-screen', '0', screen, '-nolisten', 'tcp', '-displayfd', '3'];
+  const proc = spawn(xvfbPath, argv, { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] });
+  let displayfdReady = false;
+  proc.stdio[3].on('data', () => { displayfdReady = true; });
   session.xvfb = {
     pid: proc.pid,
     path: xvfbPath,
@@ -1570,7 +1576,7 @@ async function startXvfbForSession(display, screen) {
     session.xvfb.exit_code = code;
     session.xvfb.signal = signal;
   });
-  if (!(await waitForXvfb(display))) {
+  if (!(await waitForXvfb(display, 3000, () => displayfdReady))) {
     proc.kill('SIGTERM');
     throw makeError('CAPABILITY_UNAVAILABLE', 'Xvfb did not become ready before timeout', {
       display: displayName,
@@ -2850,6 +2856,14 @@ const KEY_CODES = {
   0: 50, 1: 31, 2: 30, 3: 26, 4: 24, 5: 29, 6: 27, 7: 51, 8: 53, 9: 48,
   space: 33, ' ': 33, return: 12, enter: 12, escape: 28, esc: 28,
   tab: 44, backspace: 52,
+  // Atari800 AKEY codes (src/akey.h): the arrows are CTRL with - = + *,
+  // and the shifted symbols carry AKEY_SHFT (0x40) in the code itself.
+  up: 0x8e, down: 0x8f, left: 0x86, right: 0x87,
+  help: 0x11, atari: 0x27, caps: 0x3c, delete: 52,
+  '-': 0x0e, '=': 0x0f, '+': 0x06, '*': 0x07, '/': 0x26, '<': 0x36,
+  '>': 0x37, ',': 0x20, '.': 0x22, ';': 0x02, ':': 0x42, '?': 0x66,
+  '!': 0x5f, '"': 0x73, '#': 0x5a, '$': 0x58, '%': 0x5d, '&': 0x5b,
+  '@': 0x75, '(': 0x70, ')': 0x72,
 };
 
 function resolveKey(key, shift = undefined) {
